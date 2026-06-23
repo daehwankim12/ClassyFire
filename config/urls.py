@@ -9,9 +9,11 @@ from apps.batches.views import (
     structure_form_view,
     submit_view,
 )
+from apps.core.views import health
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+    path("health/", health, name="health"),
     path("api/", include("apps.batches.urls")),
     # Web UI routes
     path("", submit_view, name="submit"),
