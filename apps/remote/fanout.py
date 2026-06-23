@@ -89,4 +89,8 @@ def recompute_job_counters(job_ids: Iterable[uuid.UUID]) -> None:
             if job.status != BatchJobStatus.COMPLETE:
                 job.status = BatchJobStatus.COMPLETE
                 job.completed_at = timezone.now()
+        elif job.status != BatchJobStatus.COMPLETE:
+            # Still work in flight (pending/in-flight items remain): reflect that
+            # the job is actively being processed. Never regress a COMPLETE job.
+            job.status = BatchJobStatus.IN_PROGRESS
         job.save()

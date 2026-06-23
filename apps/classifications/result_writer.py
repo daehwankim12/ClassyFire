@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from apps.classifications.models import ClassificationHistory, ClassyfireLive
@@ -120,13 +120,53 @@ def write_live_result(
     priority = SOURCE_PRIORITY[source_type]
     retrieved_at = retrieved_at or timezone.now()
 
+    values = {
+        "source_type": source_type,
+        "source_priority": priority,
+        "kingdom_id": _resolve_node_id(norm.kingdom),
+        "superclass_id": _resolve_node_id(norm.superclass),
+        "class_node_id": _resolve_node_id(norm.class_),
+        "subclass_id": _resolve_node_id(norm.subclass),
+        "direct_parent_id": _resolve_node_id(norm.direct_parent),
+        "labels": _labels_payload(norm),
+        "raw_json": norm.raw_json,
+        "remote_query_id": remote_query_id,
+        "source_ref": source_ref,
+        "classification_version": norm.classification_version,
+        "retrieved_at": retrieved_at,
+    }
+
     existing = (
         ClassyfireLive.objects.select_for_update()
         .filter(inchikey=inchikey)
         .first()
     )
 
-    if existing is not None and existing.source_priority > priority:
+    if existing is None:
+        # No row yet — try to claim the unique slot with a create, guarded by a
+        # savepoint. If a concurrent writer wins the create race the unique index
+        # raises IntegrityError; we roll back the savepoint (not the outer
+        # transaction) and fall through to the supersede path with the row now
+        # locked via select_for_update — no IntegrityError escapes and no
+        # no-row window is ever observed.
+        try:
+            with transaction.atomic():
+                row = ClassyfireLive.objects.create(inchikey=inchikey, **values)
+            return WriteOutcome(applied=True, live_id=row.id, archived_history=False)
+        except IntegrityError:
+            existing = (
+                ClassyfireLive.objects.select_for_update()
+                .filter(inchikey=inchikey)
+                .first()
+            )
+
+    if existing is None:
+        # Should not happen (we just hit a unique violation) but stay defensive.
+        return WriteOutcome(
+            applied=False, live_id=None, archived_history=False, reason="lost row"
+        )
+
+    if existing.source_priority > priority:
         # Stored row is strictly higher-trust: keep it (live never clobbered by
         # a lower-priority result).
         return WriteOutcome(
@@ -136,29 +176,10 @@ def write_live_result(
             reason="existing higher priority",
         )
 
-    archived = False
-    if existing is not None:
-        # >= priority: the new result supersedes. Snapshot then overwrite.
-        _snapshot(existing).save()
-        archived = True
-        existing.delete()
-
-    row = ClassyfireLive.objects.create(
-        inchikey=inchikey,
-        source_type=source_type,
-        source_priority=priority,
-        kingdom_id=_resolve_node_id(norm.kingdom),
-        superclass_id=_resolve_node_id(norm.superclass),
-        class_node_id=_resolve_node_id(norm.class_),
-        subclass_id=_resolve_node_id(norm.subclass),
-        direct_parent_id=_resolve_node_id(norm.direct_parent),
-        labels=_labels_payload(norm),
-        raw_json=norm.raw_json,
-        remote_query_id=remote_query_id,
-        source_ref=source_ref,
-        classification_version=norm.classification_version,
-        retrieved_at=retrieved_at,
-    )
-    return WriteOutcome(
-        applied=True, live_id=row.id, archived_history=archived
-    )
+    # >= priority: the new result supersedes. Snapshot the prior row to history
+    # FIRST, then update the live row in place (no delete+create window).
+    _snapshot(existing).save()
+    for field, value in values.items():
+        setattr(existing, field, value)
+    existing.save(update_fields=list(values.keys()))
+    return WriteOutcome(applied=True, live_id=existing.id, archived_history=True)

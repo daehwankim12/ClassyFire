@@ -200,6 +200,56 @@ def test_entity_miss_with_structure_submits_query():
     assert provider.submit_calls and provider.submit_calls[0][0][0] == IK_A
 
 
+def test_batch_extras_are_claimed_under_skip_locked(settings):
+    # With a batch size > 1, the primary task pulls in extra READY tasks. Each
+    # extra MUST be claimed (LOCKED + this worker's lock_owner) so a concurrent
+    # claim_task cannot also grab it — preserving the single-owner invariant.
+    settings.REMOTE_BATCH_SIZE = 3
+    comp_a = _compound(IK_A)
+    comp_b = _compound(IK_B)
+    comp_c = _compound(IK_C)
+    queue.enqueue_task(IK_A, compound_id=comp_a.id)
+    queue.enqueue_task(IK_B, compound_id=comp_b.id)
+    queue.enqueue_task(IK_C, compound_id=comp_c.id)
+
+    # The worker claims the primary task the normal way, then folds in extras.
+    worker = _worker(MockProvider(), worker_id="owner")
+    primary = queue.claim_task("owner")
+    assert primary is not None
+
+    extras = worker._claim_batch_extras(primary)
+
+    # Both other READY tasks were claimed and are now owned by this worker.
+    assert {e.inchikey for e in extras} == {IK_B, IK_C}
+    for extra in extras:
+        extra.refresh_from_db()
+        assert extra.state == TaskState.LOCKED
+        assert extra.lock_owner == "owner"
+        assert extra.locked_at is not None
+
+    # A concurrent claim now finds nothing READY to grab — no double-submit.
+    assert queue.claim_task("rival") is None
+
+
+def test_batch_extra_without_structure_is_not_claimed(settings):
+    # An extra READY task lacking a submittable structure must be left untouched
+    # (still READY, claimable) rather than locked and stranded.
+    settings.REMOTE_BATCH_SIZE = 3
+    comp_a = _compound(IK_A)
+    queue.enqueue_task(IK_A, compound_id=comp_a.id)
+    queue.enqueue_task(IK_B)  # no compound -> no structure
+
+    worker = _worker(MockProvider(), worker_id="owner")
+    primary = queue.claim_task("owner")
+    assert primary is not None
+
+    extras = worker._claim_batch_extras(primary)
+    assert extras == []
+    no_struct = RemoteTask.objects.get(inchikey=IK_B)
+    assert no_struct.state == TaskState.READY
+    assert no_struct.lock_owner is None
+
+
 # ---------------------------------------------------------------------------
 # poll flow
 # ---------------------------------------------------------------------------
@@ -327,6 +377,77 @@ def test_lower_priority_does_not_overwrite_live():
     )
     assert outcome.applied is False
     assert ClassificationHistory.objects.filter(inchikey=IK_A).count() == 0
+
+
+def test_duplicate_write_does_not_raise_or_lose_history():
+    # Two same-priority writes for the same key must not raise IntegrityError and
+    # must keep exactly one live row plus the archived prior row in history (the
+    # upsert supersedes in place, with no delete+create no-row window).
+    from apps.classifications.result_writer import write_live_result
+    from apps.remote.mock import parse_wishart_payload
+
+    first = write_live_result(
+        IK_A,
+        parse_wishart_payload(build_raw(IK_A, kingdom="Organic compounds")),
+        source_type=SourceType.WISHART_LIVE_ENTITY,
+    )
+    assert first.applied is True
+    # A second write at equal priority supersedes; the prior row is archived.
+    second = write_live_result(
+        IK_A,
+        parse_wishart_payload(build_raw(IK_A, kingdom="Inorganic compounds")),
+        source_type=SourceType.WISHART_LIVE_QUERY,
+    )
+    assert second.applied is True
+    assert second.archived_history is True
+    # Live row stays unique and updates in place (same primary key, no gap).
+    live = ClassyfireLive.objects.get(inchikey=IK_A)
+    assert live.id == first.live_id
+    assert ClassyfireLive.objects.filter(inchikey=IK_A).count() == 1
+    assert ClassificationHistory.objects.filter(inchikey=IK_A).count() == 1
+
+
+def test_concurrent_create_race_falls_back_to_update(monkeypatch):
+    # Simulate the lost-create race: our initial select_for_update sees no row
+    # (a concurrent writer's row is not yet visible to us), so we attempt a
+    # create that hits the unique index. The savepoint must absorb the
+    # IntegrityError and re-run as an in-place update — no error escapes, the
+    # prior row is archived, and the live row stays unique.
+    from apps.classifications import result_writer
+    from apps.classifications.result_writer import write_live_result
+    from apps.remote.mock import parse_wishart_payload
+
+    # The "concurrent" writer already committed a row for this key.
+    write_live_result(
+        IK_A,
+        parse_wishart_payload(build_raw(IK_A, kingdom="Organic compounds")),
+        source_type=SourceType.WISHART_LIVE_ENTITY,
+    )
+
+    # Force the first select_for_update lookup to behave as if the row is not
+    # visible yet, so the create path runs and trips the unique violation.
+    real_manager = result_writer.ClassyfireLive.objects
+    real_select = real_manager.select_for_update
+    state = {"hidden": True}
+
+    def hiding_select(*a, **k):
+        qs = real_select(*a, **k)
+        if state["hidden"]:
+            state["hidden"] = False
+            return qs.none()  # matches nothing on the first lookup
+        return qs
+
+    monkeypatch.setattr(real_manager, "select_for_update", hiding_select)
+
+    outcome = write_live_result(
+        IK_A,
+        parse_wishart_payload(build_raw(IK_A, kingdom="Inorganic compounds")),
+        source_type=SourceType.WISHART_LIVE_QUERY,
+    )
+    assert outcome.applied is True
+    assert outcome.archived_history is True
+    assert ClassyfireLive.objects.filter(inchikey=IK_A).count() == 1
+    assert ClassificationHistory.objects.filter(inchikey=IK_A).count() == 1
 
 
 # ---------------------------------------------------------------------------

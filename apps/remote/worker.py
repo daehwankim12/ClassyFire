@@ -30,6 +30,8 @@ import uuid
 from datetime import timedelta
 
 from django.conf import settings
+from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.classifications.result_writer import write_live_result
@@ -167,7 +169,6 @@ class RemoteWorker:
 
     def _submit_batch(self, task: RemoteTask) -> None:
         if not self.rate_limiter.submit.allow():
-            queue.transition(task, TaskState.SUBMIT_WAIT)
             queue.defer_task(task, delay_seconds=5)
             return
 
@@ -175,14 +176,7 @@ class RemoteWorker:
         # REMOTE_BATCH_SIZE. The dedup index guarantees one task per inchikey.
         batch = [task]
         if settings.REMOTE_BATCH_SIZE > 1:
-            extras = (
-                RemoteTask.objects.filter(state=TaskState.READY)
-                .exclude(id=task.id)
-                .order_by("-priority", "id")[: settings.REMOTE_BATCH_SIZE - 1]
-            )
-            for extra in extras:
-                if self._structure_for(extra) is not None:
-                    batch.append(extra)
+            batch.extend(self._claim_batch_extras(task))
 
         structures: list[tuple[str, str]] = []
         members: list[RemoteTask] = []
@@ -238,6 +232,40 @@ class RemoteWorker:
                 locked_at=None,
             )
 
+    def _claim_batch_extras(self, task: RemoteTask) -> list[RemoteTask]:
+        """Claim up to REMOTE_BATCH_SIZE-1 extra READY tasks for this batch.
+
+        Each extra is CLAIMED under ``SELECT ... FOR UPDATE SKIP LOCKED`` and
+        flipped to LOCKED with this worker's ``lock_owner``/``locked_at`` set —
+        mirroring :func:`queue.claim_task` — BEFORE being folded into the submit
+        batch. This preserves the single-owner invariant: a concurrent
+        ``claim_task`` (or another worker's ``_submit_batch``) cannot also grab a
+        row we have already locked, so we never double-submit or mutate a task we
+        do not own. Rows we cannot lock are skipped (``skip_locked=True``); rows
+        without a submittable structure are released back to READY.
+        """
+        now = timezone.now()
+        extras: list[RemoteTask] = []
+        with transaction.atomic():
+            candidates = list(
+                RemoteTask.objects.select_for_update(skip_locked=True)
+                .filter(state=TaskState.READY)
+                .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
+                .exclude(id=task.id)
+                .order_by("-priority", "id")[: settings.REMOTE_BATCH_SIZE - 1]
+            )
+            for extra in candidates:
+                if self._structure_for(extra) is None:
+                    continue
+                queue.transition(
+                    extra,
+                    TaskState.LOCKED,
+                    lock_owner=self.worker_id,
+                    locked_at=now,
+                )
+                extras.append(extra)
+        return extras
+
     # -- poll flow ---------------------------------------------------------
 
     def _poll_task(self, task: RemoteTask) -> None:
@@ -257,6 +285,15 @@ class RemoteWorker:
             queue.schedule_retry(task)
             return
 
+        # Deliberate: polls draw from the entity bucket rather than a dedicated
+        # poll budget. A poll is a cheap GET against the same host as an entity
+        # lookup, and submit (the expensive, separately-budgeted call) already
+        # gates how many polls can ever exist — every poll corresponds to an
+        # earlier submit. Poll volume is therefore bounded by the submit budget,
+        # and a parked poll simply re-parks in POLL_WAIT (no retry counted), so
+        # sharing the entity bucket cannot starve fresh entity lookups in
+        # practice. A dedicated poll bucket is deferred until poll volume is
+        # shown to crowd out entity lookups under real load.
         if not self.rate_limiter.entity.allow():
             queue.transition(
                 task,
