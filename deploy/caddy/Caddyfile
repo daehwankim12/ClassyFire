@@ -1,0 +1,71 @@
+# =============================================================================
+# ClassyFire Batch Web — Caddyfile
+#
+# Caddy acts as the TLS-terminating reverse proxy sitting in front of the
+# Gunicorn `web` container.  TLS is handled automatically (ACME / Let's
+# Encrypt or ngrok's own cert when the tunnel is active).
+#
+# Environment variables available at runtime via `{env.VAR}` syntax:
+#   NGROK_DOMAIN  — the public hostname (e.g. myapp.ngrok-free.app)
+#   MAX_UPLOAD_MB — maximum body size for file uploads
+# =============================================================================
+
+{env.NGROK_DOMAIN} {
+
+    # ── Upload size limit ────────────────────────────────────────────────────
+    # MAX_UPLOAD_MB defaults to 100 when the env var is unset.
+    request_body {
+        max_size {env.MAX_UPLOAD_MB}mb
+    }
+
+    # ── Security headers ─────────────────────────────────────────────────────
+    header {
+        # Prevent browsers from MIME-sniffing
+        X-Content-Type-Options "nosniff"
+        # Clickjacking protection
+        X-Frame-Options "DENY"
+        # Cross-site scripting filter (legacy browsers)
+        X-XSS-Protection "1; mode=block"
+        # HSTS: 1 year, include subdomains, allow preload
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # Referrer policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Content-Security-Policy — tightened in Task 11
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
+        # Remove server identification headers
+        -Server
+        -X-Powered-By
+    }
+
+    # ── Reverse proxy to Gunicorn ────────────────────────────────────────────
+    reverse_proxy web:8000 {
+        # Forward the real client IP and protocol
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Real-IP {remote_host}
+        header_up Host {host}
+
+        # Health-check: mark upstream as unhealthy after 3 consecutive failures
+        health_uri /health/
+        health_interval 30s
+        health_timeout 5s
+        health_status 200
+    }
+
+    # ── Serve collected static files directly ────────────────────────────────
+    # Mount the same volume that `web` writes staticfiles into.
+    handle_path /static/* {
+        root * /app/staticfiles
+        file_server {
+            # Let Caddy set cache headers for static assets
+            precompressed gzip br
+        }
+    }
+
+    # ── Logging ──────────────────────────────────────────────────────────────
+    log {
+        output stdout
+        format json
+        level INFO
+    }
+}

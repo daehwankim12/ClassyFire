@@ -1,0 +1,45 @@
+# =============================================================================
+# ClassyFire Batch Web — ngrok agent configuration template
+#
+# This file is mounted read-only into the `ngrok-agent` container.
+# Runtime values are supplied by Docker Compose via the .env file; ngrok
+# reads them directly from the environment.
+#
+# Required .env variables:
+#   NGROK_AUTHTOKEN  — your ngrok authentication token
+#   NGROK_DOMAIN     — your reserved ngrok domain (e.g. myapp.ngrok-free.app)
+#
+# The container command is:  ngrok start --config /etc/ngrok/ngrok.yml --all
+# =============================================================================
+
+version: "3"
+
+# authtoken is read from NGROK_AUTHTOKEN env var set in docker-compose.yml
+authtoken: "${NGROK_AUTHTOKEN}"
+
+# ── Console UI ───────────────────────────────────────────────────────────────
+# Disable the local web UI in production (no interactive terminal)
+web_addr: "false"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log: stdout
+log_level: info
+log_format: json
+
+# ── Tunnels ──────────────────────────────────────────────────────────────────
+tunnels:
+  classyfire-web:
+    # Forward all public HTTPS traffic to Caddy on port 443 inside the
+    # `external` Docker network.
+    addr: proxy:443
+    proto: https
+    # Pin this tunnel to the reserved domain so the URL is stable
+    domain: "${NGROK_DOMAIN}"
+    # Rewrite the Host header so Caddy sees the public domain name
+    host_header: "${NGROK_DOMAIN}"
+    # Inspect traffic in the ngrok web dashboard (disable in high-security env)
+    inspect: false
+    # Pass the original client IP through to Caddy / Django
+    ip_restrictions:
+      allow_cidrs:
+        - "0.0.0.0/0"

@@ -1,0 +1,180 @@
+# =============================================================================
+# ClassyFire Batch Web — Docker Compose
+#
+# Network topology
+# ─────────────────
+#   internal  : db, web, worker, backup  (no host ports)
+#   external  : proxy, ngrok-agent       (may publish 80/443 to host)
+#   proxy and ngrok-agent are also on `internal` so they can reach `web`.
+#
+# Port policy
+# ───────────
+#   db, web, worker, backup → NO host-published ports (internal only)
+#   proxy                   → publishes 80 and 443 to the host
+#   ngrok-agent             → connects outbound to ngrok cloud (no inbound port)
+#
+# Usage
+# ─────
+#   cp .env.example .env        # fill in secrets
+#   docker compose up -d
+# =============================================================================
+
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  static_files:
+  media_files:
+  caddy_data:
+  caddy_config:
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  internal:
+    driver: bridge
+    internal: true   # no direct internet access from db/web/worker
+  external:
+    driver: bridge   # proxy + ngrok-agent face the internet
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  # ── Database ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-classyfire}
+      POSTGRES_USER: ${POSTGRES_USER:-classyfire}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-classyfire}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # NO ports: block — db is internal-only
+
+  # ── Web (Gunicorn) ────────────────────────────────────────────────────────
+  web:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      POSTGRES_HOST: db
+    command:
+      - gunicorn
+      - config.wsgi:application
+      - "--bind=0.0.0.0:8000"
+      - "--workers=2"
+      - "--timeout=120"
+      - "--access-logfile=-"
+      - "--error-logfile=-"
+    volumes:
+      - static_files:/app/staticfiles
+      - media_files:/app/media
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "8000"
+    # NO ports: block — accessed only through proxy
+
+  # ── Worker ────────────────────────────────────────────────────────────────
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      POSTGRES_HOST: db
+    # runworker management command is added in Task 9
+    command:
+      - python
+      - manage.py
+      - runworker
+    volumes:
+      - media_files:/app/media
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+    # NO ports: block — background process only
+
+  # ── Backup ────────────────────────────────────────────────────────────────
+  backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:-classyfire}
+      POSTGRES_USER: ${POSTGRES_USER:-classyfire}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./deploy/backup/backup.sh:/backup.sh:ro
+      - media_files:/app/media:ro
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+    # Run backup on a schedule via supercronic / cron inside the container.
+    # The backup.sh script itself is implemented in Task 10.
+    entrypoint: ["sh", "-c", "while true; do sh /backup.sh; sleep 86400; done"]
+    # NO ports: block — background process only
+
+  # ── Reverse proxy (Caddy) ─────────────────────────────────────────────────
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - static_files:/app/staticfiles:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - internal
+      - external
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+
+  # ── ngrok agent ───────────────────────────────────────────────────────────
+  ngrok-agent:
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    command:
+      - "start"
+      - "--config=/etc/ngrok/ngrok.yml"
+      - "--all"
+    volumes:
+      - ./deploy/ngrok/ngrok.yml.template:/etc/ngrok/ngrok.yml:ro
+    networks:
+      - internal
+      - external
+    depends_on:
+      - proxy
+    # NO ports: ngrok connects outbound to ngrok cloud — no inbound host ports
