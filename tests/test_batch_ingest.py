@@ -549,3 +549,27 @@ def test_remote_task_has_compound_fk_for_smiles():
     task = RemoteTask.objects.filter(inchikey__isnull=False).first()
     assert task is not None
     assert task.compound is not None  # structure known, FK set
+
+
+@pytest.mark.django_db(transaction=True)
+def test_get_or_create_compound_already_exists_no_error():
+    """_get_or_create_compound returns existing row when called twice (race-safe)."""
+    from apps.batches.services import _get_or_create_compound
+    from apps.compounds.models import CompoundStructure
+
+    # Pre-create the compound
+    CompoundStructure.objects.create(
+        inchikey=ASPIRIN_INCHIKEY,
+        original_input=ASPIRIN_SMILES,
+        original_smiles=ASPIRIN_SMILES,
+        canonical_smiles=ASPIRIN_SMILES,
+        inchi=ASPIRIN_INCHI,
+    )
+
+    # Second call must return the existing row without error
+    compound = _get_or_create_compound(
+        ASPIRIN_INCHIKEY, ASPIRIN_SMILES, ASPIRIN_SMILES, ASPIRIN_INCHI
+    )
+    assert compound.inchikey == ASPIRIN_INCHIKEY
+    # Only one row exists (no duplicate created)
+    assert CompoundStructure.objects.filter(inchikey=ASPIRIN_INCHIKEY).count() == 1

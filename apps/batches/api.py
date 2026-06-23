@@ -55,7 +55,7 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
     # For this task, only text_input (plain newline-separated) is supported.
     # File uploads will be added in Task 8.
     text_input: str = body.get("text_input") or ""
-    rows = list(parse_text_input(text_input))
+    rows = parse_text_input(text_input)
 
     # Create the job and run local processing
     job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)

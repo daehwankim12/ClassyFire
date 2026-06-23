@@ -47,6 +47,7 @@ from collections.abc import Iterable
 
 from django.contrib.auth.hashers import make_password
 from django.db import IntegrityError, transaction
+from django.db.models import F
 from django.utils import timezone
 
 from apps.batches.ingest import ingest_rows
@@ -83,32 +84,32 @@ def _get_or_create_compound(
     """Get or create a CompoundStructure for *inchikey*.
 
     If a structure already exists, we do NOT overwrite it (first-write wins).
+    Uses get_or_create to be safe against concurrent inserts.
     """
-    try:
-        return CompoundStructure.objects.get(inchikey=inchikey)
-    except CompoundStructure.DoesNotExist:
-        return CompoundStructure.objects.create(
-            inchikey=inchikey,
-            original_input=original_input,
-            original_smiles=canonical_smiles,  # input may already be canonical
-            canonical_smiles=canonical_smiles,
-            inchi=inchi,
-        )
+    compound, _ = CompoundStructure.objects.get_or_create(
+        inchikey=inchikey,
+        defaults={
+            "original_input": original_input,
+            "original_smiles": canonical_smiles,  # input may already be canonical
+            "canonical_smiles": canonical_smiles,
+            "inchi": inchi,
+        },
+    )
+    return compound
 
 
 def _update_usage(inchikey: str) -> None:
-    """Upsert CompoundUsage for *inchikey*, incrementing seen_count."""
-    usage, created = CompoundUsage.objects.get_or_create(
+    """Upsert CompoundUsage for *inchikey*, incrementing seen_count atomically."""
+    CompoundUsage.objects.get_or_create(
         inchikey=inchikey,
         defaults={"seen_count": 0},
     )
-    if not created:
-        CompoundUsage.objects.filter(inchikey=inchikey).update(
-            seen_count=usage.seen_count + 1,
-            last_seen=timezone.now(),
-        )
-    else:
-        CompoundUsage.objects.filter(inchikey=inchikey).update(seen_count=1)
+    # Atomic DB-side increment regardless of whether the row was just created or
+    # already existed — avoids read-modify-write races on concurrent jobs.
+    CompoundUsage.objects.filter(inchikey=inchikey).update(
+        seen_count=F("seen_count") + 1,
+        last_seen=timezone.now(),
+    )
 
 
 def _get_or_create_remote_task(
@@ -206,31 +207,39 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
 def process_job_items(job: BatchJob) -> None:
     """Run local normalization + lookup for all PENDING items in *job*.
 
+    Iterates items in row_order order using a DB-side cursor (chunk_size=500)
+    so large jobs never materialise all rows in RAM (FR-008).
     Updates each item in the DB and then updates the job counters + status.
     """
-    items = list(
-        BatchItem.objects.filter(
-            job=job, status=BatchItemStatus.PENDING_NORMALIZATION
-        ).order_by("row_order")
+    qs = (
+        BatchItem.objects.filter(job=job, status=BatchItemStatus.PENDING_NORMALIZATION)
+        .order_by("row_order")
+        .iterator(chunk_size=500)
     )
 
-    # Process each item
-    for item in items:
+    for item in qs:
         status = _process_item(item, remote_enabled=job.remote_enabled)
         item.status = status
         item.save(update_fields=["status", "detected_type", "inchikey", "compound", "message"])
 
-    # Recompute counters from the full item set for this job
-    all_items = list(BatchItem.objects.filter(job=job))
+    # Recompute counters via aggregate queries — no in-memory materialisation.
+    from django.db.models import Count, Q
 
-    total = len(all_items)
-    local_hit = sum(1 for i in all_items if i.status == BatchItemStatus.FOUND_LIVE_CACHE)
-    seed_hit = sum(1 for i in all_items if i.status == BatchItemStatus.FOUND_SEED_CACHE)
-    remote_pending = sum(
-        1 for i in all_items if i.status == BatchItemStatus.PENDING_CLASSIFICATION
+    counts = BatchItem.objects.filter(job=job).aggregate(
+        total=Count("pk"),
+        local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
+        seed_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_SEED_CACHE)),
+        remote_pending=Count("pk", filter=Q(status=BatchItemStatus.PENDING_CLASSIFICATION)),
+        need_structure=Count("pk", filter=Q(status=BatchItemStatus.NEED_STRUCTURE)),
+        invalid=Count("pk", filter=Q(status=BatchItemStatus.INVALID_INPUT)),
     )
-    need_structure = sum(1 for i in all_items if i.status == BatchItemStatus.NEED_STRUCTURE)
-    invalid = sum(1 for i in all_items if i.status == BatchItemStatus.INVALID_INPUT)
+
+    total = counts["total"]
+    local_hit = counts["local_hit"]
+    seed_hit = counts["seed_hit"]
+    remote_pending = counts["remote_pending"]
+    need_structure = counts["need_structure"]
+    invalid = counts["invalid"]
 
     # "completed" = items that are fully resolved locally
     completed = local_hit + seed_hit
