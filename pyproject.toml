@@ -126,3 +126,9 @@ DJANGO_SETTINGS_MODULE = "config.settings.dev"
 python_files = ["tests.py", "test_*.py", "*_tests.py"]
 addopts = "-v --tb=short"
 testpaths = ["tests", "apps"]
+filterwarnings = [
+    # WhiteNoise warns when STATIC_ROOT has no collected files. Static is
+    # collected at Docker build time (`collectstatic`); in the test env it is
+    # absent and harmless. Keep test output pristine without hiding real issues.
+    "ignore:No directory at:UserWarning",
+]

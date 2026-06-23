@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 from apps.classifications.selectors import get_live_classification, get_seed_classification
+from apps.core.enums import SOURCE_PRIORITY, SourceType
 
 INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
 
@@ -85,9 +86,14 @@ def lookup_current_classification(inchikey: str) -> ClassificationLookupResult |
             class_=_label(row, "class"),
             subclass=_label(row, "subclass"),
             direct_parent=_label(row, "direct_parent"),
-            source_type="SEED",
-            source_priority=0,
-            source_ref=None,
+            # Seed rows are served as the historical-aggregate tier; surface its
+            # canonical priority and the seed source id as provenance so callers
+            # (and a future Go/Rust reader) can audit where the result came from.
+            source_type=SourceType.HISTORICAL_AGGREGATE.value,
+            source_priority=SOURCE_PRIORITY[SourceType.HISTORICAL_AGGREGATE],
+            source_ref=(
+                str(row["seed_source_id"]) if row.get("seed_source_id") is not None else None
+            ),
             classification_version=row.get("seed_version"),
             retrieved_at=None,
             query_id=None,

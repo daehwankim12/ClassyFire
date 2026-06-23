@@ -12,11 +12,11 @@ SELECT
     cl.retrieved_at,
     cl.remote_query_id,
     -- ChemOnt slots (names via JOIN)
-    kn.name  AS kingdom_name,  kn.chemont_id  AS kingdom_id,
-    scn.name AS superclass_name, scn.chemont_id AS superclass_id,
-    cn.name  AS class_name,    cn.chemont_id  AS class_id,
-    sbn.name AS subclass_name, sbn.chemont_id AS subclass_id,
-    dpn.name AS direct_parent_name, dpn.chemont_id AS direct_parent_id,
+    kn.name  AS kingdom_name,  kn.chemont_id  AS kingdom_chemont_id,
+    scn.name AS superclass_name, scn.chemont_id AS superclass_chemont_id,
+    cn.name  AS class_name,    cn.chemont_id  AS class_chemont_id,
+    sbn.name AS subclass_name, sbn.chemont_id AS subclass_chemont_id,
+    dpn.name AS direct_parent_name, dpn.chemont_id AS direct_parent_chemont_id,
     'LIVE' AS tier
 FROM classyfire_live cl
 LEFT JOIN chemont_nodes kn  ON kn.numeric_id = cl.kingdom_id
@@ -39,11 +39,11 @@ SELECT
     cs.seed_version       AS classification_version,
     NULL                  AS retrieved_at,
     NULL                  AS remote_query_id,
-    kn.name  AS kingdom_name,  kn.chemont_id  AS kingdom_id,
-    scn.name AS superclass_name, scn.chemont_id AS superclass_id,
-    cn.name  AS class_name,    cn.chemont_id  AS class_id,
-    sbn.name AS subclass_name, sbn.chemont_id AS subclass_id,
-    dpn.name AS direct_parent_name, dpn.chemont_id AS direct_parent_id,
+    kn.name  AS kingdom_name,  kn.chemont_id  AS kingdom_chemont_id,
+    scn.name AS superclass_name, scn.chemont_id AS superclass_chemont_id,
+    cn.name  AS class_name,    cn.chemont_id  AS class_chemont_id,
+    sbn.name AS subclass_name, sbn.chemont_id AS subclass_chemont_id,
+    dpn.name AS direct_parent_name, dpn.chemont_id AS direct_parent_chemont_id,
     'SEED' AS tier
 FROM classyfire_seed_current cs
 LEFT JOIN chemont_nodes kn  ON kn.numeric_id = cs.kingdom_id
