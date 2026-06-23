@@ -1,0 +1,47 @@
+{% load static %}
+<table id="items-data-table">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>External ID</th>
+      <th>Input</th>
+      <th>Type</th>
+      <th>InChIKey</th>
+      <th>Status</th>
+      <th>Message</th>
+      <th>Action</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for item in items %}
+    <tr>
+      <td>{{ item.row_order }}</td>
+      <td>{{ item.external_id|default:'' }}</td>
+      <td>{{ item.original_input }}</td>
+      <td>{{ item.detected_type }}</td>
+      <td>{{ item.inchikey|default:'' }}</td>
+      <td>{{ item.status }}</td>
+      <td>{{ item.message|default:'' }}</td>
+      <td>
+        {% if item.status == 'NEED_STRUCTURE' %}
+        <a href="/items/{{ item.pk }}/{{ secret }}/structure">Add structure</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="8">No items match the current filter.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if page_obj.has_other_pages %}
+<div class="pagination">
+  {% if page_obj.has_previous %}
+    <a href="?page={{ page_obj.previous_page_number }}{% if status_filter %}&status_filter={{ status_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}">&laquo; Prev</a>
+  {% endif %}
+  <span>Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>
+  {% if page_obj.has_next %}
+    <a href="?page={{ page_obj.next_page_number }}{% if status_filter %}&status_filter={{ status_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}">Next &raquo;</a>
+  {% endif %}
+</div>
+{% endif %}

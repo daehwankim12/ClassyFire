@@ -14,21 +14,61 @@ POST /api/jobs
         201 Created    — job accepted and local processing complete
         400 Bad Request — validation error
 
-Structured for Task 8 extension:
-    Task 8 will add GET /api/jobs/{id}, /api/jobs/{id}/items,
-    /api/jobs/{id}/export.  Add those views here.
+GET /api/jobs/{id}?secret=<plaintext>
+    Return job status JSON.
+
+GET /api/jobs/{id}/items?secret=<plaintext>&page=1&page_size=100&status_filter=&search=
+    Return paginated + filtered items JSON.
+
+POST /api/items/{id}/structure
+    Body: {"structure": "...", "secret": "..."}
+    Submit a structure for a NEED_STRUCTURE item.
+
+POST /api/jobs/{id}/exports
+    Body: {"format": "csv"|"tsv"|"json"|"csv.gz"|"tsv.gz", "secret": "..."}
+    Create an export and return {"token": "...", "expires_at": "..."}.
+
+GET /api/exports/{token}
+    Download an export by token.
 """
 from __future__ import annotations
 
 import json
 
 from django.conf import settings
-from django.http import HttpRequest, JsonResponse
+from django.contrib.auth.hashers import check_password
+from django.core.paginator import Paginator
+from django.db.models import Q
+from django.http import (
+    FileResponse,
+    HttpRequest,
+    HttpResponseNotFound,
+    JsonResponse,
+)
+from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
+from apps.batches.exports import create_export, get_export_path
 from apps.batches.ingest import parse_text_input
+from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import create_job
+from apps.core.enums import BatchItemStatus
+
+# Status groups for items filter
+FOUND_STATUSES = [
+    BatchItemStatus.FOUND_LIVE_CACHE,
+    BatchItemStatus.FOUND_SEED_CACHE,
+    BatchItemStatus.FOUND_WISHART_ENTITY,
+    BatchItemStatus.COMPLETE_AFTER_WISHART,
+]
+STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
+    "FOUND": FOUND_STATUSES,
+    "PENDING": [BatchItemStatus.PENDING_CLASSIFICATION],
+    "NEED_STRUCTURE": [BatchItemStatus.NEED_STRUCTURE],
+    "INVALID": [BatchItemStatus.INVALID_INPUT],
+    "DELAYED": [BatchItemStatus.REMOTE_DELAYED],
+}
 
 
 @csrf_exempt
@@ -52,10 +92,8 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
         remote_enabled = bool(raw_remote)
 
     # --- Collect rows ---
-    # For this task, only text_input (plain newline-separated) is supported.
-    # File uploads will be added in Task 8.
     text_input: str = body.get("text_input") or ""
-    rows = parse_text_input(text_input)
+    rows = list(parse_text_input(text_input))
 
     # Create the job and run local processing
     job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)
@@ -64,3 +102,206 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
         {"job_id": str(job.pk), "result_secret": plaintext_secret},
         status=201,
     )
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
+    """GET /api/jobs/{id}?secret=<plaintext> — return job status JSON."""
+    job = get_object_or_404(BatchJob, pk=job_id)
+    secret = request.GET.get("secret", "")
+    if not check_password(secret, job.secret_hash):
+        return JsonResponse({"error": "Invalid secret."}, status=403)
+
+    return JsonResponse(
+        {
+            "id": str(job.pk),
+            "status": job.status,
+            "total_count": job.total_count,
+            "completed_count": job.completed_count,
+            "local_hit_count": job.local_hit_count,
+            "seed_hit_count": job.seed_hit_count,
+            "remote_pending_count": job.remote_pending_count,
+            "need_structure_count": job.need_structure_count,
+            "invalid_count": job.invalid_count,
+            "remote_enabled": job.remote_enabled,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
+    """GET /api/jobs/{id}/items — paginated + filtered items JSON."""
+    job = get_object_or_404(BatchJob, pk=job_id)
+    secret = request.GET.get("secret", "")
+    if not check_password(secret, job.secret_hash):
+        return JsonResponse({"error": "Invalid secret."}, status=403)
+
+    status_filter = request.GET.get("status_filter", "")
+    search = request.GET.get("search", "")
+    page_number = int(request.GET.get("page", 1))
+    page_size = int(request.GET.get("page_size", 100))
+
+    qs = BatchItem.objects.filter(job=job).order_by("row_order")
+    if status_filter and status_filter in STATUS_FILTER_MAP:
+        qs = qs.filter(status__in=STATUS_FILTER_MAP[status_filter])
+    if search:
+        qs = qs.filter(
+            Q(original_input__icontains=search) | Q(external_id__icontains=search)
+        )
+
+    paginator = Paginator(qs, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    items_data = [
+        {
+            "id": item.pk,
+            "row_order": item.row_order,
+            "external_id": item.external_id,
+            "original_input": item.original_input,
+            "detected_type": item.detected_type,
+            "inchikey": item.inchikey,
+            "status": item.status,
+            "message": item.message,
+        }
+        for item in page_obj
+    ]
+
+    return JsonResponse(
+        {
+            "count": paginator.count,
+            "num_pages": paginator.num_pages,
+            "page": page_obj.number,
+            "results": items_data,
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
+    """POST /api/items/{id}/structure — submit a structure for a NEED_STRUCTURE item."""
+    item = get_object_or_404(BatchItem, pk=item_id)
+    job = item.job
+
+    try:
+        body = json.loads(request.body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
+
+    secret = body.get("secret") or request.GET.get("secret", "")
+    if not check_password(secret, job.secret_hash):
+        return JsonResponse({"error": "Invalid secret."}, status=403)
+
+    structure = body.get("structure", "").strip()
+    if not structure:
+        return JsonResponse({"error": "structure is required"}, status=400)
+
+    from apps.classifications.services import LookupTier, lookup_current_classification
+    from apps.compounds.validators import normalize_row
+
+    norm = normalize_row(structure)
+    if norm.error or norm.inchikey is None:
+        return JsonResponse(
+            {"error": f"Could not parse structure: {norm.error or 'unknown'}"},
+            status=400,
+        )
+
+    if item.inchikey and norm.inchikey != item.inchikey:
+        item.status = BatchItemStatus.RESULT_KEY_MISMATCH
+        item.message = (
+            f"Submitted InChIKey {norm.inchikey} does not match "
+            f"expected {item.inchikey}"
+        )
+        item.save(update_fields=["status", "message"])
+        return JsonResponse(
+            {
+                "status": "RESULT_KEY_MISMATCH",
+                "submitted_inchikey": norm.inchikey,
+                "expected_inchikey": item.inchikey,
+            },
+            status=422,
+        )
+
+    resolved_inchikey = norm.inchikey
+    item.inchikey = resolved_inchikey
+
+    result = lookup_current_classification(resolved_inchikey)
+    if result is not None:
+        item.status = (
+            BatchItemStatus.FOUND_LIVE_CACHE
+            if result.tier == LookupTier.LIVE
+            else BatchItemStatus.FOUND_SEED_CACHE
+        )
+        item.save(update_fields=["status", "inchikey"])
+    elif job.remote_enabled:
+        from apps.batches.services import _get_or_create_compound, _get_or_create_remote_task
+
+        compound = _get_or_create_compound(
+            resolved_inchikey, structure, norm.canonical_smiles, norm.inchi
+        )
+        item.compound = compound
+        item.status = BatchItemStatus.PENDING_CLASSIFICATION
+        item.save(update_fields=["status", "inchikey", "compound"])
+        _get_or_create_remote_task(resolved_inchikey, compound)
+    else:
+        item.message = "Structure provided; remote classification disabled."
+        item.save(update_fields=["inchikey", "message"])
+
+    return JsonResponse({"status": item.status})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
+    """POST /api/jobs/{id}/exports — create or reuse an export."""
+    job = get_object_or_404(BatchJob, pk=job_id)
+
+    try:
+        body = json.loads(request.body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
+
+    secret = body.get("secret") or request.GET.get("secret", "")
+    fmt = body.get("format", "")
+
+    if not fmt:
+        return JsonResponse({"error": "format is required"}, status=400)
+
+    try:
+        token, expires_at = create_export(job, fmt, secret)
+    except PermissionError:
+        return JsonResponse({"error": "Invalid secret."}, status=403)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
+    return JsonResponse({"token": token, "expires_at": expires_at}, status=201)
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def download_export_view(request: HttpRequest, token: str) -> FileResponse | HttpResponseNotFound:
+    """GET /api/exports/{token} — download an export by token."""
+    path = get_export_path(token)
+    if path is None:
+        return HttpResponseNotFound("Export not found or expired.")
+
+    # Determine content type from extension
+    name = path.name
+    if name.endswith((".csv.gz", ".tsv.gz")):
+        content_type = "application/gzip"
+    elif name.endswith(".csv"):
+        content_type = "text/csv"
+    elif name.endswith(".tsv"):
+        content_type = "text/tab-separated-values"
+    elif name.endswith(".json"):
+        content_type = "application/json"
+    else:
+        content_type = "application/octet-stream"
+
+    response = FileResponse(open(path, "rb"), content_type=content_type)
+    response["Content-Disposition"] = f'attachment; filename="{path.name}"'
+    return response

@@ -93,3 +93,6 @@ local_settings.py
 node_modules/
 npm-debug.log
 yarn-error.log
+
+# Server-side generated export artifacts (runtime)
+export_cache/
