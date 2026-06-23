@@ -82,9 +82,24 @@ DAILY_KEPT=0
 WEEKLY_KEPT=0
 MONTHLY_KEPT=0
 
-# Walk manifests sorted newest-first
+# Walk manifests sorted newest-first.
+# Bucket age is derived from the manifest JSON "timestamp" field (ISO-8601 UTC),
+# matching the Python apply_retention() logic which also reads the manifest
+# timestamp. Falling back to file mtime would diverge from Python's behaviour
+# when files are copied/restored and mtime is reset.
 for MFILE in $(ls -t "${BACKUP_DIR}"/*.manifest.json 2>/dev/null); do
-  FILE_EPOCH=$(stat -c %Y "${MFILE}" 2>/dev/null || stat -f %m "${MFILE}")
+  FILE_EPOCH=$(python3 -c "
+import json, sys
+from datetime import datetime, timezone
+try:
+    ts = json.load(open('${MFILE}')).get('timestamp','')
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    print(int(dt.timestamp()))
+except Exception:
+    sys.exit(1)
+" 2>/dev/null || stat -c %Y "${MFILE}" 2>/dev/null || stat -f %m "${MFILE}")
   AGE_SECS=$((NOW_EPOCH - FILE_EPOCH))
 
   if [ "${AGE_SECS}" -lt "${WEEK_SECS}" ]; then

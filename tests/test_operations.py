@@ -442,12 +442,37 @@ def test_admin_not_paused_when_no_events():
 def test_admin_retry_deferred_tasks():
     from apps.operations.admin_views import retry_failed_tasks
 
-    t = _remote_task(VALID_IK_A, state="DEFERRED")
+    t_deferred = _remote_task(VALID_IK_A, state="DEFERRED")
     count = retry_failed_tasks(actor="test")
     assert count >= 1
-    t.refresh_from_db()
-    assert t.state == "READY"
-    assert t.next_run_at is not None
+    t_deferred.refresh_from_db()
+    assert t_deferred.state == "READY"
+    assert t_deferred.next_run_at is not None
+
+
+def test_admin_retry_retry_wait_tasks():
+    """RETRY_WAIT (backoff-parked) tasks must also be reset to READY."""
+    from apps.operations.admin_views import retry_failed_tasks
+
+    t_retry_wait = _remote_task(VALID_IK_B, state="RETRY_WAIT")
+    count = retry_failed_tasks(actor="test")
+    assert count >= 1
+    t_retry_wait.refresh_from_db()
+    assert t_retry_wait.state == "READY"
+    assert t_retry_wait.next_run_at is not None
+
+
+def test_admin_retry_does_not_reset_done_or_running():
+    """DONE (terminal) and RUNNING (in-flight) tasks must NOT be force-reset."""
+    from apps.operations.admin_views import retry_failed_tasks
+
+    t_done = _remote_task(VALID_IK_A, state="DONE")
+    t_running = _remote_task(VALID_IK_B, state="RUNNING")
+    retry_failed_tasks(actor="test")
+    t_done.refresh_from_db()
+    t_running.refresh_from_db()
+    assert t_done.state == "DONE"
+    assert t_running.state == "RUNNING"
 
 
 def test_admin_retry_logs_event():

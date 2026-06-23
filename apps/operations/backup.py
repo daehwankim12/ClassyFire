@@ -260,6 +260,7 @@ def run_backup_injectable(
         "checksum": checksum,
         "tables": tables,
         "status": "ok",
+        "stderr": "",
     }
 
     manifest_path = backup_dir / f"classyfire_{timestamp}.manifest.json"

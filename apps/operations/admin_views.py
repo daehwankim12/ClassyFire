@@ -14,7 +14,8 @@ This is language-agnostic — any worker in any language queries:
       AND event_type IN ('remote_pause', 'remote_resume')
     ORDER BY created_at DESC LIMIT 1;
 
-If the result is 'remote_pause' (or no row), the worker should not claim tasks.
+If the result is 'remote_pause' the worker should not claim tasks.
+If no row exists the default is running (not paused) — workers may claim tasks.
 """
 from __future__ import annotations
 
@@ -32,7 +33,14 @@ _RESUME_EVENT = "remote_resume"
 
 
 def is_remote_paused() -> bool:
-    """Return True if the last pause/resume event is a pause (or no event exists)."""
+    """Return True only if the most recent pause/resume event is a pause.
+
+    Returns False when no event exists (default = running / not paused).
+    In SQL terms: SELECT event_type FROM system_events WHERE category='WORKER'
+    AND event_type IN ('remote_pause','remote_resume') ORDER BY created_at DESC
+    LIMIT 1 — if the row is 'remote_pause' → paused; 'remote_resume' or no row
+    → not paused.
+    """
     event = (
         SystemEvent.objects.filter(
             category=EventCategory.WORKER,
@@ -71,14 +79,20 @@ def resume_remote(actor: str = "admin") -> SystemEvent:
 # ---------------------------------------------------------------------------
 
 def retry_failed_tasks(actor: str = "admin") -> int:
-    """Reset FAILED and DEFERRED remote tasks to READY with next_run_at=now.
+    """Reset DEFERRED and RETRY_WAIT remote tasks (the backoff-parked states) to READY for immediate retry.
+
+    DEFERRED = operator-parked; RETRY_WAIT = exponential-backoff pause.
+    Both are safe to force-reset because they are not currently held by a worker.
+    In-flight states (LOCKED, RUNNING, ENTITY_LOOKUP, SUBMIT_WAIT, SUBMITTED,
+    POLL_WAIT) must NOT be force-reset. DONE is terminal/success and is excluded.
+    Note: TaskState has no FAILED value — that exists only on QueryState.
 
     Returns number of tasks reset.
     """
     from apps.remote.models import RemoteTask
 
     now = timezone.now()
-    qs = RemoteTask.objects.filter(state__in=[TaskState.DEFERRED])
+    qs = RemoteTask.objects.filter(state__in=[TaskState.DEFERRED, TaskState.RETRY_WAIT])
     count = qs.update(state=TaskState.READY, next_run_at=now, lock_owner=None, locked_at=None)
 
     SystemEvent.objects.create(
