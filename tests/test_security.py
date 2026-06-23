@@ -822,3 +822,103 @@ class TestUploadSizeGuardOnRealPath:
         assert overlong_item.status == BatchItemStatus.INVALID_INPUT, (
             f"Overlong row should be INVALID_INPUT, got {overlong_item.status}"
         )
+
+
+# ===========================================================================
+# 14. API body-size guard + overlong row via API (Fix #1/#2)
+# ===========================================================================
+
+
+class TestApiIngestGuards:
+    """[Fix #1/#2] API path must enforce both body-size and per-row length guards."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_oversize_api_body_returns_413(self) -> None:
+        """A text_input whose UTF-8 byte length exceeds MAX_UPLOAD_MB must be
+        rejected with 413 (or 400) — the rows must NOT be processed."""
+        import unittest.mock as mock
+
+        from apps.core.security import UploadTooLargeError
+
+        # Patch check_upload_size in api module to raise unconditionally,
+        # simulating an oversize body without allocating hundreds of MB.
+        with mock.patch(
+            "apps.batches.api.check_upload_size",
+            side_effect=UploadTooLargeError("Upload size exceeds limit of 100 MB."),
+        ):
+            client = Client()
+            response = client.post(
+                "/api/jobs",
+                data=json.dumps({"text_input": ASPIRIN_SMILES}),
+                content_type="application/json",
+            )
+
+        assert response.status_code in (400, 413), (
+            f"Expected 413/400 for oversize API body, got {response.status_code}"
+        )
+        # Must not leak content in the error response.
+        data = response.json()
+        assert "error" in data
+        assert ASPIRIN_SMILES not in data["error"], (
+            "Error response must not echo back structure content"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    def test_overlong_row_via_api_is_invalid_with_bounded_original(self) -> None:
+        """An over-limit row submitted via /api/jobs must become INVALID_INPUT.
+
+        The item's original_input must contain a recognisable prefix of the
+        submitted text (not a synthetic sentinel) plus a truncation marker, and
+        the message must state the length limit.  Other rows in the same job
+        must be processed normally.
+        """
+        from apps.batches.models import BatchJob
+        from apps.core.enums import BatchItemStatus
+        from apps.core.security import MAX_STRUCTURE_LEN
+
+        long_structure = "C" * (MAX_STRUCTURE_LEN + 1)
+        text_input = f"{ASPIRIN_SMILES}\n{long_structure}"
+
+        client = Client()
+        response = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": text_input}),
+            content_type="application/json",
+        )
+        assert response.status_code == 201, (
+            f"Expected 201, got {response.status_code}: {response.content}"
+        )
+        data = response.json()
+
+        job = BatchJob.objects.get(pk=data["job_id"])
+        items = list(job.items.order_by("row_order"))
+        assert len(items) == 2
+
+        # Aspirin row must NOT be invalid.
+        aspirin_item = items[0]
+        assert aspirin_item.status != BatchItemStatus.INVALID_INPUT, (
+            f"Aspirin row should not be INVALID_INPUT, got {aspirin_item.status}"
+        )
+
+        # Overlong row must be INVALID_INPUT.
+        overlong_item = items[1]
+        assert overlong_item.status == BatchItemStatus.INVALID_INPUT, (
+            f"Overlong row should be INVALID_INPUT, got {overlong_item.status}"
+        )
+        # original_input must contain a real prefix, NOT the old sentinel.
+        assert "__INVALID__ROW_TOO_LONG__" not in overlong_item.original_input, (
+            "original_input must not be the synthetic sentinel"
+        )
+        # Must start with the actual submitted characters.
+        assert overlong_item.original_input.startswith("C"), (
+            "original_input must start with the real submitted content"
+        )
+        # Must contain the truncation marker.
+        assert "truncated" in overlong_item.original_input, (
+            "original_input must contain a truncation marker"
+        )
+        # message must mention the limit.
+        assert overlong_item.message, "message must be set for overlong row"
+        assert "limit" in overlong_item.message.lower() or "exceed" in overlong_item.message.lower(), (
+            f"message should state the length limit, got: {overlong_item.message}"
+        )

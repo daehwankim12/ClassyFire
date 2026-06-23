@@ -56,7 +56,7 @@ def _job() -> BatchJob:
 
 
 def _item(job: BatchJob, inchikey: str, row: int, *, compound=None,
-          status=BatchItemStatus.REMOTE_DELAYED) -> BatchItem:
+          status=BatchItemStatus.PENDING_CLASSIFICATION) -> BatchItem:
     return BatchItem.objects.create(
         job=job,
         row_order=row,
@@ -770,3 +770,86 @@ def test_remote_disabled_accumulates_without_calls(settings):
     # Item still waiting (not resolved).
     item = BatchItem.objects.get(job=job, inchikey=IK_A)
     assert item.status == BatchItemStatus.REMOTE_DELAYED
+
+
+# ---------------------------------------------------------------------------
+# Fix #3: defer/retry surfaces REMOTE_DELAYED; later success → COMPLETE_AFTER_WISHART
+# ---------------------------------------------------------------------------
+
+
+def test_retry_transitions_pending_to_remote_delayed():
+    """When a task is parked for retry (retryable error), waiting items must
+    transition from PENDING_CLASSIFICATION to REMOTE_DELAYED so the user-facing
+    status is immediately surfaced (spec §6.2)."""
+    job = _job()
+    item = _item(job, IK_A, 0)  # starts PENDING_CLASSIFICATION (new default)
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+
+    queue.enqueue_task(IK_A)
+    provider = MockProvider(entity_retryable_for={IK_A})
+    worker = _worker(provider)
+    worker.tick()
+
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.RETRY_WAIT, (
+        "Task must be in RETRY_WAIT after a retryable error"
+    )
+    # The waiting item must now show REMOTE_DELAYED.
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.REMOTE_DELAYED, (
+        f"Waiting item must be REMOTE_DELAYED after retry, got {item.status}"
+    )
+
+
+def test_circuit_open_defer_transitions_pending_to_remote_delayed():
+    """When the circuit is open, the task is deferred; waiting items must
+    transition from PENDING_CLASSIFICATION to REMOTE_DELAYED."""
+    from apps.remote.circuit import CircuitBreaker
+
+    breaker = CircuitBreaker(failure_threshold=1, reset_timeout=999)
+    breaker.record_failure()  # trip the circuit open
+
+    job = _job()
+    item = _item(job, IK_A, 0)  # starts PENDING_CLASSIFICATION
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+
+    queue.enqueue_task(IK_A)
+    provider = MockProvider(entities={IK_A: build_raw(IK_A)})
+    worker = _worker(provider, circuit=breaker)
+    worker.tick()
+
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.DEFERRED, (
+        "Task must be DEFERRED when circuit is open"
+    )
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.REMOTE_DELAYED, (
+        f"Waiting item must be REMOTE_DELAYED after circuit-open defer, got {item.status}"
+    )
+
+
+def test_subsequent_success_after_remote_delayed_completes_item():
+    """After items are moved to REMOTE_DELAYED (due to a retry), a subsequent
+    successful entity result must move them to COMPLETE_AFTER_WISHART (or
+    FOUND_WISHART_ENTITY) — verifying that REMOTE_DELAYED items are still in
+    the WAITING_STATUSES fan-out set."""
+    job = _job()
+    # Pre-set the item to REMOTE_DELAYED (simulating a prior retry cycle).
+    item = _item(job, IK_A, 0, status=BatchItemStatus.REMOTE_DELAYED)
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+
+    queue.enqueue_task(IK_A)
+    # Now the entity lookup succeeds.
+    provider = MockProvider(entities={IK_A: build_raw(IK_A)})
+    worker = _worker(provider)
+    worker.tick()
+
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.DONE, (
+        "Task must be DONE after a successful entity lookup"
+    )
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.FOUND_WISHART_ENTITY, (
+        f"REMOTE_DELAYED item must be resolved to FOUND_WISHART_ENTITY on success, "
+        f"got {item.status}"
+    )

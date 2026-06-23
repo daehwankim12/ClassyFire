@@ -23,6 +23,38 @@ WAITING_STATUSES = (
 )
 
 
+def mark_items_delayed(inchikey: str) -> list[uuid.UUID]:
+    """Transition all PENDING_CLASSIFICATION items for *inchikey* to REMOTE_DELAYED.
+
+    Called by the worker after parking a task for retry/defer (schedule_retry or
+    the circuit-open defer path) so that the user-facing REMOTE_DELAYED status —
+    spec §6.2: "Wishart 장애로 자동 재시도 대기" — is immediately visible rather
+    than staying as PENDING_CLASSIFICATION until the task eventually resolves.
+
+    Returns the list of affected BatchJob ids.  Only PENDING_CLASSIFICATION items
+    are transitioned; items already in REMOTE_DELAYED are not touched.
+    """
+    from apps.batches.services import recompute_job_counters
+
+    with transaction.atomic():
+        affected_jobs: list[uuid.UUID] = list(
+            BatchItem.objects.filter(
+                inchikey=inchikey,
+                status=BatchItemStatus.PENDING_CLASSIFICATION,
+            )
+            .values_list("job_id", flat=True)
+            .distinct()
+        )
+        if affected_jobs:
+            BatchItem.objects.filter(
+                inchikey=inchikey,
+                status=BatchItemStatus.PENDING_CLASSIFICATION,
+            ).update(status=BatchItemStatus.REMOTE_DELAYED)
+            for job_id in affected_jobs:
+                recompute_job_counters(job_id)
+    return affected_jobs
+
+
 def fan_out_result(inchikey: str, status: BatchItemStatus) -> list[uuid.UUID]:
     """Set all waiting items for ``inchikey`` to ``status``; recompute counters.
 

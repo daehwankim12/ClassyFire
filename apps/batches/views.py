@@ -26,9 +26,7 @@ from apps.compounds.models import CompoundStructure
 from apps.compounds.validators import normalize_row
 from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
-    RowTooLongError,
     UploadTooLargeError,
-    check_structure_length,
     check_upload_size,
     require_shared_access_web,
 )
@@ -88,19 +86,10 @@ def submit_view(request: HttpRequest) -> HttpResponse:
             for row in file_rows:
                 rows.append({**row, "row_index": row["row_index"] + offset})
 
-        # Guard: reject rows with absurdly long structure strings (Fix #5).
-        # Over-limit rows are marked INVALID_INPUT via error; processing continues
-        # for the remaining rows so callers get partial results rather than a crash.
-        safe_rows = []
-        for row in rows:
-            try:
-                check_structure_length(row["raw"])
-                safe_rows.append(row)
-            except RowTooLongError:
-                # Inject a synthetic row that ingest will mark as INVALID_INPUT.
-                safe_rows.append({**row, "raw": "__INVALID__ROW_TOO_LONG__"})
-
-        job, plaintext_secret = create_job(safe_rows, remote_enabled=remote_enabled)
+        # Note: over-limit rows are handled inside the service layer (_process_item)
+        # so both UI and API paths are covered consistently — no per-view sentinel
+        # injection needed here.
+        job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)
         return redirect(f"/jobs/{job.pk}/{plaintext_secret}/")
 
     return render(request, "batches/submit.html")

@@ -105,11 +105,13 @@ class RemoteWorker:
             # Remote disabled: do NOT make any remote call. Park the task so the
             # queue keeps accumulating without losing work.
             queue.defer_task(task, delay_seconds=self.lease_seconds)
+            fanout.mark_items_delayed(task.inchikey)
             return
         if not self.circuit.allow():
             # Circuit open: skip remote calls, park as DEFERRED. Local lookups +
             # queue accumulation continue elsewhere (NFR-P05).
             queue.defer_task(task, delay_seconds=self.lease_seconds)
+            fanout.mark_items_delayed(task.inchikey)
             return
 
         queue.transition(task, TaskState.RUNNING)
@@ -126,6 +128,7 @@ class RemoteWorker:
     def _entity_first(self, task: RemoteTask) -> None:
         if not self.rate_limiter.entity.allow():
             queue.defer_task(task, delay_seconds=5)
+            fanout.mark_items_delayed(task.inchikey)
             return
         result = self.provider.lookup_entity(task.inchikey)
 
@@ -136,6 +139,7 @@ class RemoteWorker:
                 queue.retry_after_override(task, result.retry_after)
             else:
                 queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
             return
 
         self.circuit.record_success()
@@ -171,6 +175,7 @@ class RemoteWorker:
     def _submit_batch(self, task: RemoteTask) -> None:
         if not self.rate_limiter.submit.allow():
             queue.defer_task(task, delay_seconds=5)
+            fanout.mark_items_delayed(task.inchikey)
             return
 
         # Batch this task with other READY tasks that have a structure, up to
@@ -197,6 +202,7 @@ class RemoteWorker:
                 queue.retry_after_override(task, exc.retry_after)
             else:
                 queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
             return
         except NonRetryableProviderError:
             self.circuit.record_success()
@@ -279,11 +285,13 @@ class RemoteWorker:
         )
         if item is None:
             queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
             return
         query = item.query
         remote_query_id = query.remote_query_id
         if remote_query_id is None:
             queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
             return
 
         # Deliberate: polls draw from the entity bucket rather than a dedicated
@@ -313,6 +321,7 @@ class RemoteWorker:
                 queue.retry_after_override(task, poll.retry_after)
             else:
                 queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
             return
 
         self.circuit.record_success()
@@ -407,6 +416,7 @@ class RemoteWorker:
             # No entity for this task's InChIKey: unresolved miss → retry per the
             # normal backoff rules rather than leaving it parked in POLL_WAIT.
             queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
             return
         if not self._key_matches(task.inchikey, norm.inchikey):
             self._handle_key_mismatch(task)

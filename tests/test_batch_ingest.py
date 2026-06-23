@@ -699,3 +699,57 @@ def test_api_structure_resubmit_pending_updates_counters():
     )
     # Job still has in-flight remote work.
     assert job.status == BatchJobStatus.IN_PROGRESS
+
+
+# ---------------------------------------------------------------------------
+# Fix #2: overlong row preserves bounded original_input + explicit message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_overlong_row_preserves_bounded_original_input_and_message():
+    """An over-limit row must become INVALID_INPUT with:
+    - original_input = a bounded preview of the real input (never the sentinel)
+    - message = explicit reason mentioning the limit
+    Other rows in the same job must be processed normally.
+    """
+    from apps.batches.services import create_job
+    from apps.core.enums import BatchItemStatus
+    from apps.core.security import MAX_STRUCTURE_LEN
+
+    long_structure = "N" * (MAX_STRUCTURE_LEN + 500)
+    rows = [
+        {"raw": ASPIRIN_SMILES, "row_index": 0},
+        {"raw": long_structure, "row_index": 1},
+        {"raw": CAFFEINE_SMILES, "row_index": 2},
+    ]
+
+    job, _secret = create_job(rows, remote_enabled=False)
+    items = list(job.items.order_by("row_order"))
+    assert len(items) == 3
+
+    # Valid rows must not be INVALID_INPUT.
+    assert items[0].status != BatchItemStatus.INVALID_INPUT
+    assert items[2].status != BatchItemStatus.INVALID_INPUT
+
+    overlong_item = items[1]
+    assert overlong_item.status == BatchItemStatus.INVALID_INPUT
+
+    # Must NOT be the synthetic sentinel.
+    assert "__INVALID__ROW_TOO_LONG__" not in overlong_item.original_input, (
+        "original_input must not be the synthetic sentinel string"
+    )
+    # Must start with the real submitted characters (N).
+    assert overlong_item.original_input.startswith("N"), (
+        "original_input must start with the real submitted content"
+    )
+    # Must contain the truncation marker.
+    assert "truncated" in overlong_item.original_input, (
+        "original_input must contain a truncation marker"
+    )
+    # message must mention the limit.
+    assert overlong_item.message, "message must be non-empty for an overlong row"
+    assert str(MAX_STRUCTURE_LEN) in overlong_item.message, (
+        f"message should reference the max length ({MAX_STRUCTURE_LEN}), "
+        f"got: {overlong_item.message}"
+    )

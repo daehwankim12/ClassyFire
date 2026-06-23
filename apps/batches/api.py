@@ -54,7 +54,7 @@ from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import create_job, recompute_job_counters
 from apps.core.enums import BatchItemStatus
-from apps.core.security import require_shared_access
+from apps.core.security import UploadTooLargeError, check_upload_size, require_shared_access
 
 
 def _job_secret(request: HttpRequest, body: dict[str, object] | None = None) -> str:
@@ -115,6 +115,15 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
 
     # --- Collect rows ---
     text_input: str = body.get("text_input") or ""
+
+    # Guard: reject payloads whose text_input exceeds MAX_UPLOAD_MB.
+    # Check the encoded byte length so the limit is consistent with the file-
+    # upload path in views.py.  Do NOT log the content — only the byte size.
+    try:
+        check_upload_size(len(text_input.encode("utf-8")))
+    except UploadTooLargeError as exc:
+        return JsonResponse({"error": str(exc)}, status=413)
+
     rows = list(parse_text_input(text_input))
 
     # Create the job and run local processing

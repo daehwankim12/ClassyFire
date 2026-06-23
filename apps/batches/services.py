@@ -62,7 +62,11 @@ from apps.core.enums import (
     DetectedInputType,
     TaskState,
 )
+from apps.core.security import MAX_STRUCTURE_LEN, RowTooLongError, check_structure_length
 from apps.remote.models import RemoteTask
+
+# Number of characters preserved in the bounded preview for an over-limit row.
+_OVERLONG_PREVIEW_CHARS = 200
 
 
 def _generate_secret() -> tuple[str, str]:
@@ -156,6 +160,21 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
     Updates item fields (inchikey, detected_type, compound, message) in place;
     the caller is responsible for calling item.save().
     """
+    # Step 0: Guard — reject rows whose structure string exceeds MAX_STRUCTURE_LEN.
+    # This check lives here (service layer) so it covers BOTH the UI and API paths.
+    # For an over-limit row we preserve a bounded preview of the original input
+    # (FR-004) rather than a synthetic sentinel, and record an explicit message.
+    try:
+        check_structure_length(item.original_input)
+    except RowTooLongError:
+        raw_len = len(item.original_input)
+        preview = item.original_input[:_OVERLONG_PREVIEW_CHARS]
+        item.original_input = f"{preview}…[truncated, {raw_len} chars total]"
+        item.message = (
+            f"Row exceeds maximum length ({raw_len} chars; limit {MAX_STRUCTURE_LEN})"
+        )
+        return BatchItemStatus.INVALID_INPUT
+
     # Step 1: Normalize
     norm = normalize_row(item.original_input, external_id=item.external_id)
     item.detected_type = norm.detected_type
@@ -313,7 +332,7 @@ def process_job_items(job: BatchJob) -> None:
     for item in qs:
         status = _process_item(item, remote_enabled=job.remote_enabled)
         item.status = status
-        item.save(update_fields=["status", "detected_type", "inchikey", "compound", "message"])
+        item.save(update_fields=["status", "detected_type", "inchikey", "compound", "message", "original_input"])
 
     recompute_job_counters(job.pk)
     # Refresh in-memory
