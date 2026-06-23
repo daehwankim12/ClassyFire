@@ -54,6 +54,7 @@ from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import create_job
 from apps.core.enums import BatchItemStatus
+from apps.core.security import require_shared_access
 
 # Status groups for items filter
 FOUND_STATUSES = [
@@ -71,7 +72,8 @@ STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
 }
 
 
-@csrf_exempt
+@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@require_shared_access
 @require_http_methods(["POST"])
 def create_job_view(request: HttpRequest) -> JsonResponse:
     """POST /api/jobs — create a batch job and run local processing."""
@@ -104,7 +106,8 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
     )
 
 
-@csrf_exempt
+@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@require_shared_access
 @require_http_methods(["GET"])
 def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """GET /api/jobs/{id}?secret=<plaintext> — return job status JSON."""
@@ -131,7 +134,8 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     )
 
 
-@csrf_exempt
+@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@require_shared_access
 @require_http_methods(["GET"])
 def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """GET /api/jobs/{id}/items — paginated + filtered items JSON."""
@@ -183,7 +187,8 @@ def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
     )
 
 
-@csrf_exempt
+@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@require_shared_access
 @require_http_methods(["POST"])
 def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     """POST /api/items/{id}/structure — submit a structure for a NEED_STRUCTURE item."""
@@ -258,7 +263,8 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     return JsonResponse({"status": item.status})
 
 
-@csrf_exempt
+@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@require_shared_access
 @require_http_methods(["POST"])
 def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """POST /api/jobs/{id}/exports — create or reuse an export."""
@@ -285,7 +291,8 @@ def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
     return JsonResponse({"token": token, "expires_at": expires_at}, status=201)
 
 
-@csrf_exempt
+@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@require_shared_access
 @require_http_methods(["GET"])
 def download_export_view(request: HttpRequest, token: str) -> FileResponse | HttpResponseNotFound:
     """GET /api/exports/{token} — download an export by token."""

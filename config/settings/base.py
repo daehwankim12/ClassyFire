@@ -171,3 +171,10 @@ UPLOAD_RETENTION_DAYS: int = env_int("UPLOAD_RETENTION_DAYS", 30)
 JOB_RETENTION_DAYS: int = env_int("JOB_RETENTION_DAYS", 90)
 EXPORT_RETENTION_DAYS: int = env_int("EXPORT_RETENTION_DAYS", 14)
 DISK_UPLOAD_PAUSE_PERCENT: int = env_int("DISK_UPLOAD_PAUSE_PERCENT", 85)
+
+# ---------------------------------------------------------------------------
+# Circuit breaker (Task 9 remote worker — read via getattr for backwards compat)
+# ---------------------------------------------------------------------------
+
+REMOTE_CIRCUIT_THRESHOLD: int = env_int("REMOTE_CIRCUIT_THRESHOLD", 5)
+REMOTE_CIRCUIT_RESET_SECONDS: int = env_int("REMOTE_CIRCUIT_RESET_SECONDS", 300)
