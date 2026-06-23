@@ -79,6 +79,9 @@ local_settings.py
 # Seed artifacts
 *.tsv.zst
 *.jsonl.zst
+# ...but small committed test fixtures are an exception
+!tests/fixtures/*.tsv.zst
+!tests/fixtures/*.jsonl.zst
 
 # Office documents
 *.docx
