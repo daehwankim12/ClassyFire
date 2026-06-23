@@ -65,6 +65,17 @@ def normalize_row(
     external_id:
         Optional caller-supplied identifier (e.g. from a CSV ``id`` column).
     """
+    if not raw or not raw.strip():
+        return NormalizedRow(
+            detected_type=DetectedInputType.UNKNOWN,
+            inchikey=None,
+            canonical_smiles=None,
+            inchi=None,
+            original_input=raw,
+            external_id=external_id,
+            error="empty input",
+        )
+
     try:
         detected_type = type_override if type_override is not None else detect_input_type(raw)
         inchikey, canonical_smiles, inchi = compute_identifiers(raw, detected_type)

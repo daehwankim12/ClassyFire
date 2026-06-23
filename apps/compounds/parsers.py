@@ -29,7 +29,7 @@ import io
 from collections.abc import Iterator
 from typing import IO
 
-from rdkit.Chem import ForwardSDMolSupplier
+from rdkit import Chem
 
 
 def parse_txt(
@@ -59,8 +59,8 @@ def parse_csv_tsv(
     text_stream = _ensure_text(file_obj, encoding)
 
     if delimiter is None:
-        # Peek at the first 8 KB to sniff.
-        peeked = _peek_text(text_stream, 8192)
+        # Read the first 8 KB to sniff; caller must prepend it back.
+        peeked = _read_prefix(text_stream, 8192)
         delimiter = "\t" if "\t" in peeked else ","
         text_stream = _prepend(peeked, text_stream)
 
@@ -88,39 +88,104 @@ def parse_csv_tsv(
 def parse_sdf(
     file_obj: IO[bytes],
 ) -> Iterator[dict]:
-    """Yield one dict per SDF record: ``{raw, row_index[, external_id]}``."""
-    # ForwardSDMolSupplier requires a binary file-like object.
+    """Yield one dict per SDF record: ``{raw, row_index[, external_id]}``.
+
+    True single-pass streaming: only one molecule block is held in memory at
+    a time.  Lines are accumulated until the ``$$$$`` delimiter, then the block
+    is parsed with RDKit and immediately yielded before the buffer is reset.
+    A bad block yields an error-free dict (raw set, external_id absent) so
+    callers using normalize_row will handle the error in isolation.
+    """
     if hasattr(file_obj, "read"):
-        bio = file_obj if isinstance(file_obj, (io.RawIOBase, io.BufferedIOBase)) else _to_binary(file_obj)
+        text_stream: IO[str]
+        if isinstance(file_obj, (io.RawIOBase, io.BufferedIOBase, io.BytesIO)):
+            text_stream = io.TextIOWrapper(file_obj, encoding="utf-8", errors="replace")
+        else:
+            text_stream = file_obj  # type: ignore[assignment]
     else:
-        bio = io.BytesIO(file_obj)  # type: ignore[arg-type]
+        text_stream = io.StringIO(file_obj.decode("utf-8", errors="replace"))  # type: ignore[union-attr]
 
-    # We also need the raw SDF block text to put in NormalizedRow.original_input.
-    # We read the whole binary stream split by '$$$$' for that, while using
-    # ForwardSDMolSupplier for the parsed molecule.
-    bio.seek(0)
-    raw_content = bio.read().decode("utf-8", errors="replace")
-    bio.seek(0)
+    row_index = 0
+    current_lines: list[str] = []
 
-    raw_blocks = _split_sdf_blocks(raw_content)
+    for line in text_stream:
+        if line.rstrip("\r\n") == "$$$$":
+            # Only emit non-empty blocks.
+            if current_lines:
+                yield _parse_sdf_block("".join(current_lines), row_index)
+                row_index += 1
+                current_lines = []
+        else:
+            current_lines.append(line)
 
-    supp = ForwardSDMolSupplier(bio, removeHs=False, sanitize=True)
-    for row_index, mol in enumerate(supp):
-        raw_block = raw_blocks[row_index] if row_index < len(raw_blocks) else ""
-        result: dict = {"raw": raw_block.strip(), "row_index": row_index}
-
-        if mol is not None:
-            props = mol.GetPropsAsDict()
-            ext_id = props.get("EXTERNAL_ID") or props.get("ID") or props.get("Name")
-            if ext_id:
-                result["external_id"] = str(ext_id)
-
-        yield result
+    # Handle a trailing block that has content but no closing $$$$ delimiter.
+    if current_lines and any(ln.strip() for ln in current_lines):
+        yield _parse_sdf_block("".join(current_lines), row_index)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _parse_sdf_block(block: str, row_index: int) -> dict:
+    """Parse a single SDF block string and return a parser result dict.
+
+    Properties are extracted directly from the SDF data fields (``> <NAME>``
+    / value lines) rather than via RDKit's prop dict, because
+    ``Chem.MolFromMolBlock`` only parses up to ``M  END`` and does not
+    populate SDF data fields.  The molecule is still parsed with RDKit to
+    obtain the molecule name (``_Name``) as a fallback external id.
+    """
+    result: dict = {"raw": block.strip(), "row_index": row_index}
+
+    # Extract SDF data properties from the text block directly.
+    sdf_props = _extract_sdf_props(block)
+
+    ext_id = sdf_props.get("EXTERNAL_ID") or sdf_props.get("ID")
+    if not ext_id:
+        # Fall back to molecule name from the molblock header line.
+        try:
+            mol = Chem.MolFromMolBlock(block, removeHs=False, sanitize=True)
+            if mol is not None and mol.HasProp("_Name"):
+                name = mol.GetProp("_Name").strip()
+                if name:
+                    ext_id = name
+        except Exception:
+            pass
+
+    if ext_id:
+        result["external_id"] = str(ext_id)
+    return result
+
+
+def _extract_sdf_props(block: str) -> dict[str, str]:
+    """Extract SDF data fields (``> <NAME>`` / value) from a block string.
+
+    Scanning starts after the ``M  END`` line.  Only the first non-blank value
+    line for each property is captured (standard SDF convention).
+    """
+    props: dict[str, str] = {}
+    lines = block.splitlines()
+    in_data = False
+    current_prop: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if not in_data:
+            if stripped == "M  END":
+                in_data = True
+            continue
+        # Inside data section.
+        if stripped.startswith(">") and "<" in stripped:
+            # e.g.  "> <EXTERNAL_ID>" or "> <EXTERNAL_ID>  (optional comment)"
+            start = stripped.index("<") + 1
+            end = stripped.index(">", start)
+            current_prop = stripped[start:end]
+        elif current_prop is not None:
+            if stripped:
+                props[current_prop] = stripped
+                current_prop = None  # Only capture first value line.
+    return props
+
 
 def _ensure_text(file_obj: IO[bytes] | IO[str], encoding: str) -> IO[str]:
     """Wrap a binary stream in a TextIOWrapper if needed."""
@@ -135,10 +200,14 @@ def _to_binary(file_obj: IO[str]) -> io.BytesIO:
     return io.BytesIO(file_obj.read().encode("utf-8"))
 
 
-def _peek_text(stream: IO[str], n: int) -> str:
-    """Read up to *n* chars without consuming the stream (best-effort)."""
-    buf = stream.read(n)
-    return buf
+def _read_prefix(stream: IO[str], n: int) -> str:
+    """Consume up to *n* chars from *stream* and return them.
+
+    The caller is responsible for prepending the returned string back to the
+    stream (via :func:`_prepend`) before further reads.  The stream is
+    permanently advanced by the number of characters returned.
+    """
+    return stream.read(n)
 
 
 def _prepend(prefix: str, stream: IO[str]) -> IO[str]:
@@ -164,18 +233,3 @@ def _resolve_col(
             return row.get(fieldnames[col])
         return None
     return row.get(col)
-
-
-def _split_sdf_blocks(content: str) -> list[str]:
-    """Split SDF content into individual record blocks (without '$$$$' line)."""
-    blocks = []
-    current: list[str] = []
-    for line in content.splitlines(keepends=True):
-        if line.strip() == "$$$$":
-            blocks.append("".join(current))
-            current = []
-        else:
-            current.append(line)
-    if current:
-        blocks.append("".join(current))
-    return blocks

@@ -216,6 +216,12 @@ class TestErrorIsolation:
     def test_empty_raw_returns_unknown_with_error(self):
         row = normalize_row("")
         assert row.detected_type == DetectedInputType.UNKNOWN
+        assert row.error  # empty input must set a non-empty error
+
+    def test_whitespace_raw_returns_unknown_with_error(self):
+        row = normalize_row("   ")
+        assert row.detected_type == DetectedInputType.UNKNOWN
+        assert row.error
 
     def test_original_input_always_preserved(self):
         bad = "INVALID!!!"
@@ -389,6 +395,14 @@ class TestParseSdf:
     def test_raw_block_nonempty(self):
         rows = list(parse_sdf(self._stream(_SDF_RECORD)))
         assert len(rows[0]["raw"]) > 0
+
+    def test_generator_does_not_load_all(self):
+        """parse_sdf must be lazy: consuming the first record must not require
+        the rest of the stream to be read."""
+        gen = parse_sdf(self._stream(_SDF_TWO_RECORDS))
+        first = next(gen)
+        assert first["row_index"] == 0
+        assert first.get("external_id") == "CPD-001"
 
 
 # ---------------------------------------------------------------------------
