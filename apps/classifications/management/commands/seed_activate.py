@@ -16,6 +16,7 @@ hard-codes the physical versioned table name.
 """
 from __future__ import annotations
 
+import psycopg.sql as pgsql
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection, transaction
 
@@ -113,8 +114,10 @@ class Command(BaseCommand):
             # Atomically create or replace the view.
             with connection.cursor() as cur:
                 cur.execute(
-                    f"CREATE OR REPLACE VIEW {CURRENT_VIEW_NAME} AS "
-                    f"SELECT * FROM {physical_table}"
+                    pgsql.SQL("CREATE OR REPLACE VIEW {} AS SELECT * FROM {}").format(
+                        pgsql.Identifier(CURRENT_VIEW_NAME),
+                        pgsql.Identifier(physical_table),
+                    )
                 )
 
             # Update SeedImport row.

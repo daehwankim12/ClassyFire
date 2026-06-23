@@ -231,8 +231,9 @@ def test_duplicate_inchikey_detected(tmp_path):
         "test-dup",
         target_table="classyfire_seed",
     )
-    # One row written, one duplicate.
-    assert result["duplicates"] >= 1 or result["rows_written"] <= 1
+    # One row written, one duplicate skipped via ON CONFLICT DO NOTHING.
+    assert result["rows_written"] == 1
+    assert result["duplicates"] == 1
 
 
 # ---------------------------------------------------------------------------

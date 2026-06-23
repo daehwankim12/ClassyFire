@@ -24,6 +24,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import psycopg.sql as pgsql
+
 logger = logging.getLogger(__name__)
 
 # Column order in the TSV (must match the fixture).
@@ -169,10 +171,13 @@ def stream_import(
                     written = 0
                     dupes = 0
                     copy_data = "".join(buf)
-                    copy_sql = (
-                        f"COPY {target_table} ({', '.join(DB_COLUMNS)}) "
-                        f"FROM STDIN WITH (FORMAT text, NULL '\\N')"
+                    tbl = pgsql.Identifier(target_table)
+                    col_list = pgsql.SQL(", ").join(
+                        pgsql.Identifier(c) for c in DB_COLUMNS
                     )
+                    copy_sql = pgsql.SQL(
+                        "COPY {} ({}) FROM STDIN WITH (FORMAT text, NULL '\\N')"
+                    ).format(tbl, col_list).as_string(cursor.connection)
                     try:
                         with cursor.connection.cursor() as cur:
                             with cur.copy(copy_sql) as copy:
@@ -182,17 +187,26 @@ def stream_import(
                         # On duplicate key, fall back to row-by-row insert.
                         logger.warning("Bulk COPY failed (%s), falling back.", exc)
                         cursor.connection.rollback()
+                        insert_sql = pgsql.SQL(
+                            "INSERT INTO {} ({}) VALUES ({}) "
+                            "ON CONFLICT (inchikey) DO NOTHING"
+                        ).format(
+                            tbl,
+                            col_list,
+                            pgsql.SQL(", ").join(
+                                pgsql.Placeholder() for _ in DB_COLUMNS
+                            ),
+                        ).as_string(cursor.connection)
                         for line in buf:
-                            parts = line.rstrip("\n").split("\t")
-                            inchikey = parts[0] if parts else ""
+                            raw_parts = line.rstrip("\n").split("\t")
+                            # COPY uses '\N' for NULL; convert back to None for
+                            # parameterized INSERT bindings.
+                            parts = [
+                                None if v == r"\N" else v for v in raw_parts
+                            ]
+                            inchikey = raw_parts[0] if raw_parts else ""
                             try:
-                                cursor.execute(
-                                    f"INSERT INTO {target_table} "
-                                    f"({', '.join(DB_COLUMNS)}) VALUES "
-                                    f"({', '.join(['%s'] * len(DB_COLUMNS))}) "
-                                    f"ON CONFLICT (inchikey) DO NOTHING",
-                                    parts,
-                                )
+                                cursor.execute(insert_sql, parts)
                                 if cursor.rowcount == 0:
                                     dupes += 1
                                     logger.debug("Duplicate inchikey: %s", inchikey)
@@ -242,7 +256,10 @@ def stream_import(
                         rows_written += w
                         duplicates += d
                         shard_buf = []
-                        # Save checkpoint.
+                        # At-least-once checkpoint: a crash between flush and
+                        # here causes the shard to be re-attempted on resume,
+                        # which is safe because the fallback INSERT uses
+                        # ON CONFLICT DO NOTHING (idempotent).
                         _save_checkpoint(seed_import, offset)
 
                 # Flush remaining rows.
@@ -250,6 +267,7 @@ def stream_import(
                     w, d = flush_shard(shard_buf)
                     rows_written += w
                     duplicates += d
+                    # At-least-once checkpoint: see comment above.
                     _save_checkpoint(seed_import, offset)
 
     # Update SeedImport row.

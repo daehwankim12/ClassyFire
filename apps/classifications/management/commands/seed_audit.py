@@ -19,6 +19,7 @@ import json
 import re
 from typing import Any
 
+import psycopg.sql as pgsql
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 
@@ -40,9 +41,11 @@ def _audit_table(
     """Run all audit checks on *table* and return a structured report."""
     report: dict[str, Any] = {"table": table, "checks": {}, "passed": True}
 
+    tbl = pgsql.Identifier(table)
+
     with connection.cursor() as cur:
         # 1. Actual row count.
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        cur.execute(pgsql.SQL("SELECT COUNT(*) FROM {}").format(tbl))
         actual_count: int = cur.fetchone()[0]
         report["actual_row_count"] = actual_count
 
@@ -58,7 +61,7 @@ def _audit_table(
 
         # 2. Duplicate InChIKey count.
         cur.execute(
-            f"SELECT COUNT(*) - COUNT(DISTINCT inchikey) FROM {table}"
+            pgsql.SQL("SELECT COUNT(*) - COUNT(DISTINCT inchikey) FROM {}").format(tbl)
         )
         dup_count: int = cur.fetchone()[0]
         report["duplicate_count"] = dup_count
@@ -68,8 +71,10 @@ def _audit_table(
 
         # 3. InChIKey format check.
         cur.execute(
-            f"SELECT COUNT(*) FROM {table} "
-            f"WHERE inchikey !~ '^[A-Z]{{14}}-[A-Z]{{10}}-[A-Z]$'"
+            pgsql.SQL(
+                "SELECT COUNT(*) FROM {} "
+                "WHERE inchikey !~ '^[A-Z]{{14}}-[A-Z]{{10}}-[A-Z]$'"
+            ).format(tbl)
         )
         bad_inchikey: int = cur.fetchone()[0]
         report["checks"]["inchikey_format"] = {
@@ -83,13 +88,15 @@ def _audit_table(
         fk_checks: dict[str, Any] = {}
         for slot in CHEMONT_SLOTS:
             cur.execute(
-                f"""
-                SELECT COUNT(*) FROM {table} s
-                WHERE s.{slot} IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM chemont_node c WHERE c.numeric_id = s.{slot}
-                  )
-                """
+                pgsql.SQL(
+                    """
+                    SELECT COUNT(*) FROM {} s
+                    WHERE s.{} IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM chemont_node c WHERE c.numeric_id = s.{}
+                      )
+                    """
+                ).format(tbl, pgsql.Identifier(slot), pgsql.Identifier(slot))
             )
             bad_fk: int = cur.fetchone()[0]
             fk_checks[slot] = {"bad_count": bad_fk, "ok": bad_fk == 0}
@@ -98,16 +105,20 @@ def _audit_table(
         report["checks"]["chemont_fk"] = fk_checks
 
         # 5. Five-slot path coverage.
-        cur.execute(f"SELECT COUNT(*) FROM {table} WHERE kingdom_id IS NOT NULL")
+        cur.execute(
+            pgsql.SQL("SELECT COUNT(*) FROM {} WHERE kingdom_id IS NOT NULL").format(tbl)
+        )
         kingdom_count: int = cur.fetchone()[0]
 
         cur.execute(
-            f"SELECT COUNT(*) FROM {table} "
-            f"WHERE kingdom_id IS NOT NULL "
-            f"AND superclass_id IS NOT NULL "
-            f"AND class_id IS NOT NULL "
-            f"AND subclass_id IS NOT NULL "
-            f"AND direct_parent_id IS NOT NULL"
+            pgsql.SQL(
+                "SELECT COUNT(*) FROM {} "
+                "WHERE kingdom_id IS NOT NULL "
+                "AND superclass_id IS NOT NULL "
+                "AND class_id IS NOT NULL "
+                "AND subclass_id IS NOT NULL "
+                "AND direct_parent_id IS NOT NULL"
+            ).format(tbl)
         )
         full_path_count: int = cur.fetchone()[0]
 
@@ -126,7 +137,9 @@ def _audit_table(
         null_checks: dict[str, Any] = {}
         for slot in CHEMONT_SLOTS:
             cur.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE {slot} IS NULL"
+                pgsql.SQL("SELECT COUNT(*) FROM {} WHERE {} IS NULL").format(
+                    tbl, pgsql.Identifier(slot)
+                )
             )
             null_count: int = cur.fetchone()[0]
             null_pct = (null_count / actual_count * 100) if actual_count else 0.0
