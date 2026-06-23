@@ -1,123 +1,304 @@
 # ClassyFire Batch Cache Web
 
-A Django batch web application for managing and processing chemical data with RDKit and PostgreSQL. Supports compound import, caching, and REST APIs.
+A self-hosted Django web application that accepts batches of chemical
+identifiers (SMILES, InChI, InChIKey), classifies them using a local cache,
+and optionally forwards unresolved compounds to the
+[Wishart Lab ClassyFire API](https://classyfire.wishartlab.com/).
 
-## Quick Start
+Classifications are cached locally so repeated queries are served instantly.
+The application works fully offline for any compound already in the local cache
+and degrades gracefully when the remote API is unreachable.
 
-### Installation
+---
 
-1. Clone the repository
-2. Create and activate a virtual environment:
-   ```bash
-   python3.12 -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -e ".[dev]"
-   ```
+## Quick Start — Fresh Linux PC
 
-### Development
+### 1. Prerequisites
 
-Run tests:
+- Docker Engine 24+ with the Compose plugin (`docker compose version`)
+- A domain or subdomain pointed at this machine (optional — only required for
+  the ngrok dev-domain feature)
+
+### 2. Configure environment
+
 ```bash
-make test
+cp .env.example .env
 ```
 
-Format code:
-```bash
-make format
+Edit `.env` and set at minimum:
+
+```dotenv
+POSTGRES_PASSWORD=<strong_random_password>
+DJANGO_SECRET_KEY=<50+-character_random_string>
 ```
 
-Check code style:
+### 3. Start the stack
+
 ```bash
-make lint
+docker compose up -d
 ```
 
-Type check:
+This starts six containers:
+
+| Service | Role |
+|---|---|
+| `db` | PostgreSQL 16 (internal only, no host port) |
+| `web` | Gunicorn (internal only, accessed via proxy) |
+| `worker` | Classification worker (`python manage.py runworker`) |
+| `backup` | Daily backup cron |
+| `proxy` | Caddy reverse proxy (publishes ports 80 and 443) |
+| `ngrok-agent` | Optional ngrok tunnel (requires NGROK_AUTHTOKEN) |
+
+### 4. Run migrations and collect static files
+
 ```bash
-make typecheck
+docker compose exec web python manage.py migrate
+docker compose exec web python manage.py collectstatic --noinput
 ```
 
-### Database Setup
+### 5. Create an admin user (optional)
 
-1. Ensure PostgreSQL is running
-2. Configure `.env` with your database credentials
-3. Run migrations:
-   ```bash
-   python manage.py migrate
-   ```
+```bash
+docker compose exec web python manage.py createsuperuser
+```
 
-## Seed Data Management
+### 6. Verify
 
-The application includes commands for downloading, verifying, and importing chemical seed data:
+Open `http://localhost/` (or your domain) in a browser.  The submit page
+should load.
 
-### Download seeds
+---
+
+## Seed Dataset (Local Classification Cache)
+
+A pre-loaded seed dataset significantly reduces the number of remote calls.
+Three profiles are available:
+
+| Profile | Description | Size (approx.) |
+|---|---|---|
+| `FULL` | Complete InChIKey-deduplicated ClassyFire collection | ~4 GB |
+| `LITE` | Most-common compounds only | ~400 MB |
+| `CUSTOM` | User-supplied subset | varies |
+
+### Download
+
 ```bash
 make seed-download
 ```
 
-### Verify seeds
+Downloads the selected seed profile from Zenodo (record 20472700).
+
+### Verify integrity
+
 ```bash
 make seed-verify
 ```
 
-### Import seeds (resumable)
+Checks SHA-256 checksums.
+
+### Import (resumable)
+
 ```bash
 make seed-import
 ```
 
-### Audit seed data
+Streams rows into the seed staging table.  Import can be safely interrupted and
+resumed — the checkpoint mechanism prevents duplicate rows.
+
+### Audit
+
 ```bash
 make seed-audit
 ```
 
-### Activate seeds in cache
+Validates InChIKey format and ChemOnt hierarchy consistency.  A seed that fails
+audit cannot be activated.
+
+### Activate
+
 ```bash
 make seed-activate
 ```
 
-## Ngrok Runbook
+Promotes the audited seed to the active classification cache.  This operation
+is idempotent and does not overwrite live (Wishart) results.
 
-For exposing the local development server to the internet:
+---
 
-1. Install ngrok: `brew install ngrok` (or your OS equivalent)
-2. Start the Django development server: `python manage.py runserver`
-3. In another terminal, create a tunnel:
-   ```bash
-   ngrok http 8000
-   ```
-4. Use the generated public URL for webhook testing or external integrations
+## ngrok Dev Domain Setup
+
+The ngrok agent exposes your local instance at a stable public HTTPS URL.
+
+### 1. Obtain an ngrok account and auth token
+
+Sign up at [ngrok.com](https://ngrok.com) and copy your auth token from the
+dashboard.
+
+### 2. Reserve a dev domain (ngrok paid plan)
+
+In the ngrok dashboard, reserve a static domain (e.g.
+`your-name.ngrok-free.app`).
+
+### 3. Configure `.env`
+
+```dotenv
+NGROK_AUTHTOKEN=<your_ngrok_auth_token>
+NGROK_DOMAIN=<your_domain>.ngrok-free.app
+```
+
+### 4. Start the stack
+
+```bash
+docker compose up -d
+```
+
+The `ngrok-agent` container reads `NGROK_AUTHTOKEN` and `NGROK_DOMAIN` and
+connects automatically.  Your application is now reachable at
+`https://<NGROK_DOMAIN>/`.
+
+---
 
 ## Backup and Restore
 
-### Backup the database
+### Run a backup
+
 ```bash
-pg_dump -U postgres classyfire > backup.sql
+docker compose exec web python manage.py run_backup
 ```
 
-### Restore from backup
+Creates a compressed archive plus a JSON manifest (tables, row counts,
+checksums) in the configured backup directory.  Applies retention policy
+(7 daily, 4 weekly, 12 monthly).
+
+### Restore smoke test
+
 ```bash
-psql -U postgres classyfire < backup.sql
+docker compose exec web python manage.py restore_smoke_test
 ```
 
-## Project Structure
+Verifies the most recent backup is readable and checksums match.
 
-- `apps/` - Django applications
-- `config/` - Project configuration and settings
-- `manage.py` - Django management script
-- `Makefile` - Common development commands
-- `pyproject.toml` - Project metadata and dependencies
+### Full restore (data loss operation)
 
-## Acceptance Workflow
+```bash
+# Stop the worker
+docker compose stop worker
 
-1. Implement feature in feature branch
-2. Run all tests: `make test`
-3. Run linters: `make lint`
-4. Run type checker: `make typecheck`
-5. Create pull request with feature branch
-6. Merge to main after review approval
+# Restore
+docker compose exec web python manage.py restore_from_backup \
+  --backup-file backups/<archive_name>.tar.gz
+
+# Restart
+docker compose up -d
+```
+
+See [docs/operations.md](docs/operations.md) for the full runbook.
+
+---
+
+## Remote-Outage Behaviour
+
+When the Wishart ClassyFire API is unreachable:
+
+- **Local cache lookups continue normally.** Compounds already in the local or
+  seed cache are served instantly.
+- **The circuit breaker opens** after repeated consecutive failures, preventing
+  further outbound calls until the API recovers.
+- **Pending remote tasks are deferred** — they are not lost.  When the circuit
+  closes (or an admin clicks **Retry deferred** in `/admin/`), deferred tasks
+  are retried automatically.
+
+Monitor circuit state on the `/stats/` page.
+
+---
+
+## Update Process
+
+```bash
+# Pull latest code
+git pull origin main
+
+# Pull updated images
+docker compose pull
+
+# Run migrations (safe on a live database)
+docker compose exec web python manage.py migrate
+
+# Restart application containers
+docker compose up -d --no-deps web worker
+```
+
+---
+
+## Failure Response
+
+| Symptom | First step |
+|---|---|
+| Worker not processing tasks | `docker compose logs worker`; check circuit state on `/stats/` |
+| Database connection errors | `docker compose ps db`; check `POSTGRES_*` vars in `.env` |
+| Remote API unreachable | Circuit breaker will self-heal; use **Retry deferred** if needed |
+| Disk full / upload rejected | `df -h /`; prune old backups; check disk guard threshold |
+| Missing classifications | Check NEED_STRUCTURE items; provide structures via the UI or API |
+
+See [docs/operations.md](docs/operations.md) for detailed procedures.
+
+---
+
+## Development
+
+### Install dependencies
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+### Run tests
+
+```bash
+make test
+```
+
+### Lint / format / type-check
+
+```bash
+make lint
+make format
+make typecheck
+```
+
+---
+
+## Documentation
+
+- [docs/user-guide.md](docs/user-guide.md) — How to submit compounds, read results, handle NEED_STRUCTURE, export
+- [docs/operations.md](docs/operations.md) — Worker management, backup/restore, seed swap, admin actions
+- [docs/api/openapi.yaml](docs/api/openapi.yaml) — Full OpenAPI 3 spec
+- [docs/acceptance-test-results.md](docs/acceptance-test-results.md) — Acceptance evidence for all T-xx / NFR-Pxx IDs
+- [docs/state-machines.md](docs/state-machines.md) — BatchItem and RemoteTask state diagrams
+
+---
 
 ## License
 
 MIT
+
+## Attribution
+
+When using ClassyFire classifications, please cite:
+
+> Djoumbou Feunang Y, Eisner R, Knox C, Chepelev L, Hastings J, Owen G,
+> Fahy E, Steinbeck C, Wishart DS.
+> ClassyFire: automated chemical classification with a comprehensive,
+> computable taxonomy.
+> *J Cheminformatics.* 2016;8:61.
+> DOI: [10.1186/s13321-016-0174-y](https://doi.org/10.1186/s13321-016-0174-y)
+
+The pre-loaded seed dataset is derived from:
+
+> InChIKey-Deduplicated ClassyFire/ChemOnt Label Collection v3  
+> Zenodo record 20472700  
+> License: CC BY 4.0
+
+See [NOTICE.md](NOTICE.md) for full attribution details.

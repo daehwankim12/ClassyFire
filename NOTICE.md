@@ -32,3 +32,29 @@ Structures submitted to this service may be forwarded to the Wishart Lab
 ClassyFire web service (https://classyfire.wishartlab.com) for classification.
 Successful classification results and identifiers (InChIKeys) are stored
 locally in this service's database for caching purposes.
+
+Users should not submit confidential or proprietary structures if forwarding to
+the Wishart Lab service is a concern.  Remote classification can be disabled
+per-job using the "remote_enabled=false" API parameter or by unchecking the
+"Enable remote classification" toggle on the submit page.
+
+## Third-Party Software
+
+This application uses the following open-source libraries and tools:
+
+- **Django** — BSD License — https://www.djangoproject.com/
+- **RDKit** — BSD License — https://www.rdkit.org/
+- **PostgreSQL** — PostgreSQL License — https://www.postgresql.org/
+- **Caddy** — Apache License 2.0 — https://caddyserver.com/
+- **ngrok** — ngrok Terms of Service — https://ngrok.com/tos
+
+Full dependency list is available in `pyproject.toml`.
+
+## Seed Dataset Attribution
+
+The seed dataset (Zenodo record 20472700) is made available under the
+Creative Commons Attribution 4.0 International (CC BY 4.0) licence.
+You are free to share and adapt the dataset provided you give appropriate
+credit, provide a link to the licence, and indicate if changes were made.
+
+Licence text: https://creativecommons.org/licenses/by/4.0/
