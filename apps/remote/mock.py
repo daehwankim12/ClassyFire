@@ -57,6 +57,19 @@ def build_raw(
     }
 
 
+def build_query_response(
+    entities: list[dict[str, Any]],
+    *,
+    status: str = "Done",
+) -> dict[str, Any]:
+    """Build a Wishart /queries response wrapping ``entities``.
+
+    Mirrors the real completed-query shape so tests can simulate a single query
+    that resolves MULTIPLE batched structures deterministically.
+    """
+    return {"classification_status": status, "entities": list(entities)}
+
+
 @dataclass
 class MockProvider:
     """A scriptable provider. All state is explicit and deterministic."""
@@ -141,6 +154,12 @@ class MockProvider:
         self.parse_calls += 1
         return parse_wishart_payload(raw_json)
 
+    def parse_results(
+        self, raw_json: dict[str, Any]
+    ) -> list[NormalizedClassification]:
+        self.parse_calls += 1
+        return parse_wishart_results(raw_json)
+
 
 def _slot(raw: dict[str, Any], key: str) -> ChemOntSlot | None:
     node = raw.get(key)
@@ -172,3 +191,26 @@ def parse_wishart_payload(raw_json: dict[str, Any]) -> NormalizedClassification:
         raw_json=raw_json,
         alternative_parents=list(raw_json.get("alternative_parents") or []),
     )
+
+
+def parse_wishart_results(
+    raw_json: dict[str, Any],
+) -> list[NormalizedClassification]:
+    """Parse EVERY entity in a Wishart query response into a list.
+
+    A completed /queries response wraps one classification per submitted
+    structure under ``entities``; each is parsed independently so the worker can
+    resolve every batched task by its own response InChIKey. A payload without an
+    ``entities`` list is treated as a single unwrapped entity (returns one item),
+    keeping the single-structure path working. An empty response yields ``[]``.
+    """
+    entities = raw_json.get("entities")
+    if isinstance(entities, list):
+        return [
+            parse_wishart_payload(entity)
+            for entity in entities
+            if isinstance(entity, dict)
+        ]
+    if raw_json:
+        return [parse_wishart_payload(raw_json)]
+    return []

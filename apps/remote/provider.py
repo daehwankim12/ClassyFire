@@ -142,3 +142,16 @@ class Provider(Protocol):
 
     def parse_result(self, raw_json: dict[str, Any]) -> NormalizedClassification:
         """Normalize a raw upstream payload into five-tier labels + key."""
+
+    def parse_results(
+        self, raw_json: dict[str, Any]
+    ) -> list[NormalizedClassification]:
+        """Normalize EVERY entity in a query response into a list.
+
+        A completed /queries response wraps one classification per submitted
+        structure under ``entities``. This yields one
+        :class:`NormalizedClassification` per entity (each carrying its own
+        response InChIKey + per-entity raw JSON) so the worker can resolve every
+        task batched into the query. For an unwrapped single-entity payload this
+        returns a one-element list.
+        """

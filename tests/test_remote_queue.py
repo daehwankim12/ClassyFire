@@ -24,7 +24,7 @@ from apps.core.enums import (
 )
 from apps.remote import queue
 from apps.remote.circuit import CircuitBreaker, CircuitState
-from apps.remote.mock import MockProvider, build_raw
+from apps.remote.mock import MockProvider, build_query_response, build_raw
 from apps.remote.models import RemoteQuery, RemoteTask
 from apps.remote.rate_limit import RateLimiter
 from apps.remote.worker import RemoteWorker
@@ -290,6 +290,190 @@ def test_poll_running_then_complete_fans_out():
     assert live.remote_query_id == "q-1"
     item = BatchItem.objects.get(job=job, inchikey=IK_A)
     assert item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
+
+
+# ---------------------------------------------------------------------------
+# multi-result batched query (REMOTE_BATCH_SIZE > 1)
+# ---------------------------------------------------------------------------
+
+
+def _drain_batch_query(provider, worker) -> None:
+    """Submit one batch, then poll it to COMPLETE (no re-submit afterwards).
+
+    Only POLL_WAIT tasks are made due so the single batched query is polled to
+    completion; tasks that revert to retry after the query completes are left
+    parked (the tests assert on that parked state) rather than re-submitted.
+    """
+    # 1) submit: the primary task pulls in extras -> one query for the batch.
+    worker.tick()
+    # 2) poll the batched query until it is COMPLETE.
+    for _ in range(10):
+        if RemoteQuery.objects.filter(state=QueryState.COMPLETE).exists():
+            break
+        RemoteTask.objects.filter(state=TaskState.POLL_WAIT).update(
+            next_run_at=timezone.now()
+        )
+        if not worker.tick():
+            break
+
+
+def test_multi_result_batch_resolves_every_task(settings):
+    # THE CORE BUG: a /queries submission batches up to REMOTE_BATCH_SIZE
+    # structures into ONE query; the completed response carries one entity per
+    # structure. EVERY batched task must be resolved by its own InChIKey — not
+    # just entities[0]. On the old entities[0]-only code IK_B and IK_C would
+    # never be resolved (they would fall out of polling), so this test is RED
+    # before the fix.
+    settings.REMOTE_BATCH_SIZE = 3
+    job = _job()
+    for ik in (IK_A, IK_B, IK_C):
+        comp = _compound(ik)
+        _item(job, ik, 0, compound=comp)
+        queue.enqueue_task(ik, compound_id=comp.id)
+
+    response = build_query_response(
+        [build_raw(IK_A), build_raw(IK_B), build_raw(IK_C)]
+    )
+    provider = MockProvider(
+        submit_query_ids=["q-batch"],
+        poll_script={"q-batch": [response]},
+    )
+    worker = _worker(provider)
+
+    # Exactly ONE query was submitted for the whole batch.
+    worker.tick()
+    assert len(provider.submit_calls) == 1
+    assert len(provider.submit_calls[0]) == 3
+    assert RemoteQuery.objects.count() == 1
+
+    # Poll the single query to completion.
+    for _ in range(10):
+        if RemoteQuery.objects.filter(state=QueryState.COMPLETE).exists():
+            break
+        RemoteTask.objects.filter(state=TaskState.POLL_WAIT).update(
+            next_run_at=timezone.now()
+        )
+        if not worker.tick():
+            break
+
+    # ALL three tasks DONE, all three live results persisted, all items fanned.
+    for ik in (IK_A, IK_B, IK_C):
+        task = RemoteTask.objects.get(inchikey=ik)
+        assert task.state == TaskState.DONE, ik
+        live = ClassyfireLive.objects.get(inchikey=ik)
+        assert live.source_type == SourceType.WISHART_LIVE_QUERY
+        assert live.source_priority == 100
+        assert live.remote_query_id == "q-batch"
+        item = BatchItem.objects.get(job=job, inchikey=ik)
+        assert item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
+    # No task left stranded in a poll-waiting state.
+    assert not RemoteTask.objects.filter(
+        state__in=[TaskState.SUBMITTED, TaskState.POLL_WAIT]
+    ).exists()
+    assert RemoteQuery.objects.get(remote_query_id="q-batch").state == (
+        QueryState.COMPLETE
+    )
+
+
+def test_partial_response_resolves_present_and_retries_absent(settings):
+    # The query returns only 2 of 3 entities. The two present are resolved; the
+    # absent one is NOT stranded — it retries per the normal backoff rules.
+    settings.REMOTE_BATCH_SIZE = 3
+    job = _job()
+    for ik in (IK_A, IK_B, IK_C):
+        comp = _compound(ik)
+        _item(job, ik, 0, compound=comp)
+        queue.enqueue_task(ik, compound_id=comp.id)
+
+    # IK_C is missing from the response.
+    response = build_query_response([build_raw(IK_A), build_raw(IK_B)])
+    provider = MockProvider(
+        submit_query_ids=["q-batch"],
+        poll_script={"q-batch": [response]},
+    )
+    worker = _worker(provider)
+    _drain_batch_query(provider, worker)
+
+    for ik in (IK_A, IK_B):
+        assert RemoteTask.objects.get(inchikey=ik).state == TaskState.DONE
+        assert ClassyfireLive.objects.filter(inchikey=ik).exists()
+        assert BatchItem.objects.get(job=job, inchikey=ik).status == (
+            BatchItemStatus.COMPLETE_AFTER_WISHART
+        )
+
+    # The absent task is retried (or deferred), never stranded / DONE-without-result.
+    absent = RemoteTask.objects.get(inchikey=IK_C)
+    assert absent.state in {
+        TaskState.RETRY_WAIT,
+        TaskState.READY,
+        TaskState.DEFERRED,
+    }
+    assert absent.attempt >= 1
+    assert not ClassyfireLive.objects.filter(inchikey=IK_C).exists()
+    assert BatchItem.objects.get(job=job, inchikey=IK_C).status == (
+        BatchItemStatus.REMOTE_DELAYED
+    )
+
+
+def test_mismatch_key_in_batch_marks_offending_task(settings):
+    # A batched task whose response entity carries a DIFFERENT key (but the key
+    # IS present in the response, mapped to that slot) -> RESULT_KEY_MISMATCH for
+    # that task only; the others resolve normally.
+    settings.REMOTE_BATCH_SIZE = 2
+    job = _job()
+    for ik in (IK_A, IK_B):
+        comp = _compound(ik)
+        _item(job, ik, 0, compound=comp)
+        queue.enqueue_task(ik, compound_id=comp.id)
+
+    # We patch parse_results so the IK_B task is handed an entity whose key !=
+    # its requested key (mismatch path), while IK_A matches.
+    from apps.remote import mock as mock_mod
+
+    response = build_query_response([build_raw(IK_A), build_raw(IK_B)])
+    provider = MockProvider(
+        submit_query_ids=["q-batch"],
+        poll_script={"q-batch": [response]},
+    )
+
+    real_parse = mock_mod.parse_wishart_results
+
+    def mismatched(raw):
+        norms = real_parse(raw)
+        out = []
+        for n in norms:
+            if n.inchikey == IK_B:
+                out.append(
+                    mock_mod.NormalizedClassification(
+                        inchikey=IK_C,  # wrong key reported for the IK_B slot
+                        kingdom=n.kingdom,
+                        superclass=n.superclass,
+                        class_=n.class_,
+                        subclass=n.subclass,
+                        direct_parent=n.direct_parent,
+                        classification_version=n.classification_version,
+                        raw_json=n.raw_json,
+                        alternative_parents=n.alternative_parents,
+                    )
+                )
+            else:
+                out.append(n)
+        return out
+
+    provider.parse_results = mismatched  # type: ignore[method-assign]
+    worker = _worker(provider)
+    _drain_batch_query(provider, worker)
+
+    assert RemoteTask.objects.get(inchikey=IK_A).state == TaskState.DONE
+    assert ClassyfireLive.objects.filter(inchikey=IK_A).exists()
+
+    # IK_B: response carried a non-matching key -> mismatch, terminal, no live row.
+    b_task = RemoteTask.objects.get(inchikey=IK_B)
+    assert b_task.state == TaskState.DONE
+    assert not ClassyfireLive.objects.filter(inchikey=IK_B).exists()
+    assert BatchItem.objects.get(job=job, inchikey=IK_B).status == (
+        BatchItemStatus.RESULT_KEY_MISMATCH
+    )
 
 
 # ---------------------------------------------------------------------------

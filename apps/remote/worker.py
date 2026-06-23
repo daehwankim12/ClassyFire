@@ -47,6 +47,7 @@ from apps.remote.models import RemoteQuery, RemoteQueryItem, RemoteTask
 from apps.remote.provider import (
     EntityLookupStatus,
     NonRetryableProviderError,
+    NormalizedClassification,
     PollStatus,
     Provider,
     RetryableProviderError,
@@ -342,7 +343,71 @@ class RemoteWorker:
     def _apply_query_result(
         self, task: RemoteTask, query: RemoteQuery, raw: dict
     ) -> None:
-        norm = self.provider.parse_result(raw)
+        """Resolve EVERY task batched into this completed query.
+
+        A single /queries submission batches up to ``REMOTE_BATCH_SIZE``
+        structures; the completed response carries one entity per structure
+        (Wishart returns them in submission order). We dispatch each RemoteTask
+        linked via ``RemoteQueryItem`` independently — no batched task may be
+        left parked after the query completes:
+
+        * an entity is paired with this task and its response key == requested →
+          write live result (WISHART_LIVE_QUERY, priority 100) + fan-out + DONE;
+        * an entity is paired with this task but its response key != requested →
+          RESULT_KEY_MISMATCH + terminal (mirrors the entity-lookup guard);
+        * NO entity is available for this task (response omitted it) → treat as
+          an unresolved miss and retry per the normal backoff rules.
+
+        Pairing strategy: when the response yields exactly one entity per
+        submitted task we pair positionally (submit order == RemoteQueryItem id
+        order == ``entities`` order), so a wrong-key slot is caught as a genuine
+        mismatch. Otherwise (a partial response) we fall back to matching each
+        task to the entity bearing its own InChIKey and retry the absent ones.
+
+        ``task`` (the one we polled with) is resolved on the same footing as its
+        batch siblings via the RemoteQueryItem set.
+        """
+        results = self.provider.parse_results(raw)
+
+        # Members in deterministic submit order (== the order entities arrive).
+        members: list[RemoteTask] = []
+        seen_task_ids: set[int] = set()
+        for item in query.items.select_related("task").order_by("id"):
+            member = item.task
+            if member is None or member.id in seen_task_ids:
+                continue
+            seen_task_ids.add(member.id)
+            members.append(member)
+        # Defensive: never strand the task we polled with even if its
+        # RemoteQueryItem link was severed (SET_NULL).
+        if task.id not in seen_task_ids:
+            members.append(task)
+
+        if len(results) == len(members):
+            # Clean one-entity-per-task response: pair positionally and validate
+            # each pair's key, so a wrong-key slot surfaces as a mismatch.
+            for member, norm in zip(members, results, strict=True):
+                self._dispatch_resolved(member, query, norm)
+            return
+
+        # Partial / ragged response: resolve by InChIKey, retry the absent.
+        by_key: dict[str, NormalizedClassification] = {
+            norm.inchikey: norm for norm in results if norm.inchikey is not None
+        }
+        for member in members:
+            self._dispatch_resolved(member, query, by_key.get(member.inchikey))
+
+    def _dispatch_resolved(
+        self,
+        task: RemoteTask,
+        query: RemoteQuery,
+        norm: NormalizedClassification | None,
+    ) -> None:
+        if norm is None:
+            # No entity for this task's InChIKey: unresolved miss → retry per the
+            # normal backoff rules rather than leaving it parked in POLL_WAIT.
+            queue.schedule_retry(task)
+            return
         if not self._key_matches(task.inchikey, norm.inchikey):
             self._handle_key_mismatch(task)
             return

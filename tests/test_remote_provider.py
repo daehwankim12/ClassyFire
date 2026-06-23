@@ -8,7 +8,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from apps.remote.mock import MockProvider, build_raw
+from apps.remote.mock import MockProvider, build_query_response, build_raw
 from apps.remote.provider import (
     EntityLookupStatus,
     NonRetryableProviderError,
@@ -91,6 +91,30 @@ def test_mock_parse_result_key_from_response():
     raw = build_raw(IK_B)
     norm = provider.parse_result(raw)
     assert norm.inchikey == IK_B
+
+
+def test_mock_parse_results_yields_every_entity():
+    # A completed query response wraps MULTIPLE entities; parse_results must
+    # return one normalized classification per entity, each with its own key.
+    provider = MockProvider()
+    raw = build_query_response([build_raw(IK_A), build_raw(IK_B)])
+    norms = provider.parse_results(raw)
+    assert [n.inchikey for n in norms] == [IK_A, IK_B]
+    # Each carries its own per-entity raw payload, not the whole wrapper.
+    assert all("entities" not in (n.raw_json or {}) for n in norms)
+
+
+def test_mock_parse_results_single_unwrapped_payload():
+    # An unwrapped single-entity payload (entity-lookup shape) -> one item.
+    provider = MockProvider()
+    norms = provider.parse_results(build_raw(IK_A))
+    assert [n.inchikey for n in norms] == [IK_A]
+
+
+def test_mock_parse_results_empty_response():
+    provider = MockProvider()
+    assert provider.parse_results({}) == []
+    assert provider.parse_results(build_query_response([])) == []
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +214,25 @@ def test_wishart_poll_running_then_complete():
     assert done.status == PollStatus.COMPLETE
     norm = provider.parse_result(done.raw_json or {})
     assert norm.inchikey == IK_A
+
+
+def test_wishart_parse_results_unwraps_all_entities():
+    # The real provider must surface EVERY entity in a completed query response
+    # (not just entities[0]) so every batched task can be resolved.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "classification_status": "Done",
+                "entities": [build_raw(IK_A), build_raw(IK_B)],
+            },
+        )
+
+    provider = _wishart_with(handler)
+    done = provider.poll_query("q1")
+    assert done.status == PollStatus.COMPLETE
+    norms = provider.parse_results(done.raw_json or {})
+    assert [n.inchikey for n in norms] == [IK_A, IK_B]
 
 
 def test_wishart_timeout_is_retryable_entity():
