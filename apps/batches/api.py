@@ -52,7 +52,7 @@ from django.views.decorators.http import require_http_methods
 from apps.batches.exports import create_export, get_export_path
 from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
-from apps.batches.services import create_job
+from apps.batches.services import create_job, recompute_job_counters
 from apps.core.enums import BatchItemStatus
 from apps.core.security import require_shared_access
 
@@ -279,6 +279,10 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     else:
         item.message = "Structure provided; remote classification disabled."
         item.save(update_fields=["inchikey", "message"])
+
+    # Recompute job counters after every structure resubmit — critical for
+    # cache-hit paths (FOUND_*) where no remote fan-out ever fires.
+    recompute_job_counters(job.pk)
 
     return JsonResponse({"status": item.status})
 

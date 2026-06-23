@@ -395,12 +395,14 @@ def test_job_counters_mixed():
     job = BatchJob.objects.get(pk=data["job_id"])
     assert job.total_count == 3
     assert job.local_hit_count == 1
-    assert job.completed_count == 1
+    # completed = all terminal items: FOUND_LIVE_CACHE + INVALID_INPUT (unified definition)
+    assert job.completed_count == 2
     assert job.invalid_count == 1
     assert job.need_structure_count == 1
     assert job.remote_pending_count == 0
-    # Some items are not complete, so status should be IN_PROGRESS
-    assert job.status == BatchJobStatus.IN_PROGRESS
+    # NEED_STRUCTURE items do NOT block COMPLETE — only remote_pending items do.
+    # This job has no in-flight remote work, so status is COMPLETE.
+    assert job.status == BatchJobStatus.COMPLETE
 
 
 @pytest.mark.django_db(transaction=True)
@@ -573,3 +575,127 @@ def test_get_or_create_compound_already_exists_no_error():
     assert compound.inchikey == ASPIRIN_INCHIKEY
     # Only one row exists (no duplicate created)
     assert CompoundStructure.objects.filter(inchikey=ASPIRIN_INCHIKEY).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Structure resubmit: job counter + status update (bug fix)
+# ---------------------------------------------------------------------------
+
+# L-Tryptophan: SMILES → InChIKey are a matched pair verified via RDKit.
+# Using a separate InChIKey/SMILES pair for structure-resubmit tests so they
+# are independent of GHOST_INCHIKEY (which is a bare key with no matching SMILES
+# in this file).
+LTRP_SMILES = "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O"
+LTRP_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_structure_resubmit_cache_hit_updates_counters():
+    """BUG FIX: structure resubmit that resolves to a cache hit must update job counters.
+
+    When the submitted structure is in the seed/live cache, the item flips to
+    FOUND_SEED_CACHE/FOUND_LIVE_CACHE with NO remote fan-out.  Previously the
+    job's need_structure_count stayed too high and completed_count too low,
+    leaving the job stuck IN_PROGRESS forever.  This test asserts the fix.
+    """
+    import json as _json
+
+    from apps.batches.models import BatchJob
+    from apps.core.enums import BatchItemStatus, BatchJobStatus
+
+    client = Client()
+    # Create a job with the L-Trp InChIKey (no structure) — remote disabled so
+    # the item stays at NEED_STRUCTURE.
+    r = _post_job(client, text_input=LTRP_INCHIKEY, remote_enabled=False)
+    assert r.status_code == 201
+    data = r.json()
+    job = BatchJob.objects.get(pk=data["job_id"])
+    secret = data["result_secret"]
+
+    # Sanity: item is NEED_STRUCTURE, job counters reflect that.
+    item = job.items.first()
+    assert item is not None
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+    assert item.inchikey == LTRP_INCHIKEY
+    job.refresh_from_db()
+    assert job.need_structure_count == 1
+    assert job.completed_count == 0
+
+    # Now add a seed entry for this InChIKey so the structure resubmit resolves as
+    # a seed hit.
+    _make_seed(LTRP_INCHIKEY)
+
+    # Submit the matching structure via the API.
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=_json.dumps({"structure": LTRP_SMILES, "secret": secret}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+    resp_data = response.json()
+    # Item must now be a cache hit.
+    assert resp_data["status"] in (
+        BatchItemStatus.FOUND_SEED_CACHE,
+        BatchItemStatus.FOUND_LIVE_CACHE,
+    ), f"Expected cache-hit status, got {resp_data['status']}"
+
+    # Job counters MUST have been updated immediately (no fan-out required).
+    job.refresh_from_db()
+    assert job.need_structure_count == 0, (
+        "need_structure_count must be decremented after cache-hit structure resubmit"
+    )
+    assert job.completed_count == 1, (
+        "completed_count must be incremented after cache-hit structure resubmit"
+    )
+    # The only item is now terminal — job must be COMPLETE.
+    assert job.status == BatchJobStatus.COMPLETE, (
+        "job must transition to COMPLETE when last in-flight item resolves via cache hit"
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_structure_resubmit_pending_updates_counters():
+    """Structure resubmit that is a cache miss → PENDING_CLASSIFICATION; counters updated."""
+    import json as _json
+
+    from apps.batches.models import BatchJob
+    from apps.core.enums import BatchItemStatus, BatchJobStatus
+
+    client = Client()
+    # Create a NEED_STRUCTURE job (remote disabled, L-Trp InChIKey, no seed/live data).
+    r = _post_job(client, text_input=LTRP_INCHIKEY, remote_enabled=False)
+    assert r.status_code == 201
+    data = r.json()
+    job = BatchJob.objects.get(pk=data["job_id"])
+    secret = data["result_secret"]
+
+    item = job.items.first()
+    assert item is not None
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+    assert item.inchikey == LTRP_INCHIKEY
+    job.refresh_from_db()
+    assert job.need_structure_count == 1
+
+    # Manually enable remote on the job so the resubmit path creates a RemoteTask.
+    BatchJob.objects.filter(pk=job.pk).update(remote_enabled=True)
+    job.refresh_from_db()
+
+    # Submit the matching structure — no cache entry, so item goes PENDING_CLASSIFICATION.
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=_json.dumps({"structure": LTRP_SMILES, "secret": secret}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200, response.content
+    assert response.json()["status"] == BatchItemStatus.PENDING_CLASSIFICATION
+
+    # Counters must reflect the transition.
+    job.refresh_from_db()
+    assert job.need_structure_count == 0, (
+        "need_structure_count must drop to 0 after pending-resolution structure resubmit"
+    )
+    assert job.remote_pending_count == 1, (
+        "remote_pending_count must rise to 1 after pending-resolution structure resubmit"
+    )
+    # Job still has in-flight remote work.
+    assert job.status == BatchJobStatus.IN_PROGRESS

@@ -43,6 +43,7 @@ worker fans results out to all waiting items in Task 9.
 from __future__ import annotations
 
 import secrets
+import uuid
 from collections.abc import Iterable
 
 from django.contrib.auth.hashers import make_password
@@ -204,12 +205,104 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
     return BatchItemStatus.INVALID_INPUT
 
 
+def recompute_job_counters(job_id: uuid.UUID | str) -> None:
+    """Recompute all denormalised BatchJob counters + status from its BatchItem rows.
+
+    This is the SINGLE SOURCE OF TRUTH for counter/status computation.
+    Both ingest (process_job_items) and fan-out (apps/remote/fanout.py) and
+    structure-resubmit handlers (views.py, api.py) MUST call this function.
+
+    Canonical definitions
+    ---------------------
+    completed  = FOUND_LIVE_CACHE + FOUND_SEED_CACHE + FOUND_WISHART_ENTITY
+                 + COMPLETE_AFTER_WISHART + INVALID_INPUT + RESULT_KEY_MISMATCH
+                 (every item in a terminal state that requires no further action)
+    remote_pending = PENDING_CLASSIFICATION + REMOTE_DELAYED
+    need_structure = NEED_STRUCTURE  (awaiting external user input)
+
+    Status rules:
+    - COMPLETE when remote_pending == 0  (no in-flight remote work remains)
+    - NEED_STRUCTURE items do NOT block COMPLETE; they await user input and are
+      shown separately via need_structure_count.
+    - A job that is already COMPLETE is never regressed back to IN_PROGRESS.
+    """
+    from django.db.models import Count, Q
+
+    job = BatchJob.objects.filter(pk=job_id).first()
+    if job is None:
+        return
+
+    terminal_complete = (
+        BatchItemStatus.FOUND_LIVE_CACHE,
+        BatchItemStatus.FOUND_SEED_CACHE,
+        BatchItemStatus.FOUND_WISHART_ENTITY,
+        BatchItemStatus.COMPLETE_AFTER_WISHART,
+        BatchItemStatus.INVALID_INPUT,
+        BatchItemStatus.RESULT_KEY_MISMATCH,
+    )
+
+    counts = BatchItem.objects.filter(job=job).aggregate(
+        total=Count("pk"),
+        local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
+        seed_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_SEED_CACHE)),
+        remote_pending=Count(
+            "pk",
+            filter=Q(
+                status__in=(
+                    BatchItemStatus.PENDING_CLASSIFICATION,
+                    BatchItemStatus.REMOTE_DELAYED,
+                )
+            ),
+        ),
+        need_structure=Count("pk", filter=Q(status=BatchItemStatus.NEED_STRUCTURE)),
+        invalid=Count("pk", filter=Q(status=BatchItemStatus.INVALID_INPUT)),
+        completed=Count("pk", filter=Q(status__in=terminal_complete)),
+    )
+
+    total = counts["total"]
+    local_hit = counts["local_hit"]
+    seed_hit = counts["seed_hit"]
+    remote_pending = counts["remote_pending"]
+    need_structure = counts["need_structure"]
+    invalid = counts["invalid"]
+    completed = counts["completed"]
+
+    # Status: COMPLETE when no item is in-flight (remote_pending == 0).
+    # NEED_STRUCTURE items await user input — they don't block COMPLETE.
+    # The status is always derived from ground-truth item counts; this function
+    # is the authoritative recompute so we do NOT apply a "never regress" guard
+    # here — if the DB shows pending items, the job IS in-progress regardless
+    # of its previous status.
+    from datetime import datetime as _datetime
+
+    completed_at: _datetime | None
+    if remote_pending == 0:
+        new_status = BatchJobStatus.COMPLETE
+        completed_at = job.completed_at if job.completed_at is not None else timezone.now()
+    else:
+        new_status = BatchJobStatus.IN_PROGRESS
+        completed_at = job.completed_at
+
+    BatchJob.objects.filter(pk=job.pk).update(
+        total_count=total,
+        completed_count=completed,
+        local_hit_count=local_hit,
+        seed_hit_count=seed_hit,
+        remote_pending_count=remote_pending,
+        need_structure_count=need_structure,
+        invalid_count=invalid,
+        status=new_status,
+        completed_at=completed_at,
+    )
+
+
 def process_job_items(job: BatchJob) -> None:
     """Run local normalization + lookup for all PENDING items in *job*.
 
     Iterates items in row_order order using a DB-side cursor (chunk_size=500)
     so large jobs never materialise all rows in RAM (FR-008).
-    Updates each item in the DB and then updates the job counters + status.
+    Updates each item in the DB and then updates the job counters + status
+    via the canonical recompute_job_counters().
     """
     qs = (
         BatchItem.objects.filter(job=job, status=BatchItemStatus.PENDING_NORMALIZATION)
@@ -222,47 +315,7 @@ def process_job_items(job: BatchJob) -> None:
         item.status = status
         item.save(update_fields=["status", "detected_type", "inchikey", "compound", "message"])
 
-    # Recompute counters via aggregate queries — no in-memory materialisation.
-    from django.db.models import Count, Q
-
-    counts = BatchItem.objects.filter(job=job).aggregate(
-        total=Count("pk"),
-        local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
-        seed_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_SEED_CACHE)),
-        remote_pending=Count("pk", filter=Q(status=BatchItemStatus.PENDING_CLASSIFICATION)),
-        need_structure=Count("pk", filter=Q(status=BatchItemStatus.NEED_STRUCTURE)),
-        invalid=Count("pk", filter=Q(status=BatchItemStatus.INVALID_INPUT)),
-    )
-
-    total = counts["total"]
-    local_hit = counts["local_hit"]
-    seed_hit = counts["seed_hit"]
-    remote_pending = counts["remote_pending"]
-    need_structure = counts["need_structure"]
-    invalid = counts["invalid"]
-
-    # "completed" = items that are fully resolved locally
-    completed = local_hit + seed_hit
-
-    # Status: COMPLETE only if no item is still pending remote or need_structure
-    still_pending = remote_pending + need_structure
-    if still_pending == 0:
-        job_status = BatchJobStatus.COMPLETE
-        job.completed_at = timezone.now()
-    else:
-        job_status = BatchJobStatus.IN_PROGRESS
-
-    BatchJob.objects.filter(pk=job.pk).update(
-        total_count=total,
-        completed_count=completed,
-        local_hit_count=local_hit,
-        seed_hit_count=seed_hit,
-        remote_pending_count=remote_pending,
-        need_structure_count=need_structure,
-        invalid_count=invalid,
-        status=job_status,
-        completed_at=job.completed_at,
-    )
+    recompute_job_counters(job.pk)
     # Refresh in-memory
     job.refresh_from_db()
 

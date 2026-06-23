@@ -20,7 +20,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 
 from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
-from apps.batches.services import _get_or_create_remote_task, create_job
+from apps.batches.services import _get_or_create_remote_task, create_job, recompute_job_counters
 from apps.classifications.services import lookup_current_classification
 from apps.compounds.models import CompoundStructure
 from apps.compounds.validators import normalize_row
@@ -227,6 +227,10 @@ def structure_form_view(request: HttpRequest, item_id: int, secret: str) -> Http
                 else:
                     item.message = "Structure provided but no remote classification available."
                     item.save(update_fields=["inchikey", "message"])
+
+                # Recompute job counters after every structure resubmit — critical
+                # for cache-hit paths (FOUND_*) where no remote fan-out fires.
+                recompute_job_counters(job.pk)
 
                 return redirect(f"/jobs/{job.pk}/{secret}/")
 
