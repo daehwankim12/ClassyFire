@@ -30,7 +30,7 @@ class SeedImport(models.Model):
     who = models.TextField(null=True, blank=True, help_text="Actor who ran the import.")
 
     class Meta:
-        db_table = "seed_import"
+        db_table = "seed_imports"
 
     def __str__(self) -> str:
         return f"seed_import:{self.pk} ({self.import_status})"
@@ -45,7 +45,7 @@ class SystemEvent(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = "system_event"
+        db_table = "system_events"
         indexes = [
             models.Index(fields=["category", "created_at"], name="system_event_cat_idx"),
         ]

@@ -34,7 +34,7 @@ class ChemOntNode(models.Model):
     )
 
     class Meta:
-        db_table = "chemont_node"
+        db_table = "chemont_nodes"
         verbose_name = "ChemOnt node"
         verbose_name_plural = "ChemOnt nodes"
 

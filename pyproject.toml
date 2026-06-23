@@ -47,6 +47,7 @@ exclude = [
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    "stubs",
 ]
 
 [tool.ruff.lint]
@@ -94,6 +95,10 @@ max-args = 7
 python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
+# stubs/ contains minimal corrected rdkit stubs that override the broken
+# rdkit-stubs shipped with the rdkit wheel (rdchem.pyi has a SyntaxError in
+# the default/autoConvert parameter ordering).
+mypy_path = ["stubs"]
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 check_untyped_defs = true
@@ -111,6 +116,7 @@ module = [
     "psycopg",
 ]
 ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.django-stubs]
 django_settings_module = "config.settings.dev"

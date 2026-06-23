@@ -23,7 +23,7 @@ class CompoundStructure(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        db_table = "compound_structure"
+        db_table = "compound_structures"
         constraints = [
             models.CheckConstraint(
                 name="compound_structure_inchikey_len27",

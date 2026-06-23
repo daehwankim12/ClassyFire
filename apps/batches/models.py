@@ -6,7 +6,7 @@ import uuid
 from django.db import models
 from django.db.models import Q
 
-from apps.core.enums import BatchItemStatus, DetectedInputType
+from apps.core.enums import BatchItemStatus, BatchJobStatus, DetectedInputType
 
 
 class BatchJob(models.Model):
@@ -19,8 +19,11 @@ class BatchJob(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     secret_hash = models.TextField(help_text="Hash of the per-job access secret.")
-    status = models.TextField(
-        default="PENDING", help_text="Coarse job lifecycle status."
+    status = models.CharField(
+        max_length=16,
+        choices=BatchJobStatus.choices,
+        default=BatchJobStatus.PENDING,
+        help_text="Coarse job lifecycle status.",
     )
 
     total_count = models.IntegerField(default=0)
@@ -36,7 +39,7 @@ class BatchJob(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        db_table = "batch_job"
+        db_table = "batch_jobs"
 
     def __str__(self) -> str:
         return f"job:{self.id} ({self.status})"
@@ -84,7 +87,7 @@ class BatchItem(models.Model):
     )
 
     class Meta:
-        db_table = "batch_item"
+        db_table = "batch_items"
         constraints = [
             models.CheckConstraint(
                 name="batch_item_inchikey_len27",

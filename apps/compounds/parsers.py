@@ -103,7 +103,7 @@ def parse_sdf(
         else:
             text_stream = file_obj  # type: ignore[assignment]
     else:
-        text_stream = io.StringIO(file_obj.decode("utf-8", errors="replace"))  # type: ignore[union-attr]
+        text_stream = io.StringIO(file_obj.decode("utf-8", errors="replace"))  # type: ignore[attr-defined]
 
     row_index = 0
     current_lines: list[str] = []

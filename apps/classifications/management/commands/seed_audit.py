@@ -93,7 +93,7 @@ def _audit_table(
                     SELECT COUNT(*) FROM {} s
                     WHERE s.{} IS NOT NULL
                       AND NOT EXISTS (
-                          SELECT 1 FROM chemont_node c WHERE c.numeric_id = s.{}
+                          SELECT 1 FROM chemont_nodes c WHERE c.numeric_id = s.{}
                       )
                     """
                 ).format(tbl, pgsql.Identifier(slot), pgsql.Identifier(slot))

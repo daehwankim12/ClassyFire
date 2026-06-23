@@ -128,9 +128,6 @@ class ClassyfireLive(models.Model):
                 fields=["inchikey"], name="classyfire_live_unique_current"
             ),
         ]
-        indexes = [
-            models.Index(fields=["inchikey"], name="live_inchikey_idx"),
-        ]
 
     def __str__(self) -> str:
         return f"live:{self.inchikey} ({self.source_type})"

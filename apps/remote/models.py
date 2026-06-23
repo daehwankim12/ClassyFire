@@ -48,7 +48,7 @@ class RemoteTask(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "remote_task"
+        db_table = "remote_tasks"
         constraints = [
             models.CheckConstraint(
                 name="remote_task_inchikey_len27",
@@ -92,7 +92,7 @@ class RemoteQuery(models.Model):
     completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        db_table = "remote_query"
+        db_table = "remote_queries"
         indexes = [
             models.Index(fields=["state", "next_poll_at"], name="remote_query_poll_idx"),
         ]
@@ -133,7 +133,7 @@ class RemoteQueryItem(models.Model):
     )
 
     class Meta:
-        db_table = "remote_query_item"
+        db_table = "remote_query_items"
         constraints = [
             models.CheckConstraint(
                 name="remote_query_item_inchikey_len27",

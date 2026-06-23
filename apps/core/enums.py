@@ -38,6 +38,20 @@ SOURCE_PRIORITY: dict[str, int] = {
 }
 
 
+class BatchJobStatus(models.TextChoices):
+    """Coarse lifecycle status for a batch job (batch_jobs.status).
+
+    State machine (see docs/state-machines.md):
+      PENDING → IN_PROGRESS → COMPLETE (all items resolved)
+                            └→ FAILED   (unrecoverable error)
+    """
+
+    PENDING = "PENDING", "Pending"
+    IN_PROGRESS = "IN_PROGRESS", "In progress"
+    COMPLETE = "COMPLETE", "Complete"
+    FAILED = "FAILED", "Failed"
+
+
 class DetectedInputType(models.TextChoices):
     """Detected shape of a single batch input row before normalization."""
 

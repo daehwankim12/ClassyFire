@@ -227,7 +227,35 @@ SUBMITTED ─▶ FAILED                     (immediate rejection)
 
 ---
 
-## 4. Other enums (no transition graph)
+## 4. `batch_jobs` — job lifecycle (`BatchJobStatus`)
+
+Enum: `BatchJobStatus` (in `apps/core/enums.py`). Column: `batch_jobs.status`.
+
+A `BatchJob` is created when a batch upload is accepted. Its status coarsely
+tracks whether processing is outstanding, complete, or has failed.
+
+### States
+
+| State | Meaning | Terminal? |
+| --- | --- | --- |
+| `PENDING` | Created; items not yet normalized or processed. | no |
+| `IN_PROGRESS` | Normalization / lookup / remote work is ongoing. | no |
+| `COMPLETE` | All items have reached a terminal `BatchItemStatus`. | yes |
+| `FAILED` | Unrecoverable error; job cannot proceed. | yes |
+
+### Allowed transitions
+
+```
+PENDING → IN_PROGRESS → COMPLETE   (all items resolved)
+                      └→ FAILED    (unrecoverable error)
+```
+
+`COMPLETE` and `FAILED` are terminal. The `completed_at` timestamp is set on
+entry to either terminal state.
+
+---
+
+## 5. Other enums (no transition graph)
 
 - `SourceType` + `SOURCE_PRIORITY` — provenance/trust of a `classyfire_live`
   row. Priority is stored as the integer column `classyfire_live.source_priority`
