@@ -75,6 +75,8 @@ local_settings.py
 # Database dumps
 *.sql
 *.dump
+# ...but checked-in source SQL (queries, view DDL) under apps is not a dump
+!apps/**/sql/*.sql
 
 # Seed artifacts
 *.tsv.zst
