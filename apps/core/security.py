@@ -101,6 +101,8 @@ def require_shared_access(view_func: Callable) -> Callable:
 
     In dev-open mode (SHARED_ACCESS_PASSWORD_HASH unset), all requests pass.
     In secure mode, a valid Bearer token or session login is required.
+    Returns a JSON 401 response for unauthenticated requests (suitable for
+    API endpoints).  Use :func:`require_shared_access_web` for browser views.
     """
     @functools.wraps(view_func)
     def wrapper(request: HttpRequest, *args, **kwargs):
@@ -109,6 +111,32 @@ def require_shared_access(view_func: Callable) -> Callable:
                 {"error": "Authentication required."},
                 status=401,
                 headers={"WWW-Authenticate": 'Bearer realm="ClassyFire"'},
+            )
+        return view_func(request, *args, **kwargs)
+
+    return wrapper
+
+
+def require_shared_access_web(view_func: Callable) -> Callable:
+    """Decorator: gate a browser view behind shared-access authentication.
+
+    Identical auth logic to :func:`require_shared_access` but returns a
+    browser-friendly 403 Forbidden response instead of a JSON 401.  This
+    keeps the gate DRY — both decorators delegate to :func:`_is_authenticated`
+    — while giving browsers a useful HTTP status code rather than a JSON body.
+
+    In dev-open mode (SHARED_ACCESS_PASSWORD_HASH unset), all requests pass.
+    In secure mode, a valid Bearer token, session login, or
+    X-Shared-Access-Token header is required; unauthenticated browser requests
+    receive a plain-text 403 so no JSON parser is needed on the client side.
+    """
+    from django.http import HttpResponseForbidden  # local import to avoid circular
+
+    @functools.wraps(view_func)
+    def wrapper(request: HttpRequest, *args, **kwargs):
+        if not _is_authenticated(request):
+            return HttpResponseForbidden(
+                "Access denied. A valid shared-access credential is required."
             )
         return view_func(request, *args, **kwargs)
 
