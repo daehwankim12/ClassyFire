@@ -233,3 +233,99 @@ def test_stats_page_returns_200():
     client = Client()
     response = client.get("/stats/")
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 12. API pagination: bad page_size → 400; page_size=0 doesn't crash
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_items_invalid_page_size_returns_400():
+    """?page_size=abc must return 400, not 500."""
+    rows = list(parse_text_input(ASPIRIN_SMILES))
+    job, secret = create_job(rows, remote_enabled=False)
+    client = Client()
+    response = client.get(
+        f"/api/jobs/{job.pk}/items",
+        {"secret": secret, "page_size": "abc"},
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert "error" in data
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_items_zero_page_size_does_not_crash():
+    """?page_size=0 must be clamped (not crash)."""
+    rows = list(parse_text_input(ASPIRIN_SMILES))
+    job, secret = create_job(rows, remote_enabled=False)
+    client = Client()
+    response = client.get(
+        f"/api/jobs/{job.pk}/items",
+        {"secret": secret, "page_size": "0"},
+    )
+    assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 13. API key-mismatch leaves item as NEED_STRUCTURE (retry-friendly)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_structure_key_mismatch_leaves_need_structure():
+    """API mismatch must return 422 and NOT strand item as RESULT_KEY_MISMATCH."""
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.first()
+    assert item is not None
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+    import json as _json
+
+    client = Client()
+    # Submit ASPIRIN structure for the GHOST_INCHIKEY item → mismatch
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=_json.dumps({"structure": ASPIRIN_SMILES, "secret": secret}),
+        content_type="application/json",
+    )
+    assert response.status_code == 422
+    data = response.json()
+    assert "error" in data
+
+    # Item must remain NEED_STRUCTURE (retryable), not RESULT_KEY_MISMATCH
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+
+# ---------------------------------------------------------------------------
+# 14. File-upload rows preserve all parser fields (external_id not dropped)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_file_upload_row_extra_fields_preserved():
+    """Parser rows with extra fields (e.g. external_id) must survive the
+    file-upload merge loop — the {**row, row_index: ...} fix ensures this."""
+    # Simulate the logic in submit_view: file_rows already contain external_id
+    # (as parse_csv_tsv would yield); the fixed merge must not drop it.
+    from apps.batches.services import create_job
+
+    file_rows = [
+        {"raw": ASPIRIN_SMILES, "row_index": 0, "external_id": "FILE-EXT-9000"},
+    ]
+    # Replicate the fixed merge (offset=0 since no text_input rows)
+    offset = 0
+    rows = []
+    for row in file_rows:
+        rows.append({**row, "row_index": row["row_index"] + offset})
+
+    assert rows[0].get("external_id") == "FILE-EXT-9000", (
+        "external_id dropped by the file-upload row merge"
+    )
+
+    job, _secret = create_job(rows, remote_enabled=False)
+    item = job.items.filter(external_id="FILE-EXT-9000").first()
+    assert item is not None, "external_id not propagated through ingest"

@@ -142,8 +142,11 @@ def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
 
     status_filter = request.GET.get("status_filter", "")
     search = request.GET.get("search", "")
-    page_number = int(request.GET.get("page", 1))
-    page_size = int(request.GET.get("page_size", 100))
+    try:
+        page_number = max(1, int(request.GET.get("page", 1)))
+        page_size = min(max(1, int(request.GET.get("page_size", 100))), 500)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid page or page_size."}, status=400)
 
     qs = BatchItem.objects.filter(job=job).order_by("row_order")
     if status_filter and status_filter in STATUS_FILTER_MAP:
@@ -211,15 +214,16 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
         )
 
     if item.inchikey and norm.inchikey != item.inchikey:
-        item.status = BatchItemStatus.RESULT_KEY_MISMATCH
-        item.message = (
-            f"Submitted InChIKey {norm.inchikey} does not match "
-            f"expected {item.inchikey}"
-        )
-        item.save(update_fields=["status", "message"])
+        # FR-015: user submitted a structure whose InChIKey doesn't match the
+        # expected InChIKey.  Leave the item as NEED_STRUCTURE (retryable) and
+        # return a 422 error — do NOT permanently strand it as RESULT_KEY_MISMATCH
+        # (that status is reserved for remote-response mismatches, FR-018).
         return JsonResponse(
             {
-                "status": "RESULT_KEY_MISMATCH",
+                "error": (
+                    f"Submitted InChIKey {norm.inchikey} does not match "
+                    f"expected {item.inchikey}"
+                ),
                 "submitted_inchikey": norm.inchikey,
                 "expected_inchikey": item.inchikey,
             },

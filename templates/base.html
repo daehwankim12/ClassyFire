@@ -1,3 +1,4 @@
+{% load static %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7,7 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.12/dist/htmx.min.js"
           integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2"
           crossorigin="anonymous"></script>
-  <link rel="stylesheet" href="{% load static %}{% static 'app.css' %}">
+  <link rel="stylesheet" href="{% static 'app.css' %}">
 </head>
 <body>
   <nav>
@@ -18,6 +19,6 @@
   <main>
     {% block content %}{% endblock %}
   </main>
-  <script src="{% load static %}{% static 'app.js' %}"></script>
+  <script src="{% static 'app.js' %}"></script>
 </body>
 </html>

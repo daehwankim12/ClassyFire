@@ -66,7 +66,7 @@ def submit_view(request: HttpRequest) -> HttpResponse:
             # Re-index to continue after text_input rows
             offset = len(rows)
             for row in file_rows:
-                rows.append({"raw": row["raw"], "row_index": row["row_index"] + offset})
+                rows.append({**row, "row_index": row["row_index"] + offset})
 
         job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)
         return redirect(f"/jobs/{job.pk}/{plaintext_secret}/")
