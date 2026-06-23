@@ -68,7 +68,7 @@ def _check_bearer(request: HttpRequest) -> bool:
     token: str = ""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        token = auth_header[len("Bearer "):]
+        token = auth_header[len("Bearer "):].strip()
     else:
         token = request.headers.get("X-Shared-Access-Token", "")
 
@@ -171,8 +171,12 @@ def check_decompression_ratio(
 ) -> bytes:
     """Decompress zip data and reject if expansion ratio is too high (zip-bomb guard).
 
-    Returns the decompressed bytes on success.
-    Raises DecompressionBombError if the ratio exceeds the allowed maximum.
+    Counts REAL decompressed bytes by streaming each member in chunks — never
+    trusts attacker-controlled central-directory metadata (info.file_size).
+
+    Returns the decompressed bytes of the first member on success.
+    Raises DecompressionBombError if the running total of real decompressed
+    bytes exceeds compressed_size * ratio_limit before reading is complete.
     Raises ValueError for non-zip data or corrupt archives.
     """
     ratio_limit = max_ratio if max_ratio is not None else MAX_DECOMPRESSION_RATIO
@@ -181,26 +185,37 @@ def check_decompression_ratio(
     if compressed_size == 0:
         return b""
 
+    limit = compressed_size * ratio_limit
+    total_real: int = 0
+    first_member_chunks: list[bytes] = []
+    first_name: str | None = None
+
     try:
         buf = io.BytesIO(compressed_data)
         with zipfile.ZipFile(buf, "r") as zf:
-            total_decompressed = sum(info.file_size for info in zf.infolist())
+            for info in zf.infolist():
+                is_first = first_name is None
+                if is_first:
+                    first_name = info.filename
+                with zf.open(info) as member:
+                    while True:
+                        chunk = member.read(65536)
+                        if not chunk:
+                            break
+                        total_real += len(chunk)
+                        if total_real > limit:
+                            raise DecompressionBombError(
+                                f"Decompression ratio exceeds {ratio_limit}x limit "
+                                f"(real bytes > {int(limit)})."
+                            )
+                        if is_first:
+                            first_member_chunks.append(chunk)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"Invalid zip archive: {exc}") from exc
 
-    if compressed_size > 0:
-        ratio = total_decompressed / compressed_size
-        if ratio > ratio_limit:
-            raise DecompressionBombError(
-                f"Decompression ratio {ratio:.1f}x exceeds limit of {ratio_limit}x."
-            )
-
-    buf.seek(0)
-    with zipfile.ZipFile(buf, "r") as zf:
-        names = zf.namelist()
-        if not names:
-            return b""
-        return zf.read(names[0])
+    if first_name is None:
+        return b""
+    return b"".join(first_member_chunks)
 
 
 # ---------------------------------------------------------------------------

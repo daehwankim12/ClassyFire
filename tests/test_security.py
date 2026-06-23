@@ -409,6 +409,50 @@ class TestUploadSafety:
         with pytest.raises(DecompressionBombError):
             check_decompression_ratio(bomb, max_ratio=10.0)
 
+    def test_zip_bomb_forged_metadata_raises(self) -> None:
+        """Zip-bomb with forged central-directory file_size=0 must still be caught.
+
+        This tests that check_decompression_ratio does NOT trust info.file_size
+        (attacker-controlled metadata). We simulate an archive whose infolist
+        reports file_size=0 for every member while open() actually yields large
+        payloads. A metadata-trusting guard would see zero decompressed bytes and
+        pass silently. The streaming guard must detect the real bytes and raise.
+        """
+        import unittest.mock as mock
+
+        # Simulate an archive with two entries each reporting file_size=0 but
+        # whose real content totals well above (compressed_size * max_ratio).
+        fake_compressed_size = 500  # bytes — sets the limit; ratio 10x → 5000 byte ceiling
+        max_ratio = 10.0
+        # Each fake member yields 3000 bytes → 6000 total > 5000 limit
+        large_payload = b"\x00" * 3000
+
+        fake_info1 = zipfile.ZipInfo("a.txt")
+        fake_info1.file_size = 0  # attacker lies: declares 0
+
+        fake_info2 = zipfile.ZipInfo("b.txt")
+        fake_info2.file_size = 0  # attacker lies: declares 0
+
+        def fake_infolist(self_zf):  # type: ignore[no-untyped-def]
+            return [fake_info1, fake_info2]
+
+        def fake_open(self_zf, name_or_info, mode="r", pwd=None, *, force_zip64=False):  # type: ignore[no-untyped-def]
+            return io.BytesIO(large_payload)
+
+        # Build a minimal valid-looking bytes blob of the right size so that
+        # compressed_size == fake_compressed_size inside check_decompression_ratio.
+        fake_zip_data = b"PK\x05\x06" + b"\x00" * (fake_compressed_size - 4)
+
+        with (
+            mock.patch.object(zipfile.ZipFile, "infolist", fake_infolist),
+            mock.patch.object(zipfile.ZipFile, "open", fake_open),
+            mock.patch("zipfile.ZipFile.__init__", lambda self, *a, **kw: None),
+            mock.patch("zipfile.ZipFile.__exit__", lambda self, *a: None),
+            mock.patch("zipfile.ZipFile.__enter__", lambda self: self),
+        ):
+            with pytest.raises(DecompressionBombError):
+                check_decompression_ratio(fake_zip_data, max_ratio=max_ratio)
+
     def test_normal_zip_passes(self) -> None:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
