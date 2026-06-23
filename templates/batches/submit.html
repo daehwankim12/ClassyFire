@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block title %}Submit Batch — ClassyFire{% endblock %}
+
+{% block content %}
+<h1>Submit Batch</h1>
+
+<p class="notice">
+  <strong>Data notice:</strong> Structures you submit may be sent to the Wishart Lab ClassyFire
+  service for classification. Successful classification results and identifiers are stored locally
+  in this service's database.
+</p>
+
+<form method="post" enctype="multipart/form-data">
+  {% csrf_token %}
+  <div>
+    <label for="text_input">Paste input (one structure per line):</label><br>
+    <small>Supported: SMILES, InChI, InChIKey (auto-detected)</small>
+    <br>
+    <textarea id="text_input" name="text_input" rows="10" cols="80" placeholder="SMILES, InChI, or InChIKey — one per line">{{ text_input|default:'' }}</textarea>
+  </div>
+
+  <div>
+    <label for="input_file">Or upload a file (.txt, .smi, .csv):</label>
+    <input type="file" id="input_file" name="input_file" accept=".txt,.smi,.csv,.tsv">
+  </div>
+
+  <div>
+    <label>
+      <input type="checkbox" name="remote_enabled" id="remote_enabled" checked>
+      Enable remote classification (may send structures to Wishart Lab ClassyFire)
+    </label>
+  </div>
+
+  <div id="type-hint" style="color: #666; font-size: 0.9em;"></div>
+
+  <button type="submit">Submit Batch</button>
+</form>
+
+<script>
+(function() {
+  var ta = document.getElementById('text_input');
+  var hint = document.getElementById('type-hint');
+  if (!ta) return;
+  var INCHIKEY_RE = /^[A-Z]{14}-[A-Z]{10}-[A-Z]$/;
+  var INCHI_RE = /^InChI=/;
+  ta.addEventListener('input', function() {
+    var first = ta.value.split('\n').map(function(l){ return l.trim(); }).filter(Boolean)[0];
+    if (!first) { hint.textContent = ''; return; }
+    if (INCHIKEY_RE.test(first)) {
+      hint.textContent = 'Detected: InChIKey';
+    } else if (INCHI_RE.test(first)) {
+      hint.textContent = 'Detected: InChI';
+    } else {
+      hint.textContent = 'Detected: SMILES (assumed)';
+    }
+  });
+})();
+</script>
+{% endblock %}

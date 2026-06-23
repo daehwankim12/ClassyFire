@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Add Structure — ClassyFire{% endblock %}
+
+{% block content %}
+<h1>Add Structure for Item</h1>
+
+<p><strong>Original input:</strong> {{ item.original_input }}</p>
+<p><strong>Current status:</strong> {{ item.status }}</p>
+{% if item.inchikey %}<p><strong>Expected InChIKey:</strong> {{ item.inchikey }}</p>{% endif %}
+
+{% if error %}
+<div class="error">
+  <strong>Error:</strong> {{ error }}
+</div>
+{% endif %}
+
+<form method="post">
+  {% csrf_token %}
+  <label for="structure">Structure (SMILES or InChI):</label><br>
+  <textarea name="structure" id="structure" rows="5" cols="80">{{ submitted_structure|default:'' }}</textarea>
+  <br>
+  <button type="submit">Submit Structure</button>
+</form>
+
+<p><a href="/jobs/{{ item.job.id }}/{{ secret }}/">Back to job</a></p>
+{% endblock %}

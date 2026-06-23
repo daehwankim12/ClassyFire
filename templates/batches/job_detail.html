@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+
+{% block title %}Job {{ job.id }} — ClassyFire{% endblock %}
+
+{% block content %}
+<h1>Batch Job</h1>
+<p><strong>Job ID:</strong> {{ job.id }}</p>
+<p><strong>Status:</strong> {{ job.status }}</p>
+<p><strong>Created:</strong> {{ job.created_at }}</p>
+{% if job.completed_at %}<p><strong>Completed:</strong> {{ job.completed_at }}</p>{% endif %}
+
+<h2>Progress</h2>
+<table>
+  <tr><th>Total</th><th>Completed</th><th>Local hits</th><th>Seed hits</th><th>Pending</th><th>Need structure</th><th>Invalid</th></tr>
+  <tr>
+    <td>{{ job.total_count }}</td>
+    <td>{{ job.completed_count }}</td>
+    <td>{{ job.local_hit_count }}</td>
+    <td>{{ job.seed_hit_count }}</td>
+    <td>{{ job.remote_pending_count }}</td>
+    <td>{{ job.need_structure_count }}</td>
+    <td>{{ job.invalid_count }}</td>
+  </tr>
+</table>
+
+<h2>Export</h2>
+<form method="post" action="/api/jobs/{{ job.id }}/exports" id="export-form">
+  <input type="hidden" name="secret" value="{{ secret }}">
+  <select name="format">
+    <option value="csv">CSV</option>
+    <option value="tsv">TSV</option>
+    <option value="json">JSON</option>
+    <option value="csv.gz">CSV.gz</option>
+    <option value="tsv.gz">TSV.gz</option>
+  </select>
+  <button type="button" onclick="doExport()">Export</button>
+</form>
+<div id="export-status"></div>
+
+<h2>Filter &amp; Search</h2>
+<form method="get">
+  <label for="status_filter">Status:</label>
+  <select name="status_filter" id="status_filter">
+    <option value="">All</option>
+    <option value="FOUND" {% if status_filter == 'FOUND' %}selected{% endif %}>Found</option>
+    <option value="PENDING" {% if status_filter == 'PENDING' %}selected{% endif %}>Pending</option>
+    <option value="NEED_STRUCTURE" {% if status_filter == 'NEED_STRUCTURE' %}selected{% endif %}>Need structure</option>
+    <option value="INVALID" {% if status_filter == 'INVALID' %}selected{% endif %}>Invalid</option>
+    <option value="DELAYED" {% if status_filter == 'DELAYED' %}selected{% endif %}>Delayed</option>
+  </select>
+  &nbsp;
+  <label for="search">Search:</label>
+  <input type="text" name="search" id="search" value="{{ search }}">
+  <button type="submit">Filter</button>
+</form>
+
+<h2>Results</h2>
+<div id="job-items-table"
+     data-job-complete="{{ job_complete|lower }}"
+     hx-get="/jobs/{{ job.id }}/{{ secret }}/items?{{ request.GET.urlencode }}"
+     hx-trigger="poll"
+     hx-swap="outerHTML">
+  {% include "batches/item_table.html" %}
+</div>
+
+<script>
+function doExport() {
+  var form = document.getElementById('export-form');
+  var fmt = form.querySelector('select[name="format"]').value;
+  var secret = form.querySelector('input[name="secret"]').value;
+  var statusEl = document.getElementById('export-status');
+  statusEl.textContent = 'Creating export...';
+  fetch('/api/jobs/{{ job.id }}/exports', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-CSRFToken': '{{ csrf_token }}'},
+    body: JSON.stringify({format: fmt, secret: secret})
+  }).then(function(r){ return r.json(); }).then(function(data){
+    if (data.token) {
+      var link = document.createElement('a');
+      link.href = '/api/exports/' + data.token;
+      link.download = '';
+      link.textContent = 'Download export';
+      statusEl.innerHTML = '';
+      statusEl.appendChild(link);
+    } else {
+      statusEl.textContent = 'Export error: ' + JSON.stringify(data);
+    }
+  }).catch(function(e){ statusEl.textContent = 'Export failed: ' + e; });
+}
+</script>
+{% endblock %}
