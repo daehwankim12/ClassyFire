@@ -624,3 +624,201 @@ class TestXJobSecretHeader:
         assert response.status_code == 200, (
             f"Expected 200 when header is correct and query is wrong, got {response.status_code}"
         )
+
+
+# ===========================================================================
+# 12. Web UI shared-access gate (HIGH #4)
+# ===========================================================================
+
+
+class TestWebGate:
+    """[HIGH #4] submit_view (/) and stats_view (/stats/) must be gated in
+    locked mode and open in dev-open mode."""
+
+    # --- locked mode: unauthenticated requests are rejected ---
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_submit_unauthenticated_locked_mode_rejected(self) -> None:
+        client = Client()
+        response = client.get("/")
+        assert response.status_code in (302, 403), (
+            f"Expected 302/403 for unauthenticated GET / in locked mode, "
+            f"got {response.status_code}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_stats_unauthenticated_locked_mode_rejected(self) -> None:
+        client = Client()
+        response = client.get("/stats/")
+        assert response.status_code in (302, 403), (
+            f"Expected 302/403 for unauthenticated GET /stats/ in locked mode, "
+            f"got {response.status_code}"
+        )
+
+    # --- locked mode: authenticated requests via Bearer token pass ---
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_submit_valid_bearer_locked_mode_passes(self) -> None:
+        client = Client()
+        response = client.get(
+            "/",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+        )
+        assert response.status_code == 200, (
+            f"Expected 200 for authenticated GET / in locked mode, "
+            f"got {response.status_code}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_stats_valid_bearer_locked_mode_passes(self) -> None:
+        client = Client()
+        response = client.get(
+            "/stats/",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+        )
+        assert response.status_code == 200, (
+            f"Expected 200 for authenticated GET /stats/ in locked mode, "
+            f"got {response.status_code}"
+        )
+
+    # --- dev-open mode: no hash set → pages remain public ---
+
+    @pytest.mark.django_db(transaction=True)
+    def test_submit_dev_open_mode_is_public(self) -> None:
+        client = Client()
+        response = client.get("/")
+        assert response.status_code == 200, (
+            f"Expected 200 in dev-open mode for GET /, got {response.status_code}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    def test_stats_dev_open_mode_is_public(self) -> None:
+        client = Client()
+        response = client.get("/stats/")
+        assert response.status_code == 200, (
+            f"Expected 200 in dev-open mode for GET /stats/, got {response.status_code}"
+        )
+
+    # --- per-job result pages remain accessible by job secret (not behind gate) ---
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_detail_accessible_by_job_secret_in_locked_mode(self) -> None:
+        """Per-job result pages must NOT require the shared-access credential;
+        they are already authorized by the per-job secret embedded in the URL."""
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        response = client.get(f"/jobs/{job.pk}/{secret}/")
+        assert response.status_code == 200, (
+            f"Expected 200 for job detail page with correct secret in locked mode, "
+            f"got {response.status_code}"
+        )
+
+
+# ===========================================================================
+# 13. Upload size guard wired into the real ingest path (MEDIUM #5)
+# ===========================================================================
+
+
+class TestUploadSizeGuardOnRealPath:
+    """[MEDIUM #5] check_upload_size must be called before reading the upload
+    in submit_view so an oversize file is rejected without materializing it."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_oversize_file_upload_returns_413_or_400(self) -> None:
+        """An upload whose reported size exceeds MAX_UPLOAD_MB must be rejected
+        with 413 (or 400) — no 500, no content leakage in the response.
+
+        Django's test client re-encodes multipart data so the actual file size
+        reported at the view layer matches the real content size, not any
+        pre-set .size attribute.  We therefore patch check_upload_size inside
+        views to simulate a size-check failure without allocating hundreds of MB,
+        while verifying that the wiring is in place (guard is called and its
+        exception is handled correctly).
+        """
+        import unittest.mock as mock
+
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        from apps.core.security import UploadTooLargeError
+
+        tiny_content = b"CC(=O)O\n"
+        uploaded = SimpleUploadedFile("test.txt", tiny_content, content_type="text/plain")
+
+        # Patch check_upload_size in the views module to raise unconditionally,
+        # simulating an oversize upload without needing a real large file.
+        with mock.patch(
+            "apps.batches.views.check_upload_size",
+            side_effect=UploadTooLargeError("Upload size exceeds limit of 100 MB."),
+        ):
+            client = Client()
+            response = client.post(
+                "/",
+                {"input_file": uploaded, "text_input": "", "remote_enabled": ""},
+            )
+
+        assert response.status_code in (400, 413), (
+            f"Expected 413/400 for oversize upload, got {response.status_code}"
+        )
+        # Must not leak file content in the response body.
+        assert b"CC(=O)O" not in response.content, (
+            "Response must not echo back file content on oversize error"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    def test_overlong_row_results_in_invalid_item_others_processed(self) -> None:
+        """A row whose structure string exceeds MAX_STRUCTURE_LEN must be
+        recorded as INVALID_INPUT; other rows in the same job must still be
+        processed normally."""
+        from apps.core.enums import BatchItemStatus
+        from apps.core.security import MAX_STRUCTURE_LEN
+
+        # Build a multi-row submission: one good row + one over-limit row.
+        long_structure = "C" * (MAX_STRUCTURE_LEN + 1)
+        text_input = f"{ASPIRIN_SMILES}\n{long_structure}"
+
+        client = Client()
+        response = client.post(
+            "/",
+            {"text_input": text_input, "remote_enabled": ""},
+            follow=False,
+        )
+        # Should redirect to a job page (not crash).
+        assert response.status_code == 302, (
+            f"Expected 302 redirect after submit with overlong row, "
+            f"got {response.status_code}"
+        )
+        location = response["Location"]
+        assert location.startswith("/jobs/"), (
+            f"Redirect should go to /jobs/..., got {location}"
+        )
+        # Follow the redirect to confirm the job was created.
+        response2 = client.get(location)
+        assert response2.status_code == 200
+
+        # Inspect the DB: the aspirin row must be present and processed;
+        # the overlong row must be INVALID_INPUT.
+        from apps.batches.models import BatchJob
+
+        parts = location.strip("/").split("/")
+        job_id = parts[1]
+        job = BatchJob.objects.get(pk=job_id)
+        items = list(job.items.order_by("row_order"))
+        assert len(items) == 2, f"Expected 2 items, got {len(items)}"
+
+        # The aspirin item should NOT be invalid.
+        aspirin_item = items[0]
+        assert aspirin_item.status != BatchItemStatus.INVALID_INPUT, (
+            f"Aspirin row should not be INVALID_INPUT, got {aspirin_item.status}"
+        )
+
+        # The overlong row item should be INVALID_INPUT.
+        overlong_item = items[1]
+        assert overlong_item.status == BatchItemStatus.INVALID_INPUT, (
+            f"Overlong row should be INVALID_INPUT, got {overlong_item.status}"
+        )

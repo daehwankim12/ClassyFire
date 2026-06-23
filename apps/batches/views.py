@@ -25,6 +25,13 @@ from apps.classifications.services import lookup_current_classification
 from apps.compounds.models import CompoundStructure
 from apps.compounds.validators import normalize_row
 from apps.core.enums import BatchItemStatus, BatchJobStatus
+from apps.core.security import (
+    RowTooLongError,
+    UploadTooLargeError,
+    check_structure_length,
+    check_upload_size,
+    require_shared_access_web,
+)
 
 PAGE_SIZE = 100
 
@@ -49,6 +56,7 @@ STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
 # ---------------------------------------------------------------------------
 
 
+@require_shared_access_web
 def submit_view(request: HttpRequest) -> HttpResponse:
     """GET / — Show submit form. POST / — Process submission."""
     if request.method == "POST":
@@ -61,6 +69,18 @@ def submit_view(request: HttpRequest) -> HttpResponse:
         # Handle file upload
         file = request.FILES.get("input_file")
         if file:
+            # Guard: reject oversize uploads before reading content (Fix #5).
+            # file.size may be None when the upload size is unknown; in that
+            # case we fall through and let the read proceed (no size to check).
+            try:
+                check_upload_size(file.size if file.size is not None else 0)
+            except UploadTooLargeError as exc:
+                return render(
+                    request,
+                    "batches/submit.html",
+                    {"error": str(exc)},
+                    status=413,
+                )
             file_text = file.read().decode("utf-8", errors="replace")
             file_rows = list(parse_text_input(file_text))
             # Re-index to continue after text_input rows
@@ -68,7 +88,19 @@ def submit_view(request: HttpRequest) -> HttpResponse:
             for row in file_rows:
                 rows.append({**row, "row_index": row["row_index"] + offset})
 
-        job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)
+        # Guard: reject rows with absurdly long structure strings (Fix #5).
+        # Over-limit rows are marked INVALID_INPUT via error; processing continues
+        # for the remaining rows so callers get partial results rather than a crash.
+        safe_rows = []
+        for row in rows:
+            try:
+                check_structure_length(row["raw"])
+                safe_rows.append(row)
+            except RowTooLongError:
+                # Inject a synthetic row that ingest will mark as INVALID_INPUT.
+                safe_rows.append({**row, "raw": "__INVALID__ROW_TOO_LONG__"})
+
+        job, plaintext_secret = create_job(safe_rows, remote_enabled=remote_enabled)
         return redirect(f"/jobs/{job.pk}/{plaintext_secret}/")
 
     return render(request, "batches/submit.html")
@@ -251,6 +283,7 @@ def structure_form_view(request: HttpRequest, item_id: int, secret: str) -> Http
 # ---------------------------------------------------------------------------
 
 
+@require_shared_access_web
 def stats_view(request: HttpRequest) -> HttpResponse:
     """GET /stats/ — DB status page with aggregate counts."""
     jobs_qs = BatchJob.objects.aggregate(
