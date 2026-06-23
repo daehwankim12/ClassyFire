@@ -1,0 +1,583 @@
+openapi: "3.0.3"
+info:
+  title: ClassyFire Batch Cache Web API
+  version: "1.0.0"
+  description: |
+    REST API for the ClassyFire Batch Cache Web application.
+
+    ## Authentication
+
+    Two authentication methods are supported:
+
+    **BearerAuth** — shared-access token in the `Authorization: Bearer <token>` header.
+    Required for all `/api/jobs` and `/api/items` endpoints when the server is
+    configured with `SHARED_ACCESS_PASSWORD_HASH`.  In dev-open mode (no hash
+    configured), the gate passes all requests.
+
+    **X-Job-Secret** — per-job secret returned at job creation.  Required for
+    operations on a specific job (status, items, exports).  May also be sent as
+    a `?secret=` query parameter (useful for shareable result links) or in the
+    JSON body as `"secret"`.  Prefer the `X-Job-Secret` header to keep the
+    secret out of access logs.
+
+servers:
+  - url: /
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Shared-access token validated against SHARED_ACCESS_PASSWORD_HASH.
+        Pass as `Authorization: Bearer <token>`.
+    JobSecret:
+      type: apiKey
+      in: header
+      name: X-Job-Secret
+      description: |
+        Per-job secret returned at job creation.  Required for all
+        job-scoped endpoints.  May alternatively be sent as a `?secret=`
+        query parameter or in the JSON request body as `"secret"`.
+
+  schemas:
+    Job:
+      type: object
+      description: Batch job summary.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Job identifier.
+        status:
+          type: string
+          description: Aggregate job status (PENDING, PROCESSING, COMPLETE, etc.).
+        total_count:
+          type: integer
+          description: Total number of input rows.
+        completed_count:
+          type: integer
+          description: Number of rows that have a final status.
+        local_hit_count:
+          type: integer
+          description: Rows resolved from the live classification cache.
+        seed_hit_count:
+          type: integer
+          description: Rows resolved from the seed cache.
+        remote_pending_count:
+          type: integer
+          description: Rows awaiting remote classification.
+        need_structure_count:
+          type: integer
+          description: Rows that require a user-supplied structure.
+        invalid_count:
+          type: integer
+          description: Rows that could not be parsed.
+        remote_enabled:
+          type: boolean
+          description: Whether remote (Wishart) classification is enabled for this job.
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+        - id
+        - status
+        - total_count
+        - completed_count
+        - local_hit_count
+        - seed_hit_count
+        - remote_pending_count
+        - need_structure_count
+        - invalid_count
+        - remote_enabled
+
+    BatchItem:
+      type: object
+      description: A single row in a batch job.
+      properties:
+        id:
+          type: integer
+        row_order:
+          type: integer
+          description: Original zero-based row index (order is preserved).
+        external_id:
+          type: string
+          nullable: true
+          description: User-supplied identifier from the input file header column.
+        original_input:
+          type: string
+          description: The raw input string as submitted.
+        detected_type:
+          type: string
+          description: Detected input type (SMILES, INCHI, INCHIKEY, UNKNOWN).
+        inchikey:
+          type: string
+          nullable: true
+          description: Computed InChIKey (null for invalid/unknown inputs).
+        status:
+          type: string
+          description: >
+            Item status.  One of:
+            PENDING_CLASSIFICATION, FOUND_LIVE_CACHE, FOUND_SEED_CACHE,
+            FOUND_WISHART_ENTITY, COMPLETE_AFTER_WISHART, NEED_STRUCTURE,
+            INVALID_INPUT, REMOTE_DELAYED.
+        message:
+          type: string
+          nullable: true
+          description: Human-readable status message or error detail.
+      required:
+        - id
+        - row_order
+        - original_input
+        - detected_type
+        - status
+
+    PaginatedItems:
+      type: object
+      properties:
+        count:
+          type: integer
+          description: Total number of items matching the filter.
+        num_pages:
+          type: integer
+        page:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatchItem"
+      required:
+        - count
+        - num_pages
+        - page
+        - results
+
+    ExportResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: Opaque download token.  Use with GET /api/exports/{token}.
+        expires_at:
+          type: string
+          format: date-time
+          description: ISO 8601 expiry timestamp.
+      required:
+        - token
+        - expires_at
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+paths:
+  /api/jobs:
+    post:
+      operationId: createJob
+      summary: Create a batch job
+      description: |
+        Submit a newline-separated list of chemical identifiers (SMILES, InChI,
+        or InChIKey) and run local classification.  Returns the job ID and a
+        per-job result secret.
+
+        The job secret must be supplied to all subsequent job-scoped endpoints.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text_input:
+                  type: string
+                  nullable: true
+                  description: |
+                    Newline-separated chemical identifiers.  Each line may be
+                    a SMILES string, an InChI string, or a 27-character InChIKey.
+                  example: "CC(=O)Oc1ccccc1C(=O)O\nBSYNRYMUTXBXSQ-UHFFFAOYSA-N"
+                remote_enabled:
+                  type: boolean
+                  nullable: true
+                  description: |
+                    Whether to forward unresolved compounds to the Wishart
+                    ClassyFire service.  Defaults to the server-side
+                    REMOTE_ENABLED setting.
+      responses:
+        "201":
+          description: Job created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  result_secret:
+                    type: string
+                    description: |
+                      Plaintext job secret.  Store securely — treat like a
+                      password.  Pass via X-Job-Secret header or ?secret= param.
+                required:
+                  - job_id
+                  - result_secret
+        "400":
+          description: Invalid JSON or malformed request body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid shared-access token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/jobs/{id}:
+    get:
+      operationId: getJobStatus
+      summary: Get job status
+      description: Return aggregate counters and status for a batch job.
+      security:
+        - BearerAuth: []
+        - JobSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Job ID returned by POST /api/jobs.
+        - name: secret
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Job secret (plaintext).  Prefer the X-Job-Secret header to avoid
+            the secret appearing in server access logs.
+      responses:
+        "200":
+          description: Job found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401":
+          description: Missing shared-access token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Invalid job secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Job not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/jobs/{id}/items:
+    get:
+      operationId: listJobItems
+      summary: List job items (paginated)
+      description: |
+        Return a paginated, filterable list of batch items for a job.
+
+        Items are always returned in original row order (row_order ascending).
+      security:
+        - BearerAuth: []
+        - JobSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Job ID.
+        - name: secret
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Job secret.  Prefer the X-Job-Secret header.
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 500
+        - name: status_filter
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ["FOUND", "PENDING", "NEED_STRUCTURE", "INVALID", "DELAYED", ""]
+          description: |
+            Filter items by status group.  FOUND includes all four resolved
+            statuses.  Empty string (default) returns all items.
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Case-insensitive substring search over original_input and
+            external_id.
+      responses:
+        "200":
+          description: Paginated items.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedItems"
+        "400":
+          description: Invalid page or page_size value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing shared-access token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Invalid job secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Job not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/items/{id}/structure:
+    post:
+      operationId: submitItemStructure
+      summary: Submit structure for a NEED_STRUCTURE item
+      description: |
+        Provide a chemical structure (SMILES, InChI, or InChIKey) for an item
+        that was submitted as an InChIKey-only input and therefore could not be
+        classified locally.
+
+        If the computed InChIKey of the submitted structure matches the item's
+        expected InChIKey the item progresses to classification.  If it does not
+        match, 422 is returned and the item remains NEED_STRUCTURE (retryable).
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                structure:
+                  type: string
+                  description: SMILES, InChI, or full structure string.
+                  example: "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O"
+                secret:
+                  type: string
+                  description: |
+                    Job secret.  Prefer the X-Job-Secret header.
+              required:
+                - structure
+      responses:
+        "200":
+          description: Structure accepted; item status updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    description: New item status.
+                required:
+                  - status
+        "400":
+          description: Missing or unparseable structure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing shared-access token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Invalid job secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Item not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: |
+            Submitted structure InChIKey does not match the expected InChIKey.
+            Item remains NEED_STRUCTURE.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  submitted_inchikey:
+                    type: string
+                  expected_inchikey:
+                    type: string
+                required:
+                  - error
+                  - submitted_inchikey
+                  - expected_inchikey
+
+  /api/jobs/{id}/exports:
+    post:
+      operationId: createExport
+      summary: Create or reuse an export
+      description: |
+        Create a downloadable export file for a job.  If an identical export
+        (same job, format, and secret) already exists it may be reused.
+
+        The returned token is valid for a limited time.  Use
+        GET /api/exports/{token} to download.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Job ID.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format:
+                  type: string
+                  enum: ["csv", "tsv", "json", "csv.gz", "tsv.gz"]
+                  description: Export format.
+                secret:
+                  type: string
+                  description: Job secret.  Prefer the X-Job-Secret header.
+              required:
+                - format
+      responses:
+        "201":
+          description: Export created (or reused).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportResponse"
+        "400":
+          description: Missing or invalid format.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing shared-access token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Invalid job secret.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Job not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/exports/{token}:
+    get:
+      operationId: downloadExport
+      summary: Download an export
+      description: |
+        Download a previously created export by its token.  No authentication
+        header is required — the token itself is the credential.  Treat the
+        URL as a secret (like a signed URL).
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Export token returned by POST /api/jobs/{id}/exports.
+      responses:
+        "200":
+          description: Export file.
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            text/tab-separated-values:
+              schema:
+                type: string
+                format: binary
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+            application/gzip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Token not found or expired.
