@@ -87,7 +87,7 @@ def env_required(name: str) -> str:
     secrets and other values that must be supplied explicitly in production.
     """
     value = os.environ.get(name, "")
-    if not value:
+    if not value.strip():
         raise ImproperlyConfigured(
             f"Required environment variable {name!r} is missing or empty. "
             "Set it in .env or as a real environment variable."

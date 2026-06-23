@@ -53,11 +53,15 @@ ARG DJANGO_SETTINGS_MODULE=config.settings.prod
 ENV DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY} \
     DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}
 
-# Skip DB checks during collectstatic by providing minimal env
+# Collect static at build with placeholder env (collectstatic needs no DB).
+# A failure must remain VISIBLE in the build log rather than be silently
+# swallowed, but it should not abort the image build — missing static assets
+# surface and are recoverable at runtime via `collectstatic` on start.
 RUN POSTGRES_HOST=localhost POSTGRES_PASSWORD=placeholder \
     NGROK_DOMAIN=placeholder.example.com \
     SHARED_ACCESS_PASSWORD_HASH=placeholder \
-    python manage.py collectstatic --noinput 2>&1 || true
+    python manage.py collectstatic --noinput 2>&1 \
+    || echo "WARN: collectstatic failed at build time — run it at container start; check STORAGES/whitenoise config"
 
 # ── Runtime ownership ────────────────────────────────────────────────────────
 RUN chown -R appuser:appgroup /app
