@@ -19,6 +19,7 @@ import os
 import sys
 import types
 import zipfile
+from pathlib import Path
 
 import pytest
 import yaml
@@ -332,7 +333,7 @@ class TestBaseSettingsCircuit:
 
 
 class TestDockerComposePortExposure:
-    COMPOSE_FILE = "/media/user/HDD/git/ClassyFire-wt-task11/docker-compose.yml"
+    COMPOSE_FILE = str(Path(__file__).resolve().parents[1] / "docker-compose.yml")
 
     def _load_compose(self) -> dict:
         with open(self.COMPOSE_FILE) as f:
@@ -468,3 +469,114 @@ class TestLogRedaction:
     def test_exact_max_chars_not_redacted(self) -> None:
         result = redact_for_log("abc", max_chars=3)
         assert result == "abc"
+
+
+# ===========================================================================
+# 10. Referrer-Policy: no-referrer header (defence-in-depth for URL secrets)
+# ===========================================================================
+
+
+class TestReferrerPolicy:
+    """Responses must carry Referrer-Policy: no-referrer so the per-job secret
+    embedded in result-page URLs is never forwarded in a Referer header."""
+
+    @pytest.mark.django_db(transaction=True)
+    def test_result_page_has_no_referrer_policy(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        response = client.get(f"/jobs/{job.pk}/{secret}/")
+        assert response.status_code == 200
+        assert response.headers.get("Referrer-Policy") == "no-referrer", (
+            f"Expected Referrer-Policy: no-referrer, got: {response.headers.get('Referrer-Policy')}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_api_response_has_no_referrer_policy(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        response = client.get(
+            f"/api/jobs/{job.pk}?secret={secret}",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+        )
+        assert response.status_code == 200
+        assert response.headers.get("Referrer-Policy") == "no-referrer", (
+            f"Expected Referrer-Policy: no-referrer, got: {response.headers.get('Referrer-Policy')}"
+        )
+
+
+# ===========================================================================
+# 11. X-Job-Secret header support (keeps secret out of query-string logs)
+# ===========================================================================
+
+
+class TestXJobSecretHeader:
+    """The API must accept the per-job secret via the X-Job-Secret request
+    header in addition to ?secret= and body["secret"], allowing API clients
+    to keep the secret out of URLs and access logs."""
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_correct_header_secret_gives_200(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        # Pass the secret in the header only — NOT in query string or body.
+        response = client.get(
+            f"/api/jobs/{job.pk}",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+            HTTP_X_JOB_SECRET=secret,
+        )
+        assert response.status_code == 200, (
+            f"Expected 200 with correct X-Job-Secret header, got {response.status_code}: "
+            f"{response.content}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_wrong_header_secret_gives_403(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, _secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        response = client.get(
+            f"/api/jobs/{job.pk}",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+            HTTP_X_JOB_SECRET="definitely-wrong-secret",
+        )
+        assert response.status_code == 403, (
+            f"Expected 403 with wrong X-Job-Secret header, got {response.status_code}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_query_secret_still_works(self) -> None:
+        """Backwards compat: ?secret= continues to work for shareable links."""
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        response = client.get(
+            f"/api/jobs/{job.pk}?secret={secret}",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+        )
+        assert response.status_code == 200, (
+            f"Expected 200 with ?secret= query param, got {response.status_code}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_header_takes_priority_over_query(self) -> None:
+        """X-Job-Secret header is checked first; a wrong query param is ignored
+        when the header carries the correct secret."""
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+        response = client.get(
+            f"/api/jobs/{job.pk}?secret=wrong-query-param",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+            HTTP_X_JOB_SECRET=secret,
+        )
+        assert response.status_code == 200, (
+            f"Expected 200 when header is correct and query is wrong, got {response.status_code}"
+        )

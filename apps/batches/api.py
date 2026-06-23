@@ -56,6 +56,26 @@ from apps.batches.services import create_job
 from apps.core.enums import BatchItemStatus
 from apps.core.security import require_shared_access
 
+
+def _job_secret(request: HttpRequest, body: dict[str, object] | None = None) -> str:
+    """Return the job secret from the request, checking in this priority order:
+
+    1. ``X-Job-Secret`` request header — keeps the secret out of URLs/query
+       strings and therefore out of access logs (preferred for API clients).
+    2. ``body["secret"]`` — accepted for backwards-compat POST/JSON callers.
+    3. ``?secret=`` query parameter — preserved for the shareable-link use case
+       (§9.2: result URLs embed the secret so recipients can open them directly).
+    """
+    header_secret = request.headers.get("X-Job-Secret", "")
+    if header_secret:
+        return header_secret
+    if body is not None:
+        body_secret = str(body.get("secret") or "")
+        if body_secret:
+            return body_secret
+    return request.GET.get("secret", "")
+
+
 # Status groups for items filter
 FOUND_STATUSES = [
     BatchItemStatus.FOUND_LIVE_CACHE,
@@ -112,7 +132,7 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
 def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """GET /api/jobs/{id}?secret=<plaintext> — return job status JSON."""
     job = get_object_or_404(BatchJob, pk=job_id)
-    secret = request.GET.get("secret", "")
+    secret = _job_secret(request)
     if not check_password(secret, job.secret_hash):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
@@ -140,7 +160,7 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
 def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """GET /api/jobs/{id}/items — paginated + filtered items JSON."""
     job = get_object_or_404(BatchJob, pk=job_id)
-    secret = request.GET.get("secret", "")
+    secret = _job_secret(request)
     if not check_password(secret, job.secret_hash):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
@@ -200,7 +220,7 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
 
-    secret = body.get("secret") or request.GET.get("secret", "")
+    secret = _job_secret(request, body)
     if not check_password(secret, job.secret_hash):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
@@ -275,7 +295,7 @@ def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
 
-    secret = body.get("secret") or request.GET.get("secret", "")
+    secret = _job_secret(request, body)
     fmt = body.get("format", "")
 
     if not fmt:

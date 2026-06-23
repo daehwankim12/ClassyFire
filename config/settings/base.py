@@ -173,6 +173,15 @@ EXPORT_RETENTION_DAYS: int = env_int("EXPORT_RETENTION_DAYS", 14)
 DISK_UPLOAD_PAUSE_PERCENT: int = env_int("DISK_UPLOAD_PAUSE_PERCENT", 85)
 
 # ---------------------------------------------------------------------------
+# Referrer policy (defence-in-depth: URL path embeds a per-job secret)
+# no-referrer prevents the secret from appearing in any Referer header,
+# including same-origin requests (which would otherwise leak it into logs).
+# SecurityMiddleware emits Referrer-Policy when this setting is present.
+# ---------------------------------------------------------------------------
+
+SECURE_REFERRER_POLICY = "no-referrer"
+
+# ---------------------------------------------------------------------------
 # Circuit breaker (Task 9 remote worker — read via getattr for backwards compat)
 # ---------------------------------------------------------------------------
 
