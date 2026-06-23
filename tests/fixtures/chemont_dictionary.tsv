@@ -1,0 +1,7 @@
+chemont_id	name	parent_id	ontology_version
+CHEMONT:0000000	Chemical entities		2.1
+CHEMONT:0000001	Organic compounds	CHEMONT:0000000	2.1
+CHEMONT:0000002	Lipids and lipid-like molecules	CHEMONT:0000001	2.1
+CHEMONT:0000003	Glycerophospholipids	CHEMONT:0000002	2.1
+CHEMONT:0000004	Fatty Acyls	CHEMONT:0000002	2.1
+CHEMONT:0000005	Organic acids and derivatives	CHEMONT:0000001	2.1
