@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 from django.conf import settings
 
-from apps.remote.mock import parse_wishart_payload
+from apps.remote.mock import parse_wishart_payload, parse_wishart_results
 from apps.remote.provider import (
     EntityLookupResult,
     EntityLookupStatus,
@@ -175,3 +175,10 @@ class WishartDirectProvider:
         if isinstance(entities, list) and entities:
             payload = entities[0]
         return parse_wishart_payload(payload)
+
+    def parse_results(
+        self, raw_json: dict[str, Any]
+    ) -> list[NormalizedClassification]:
+        # A completed /queries response wraps one entity per submitted
+        # structure; parse EVERY entity so every batched task can be resolved.
+        return parse_wishart_results(raw_json)
