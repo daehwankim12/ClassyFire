@@ -34,7 +34,7 @@ from django.conf import settings
 from django.contrib.auth.hashers import check_password
 
 from apps.batches.models import BatchItem, BatchJob
-from apps.classifications.services import lookup_current_classification
+from apps.classifications.services import snapshot_current_classification
 
 if TYPE_CHECKING:
     pass
@@ -59,28 +59,15 @@ CITATION_DICT = (
 )
 
 COLUMNS = [
-    "row_order",
-    "external_id",
-    "original_input",
-    "detected_type",
-    "inchikey",
-    "status",
-    "message",
-    "kingdom_name",
-    "kingdom_chemont_id",
-    "superclass_name",
-    "superclass_chemont_id",
-    "class_name",
-    "class_chemont_id",
-    "subclass_name",
-    "subclass_chemont_id",
-    "direct_parent_name",
-    "direct_parent_chemont_id",
-    "source_type",
-    "source_priority",
-    "source_ref",
-    "classification_version",
-    "retrieved_at",
+    "InChIKey",
+    "ClassyFy Status",
+    "Kingdom",
+    "Superclass",
+    "Class",
+    "Subclass",
+    "Parent Level 1",
+    "Parent Level 2",
+    "Parent Level 3",
 ]
 
 # Statuses that warrant a classification lookup
@@ -104,58 +91,98 @@ def _escape_cell(value: str | None) -> str:
     return s
 
 
+def _snapshot_label(snapshot: dict[str, object], key: str) -> dict[str, object] | None:
+    value = snapshot.get(key)
+    return value if isinstance(value, dict) else None
+
+
+def _label_name(snapshot: dict[str, object], key: str) -> str:
+    label = _snapshot_label(snapshot, key)
+    if label is None:
+        return ""
+    name = label.get("name")
+    return str(name) if name is not None else ""
+
+
+def _label_chemont_id(snapshot: dict[str, object], key: str) -> str | None:
+    label = _snapshot_label(snapshot, key)
+    if label is None:
+        return None
+    chemont_id = label.get("chemont_id")
+    return str(chemont_id) if chemont_id is not None else None
+
+
+def _parent_levels(snapshot: dict[str, object]) -> list[str]:
+    direct_name = _label_name(snapshot, "direct_parent")
+    direct_id = _label_chemont_id(snapshot, "direct_parent")
+    if not direct_name:
+        return ["", "", ""]
+    if not direct_id:
+        return [direct_name, "", ""]
+
+    from apps.chemont.models import ChemOntNode
+
+    stop_ids = {
+        _label_chemont_id(snapshot, "subclass"),
+        _label_chemont_id(snapshot, "class"),
+        _label_chemont_id(snapshot, "superclass"),
+        _label_chemont_id(snapshot, "kingdom"),
+    }
+    stop_ids.discard(None)
+
+    node = (
+        ChemOntNode.objects.filter(chemont_id=direct_id)
+        .select_related("parent")
+        .first()
+    )
+    if node is None:
+        return [direct_name, "", ""]
+
+    chain: list[str] = []
+    current: ChemOntNode | None = node
+    while current is not None:
+        chain.append(current.name)
+        if current.chemont_id in stop_ids:
+            break
+        current = current.parent
+
+    if chain and current is not None and current.chemont_id in stop_ids:
+        chain = chain[:-1]
+    if not chain:
+        chain = [direct_name]
+
+    levels = list(reversed(chain))[:3]
+    return [*levels, "", "", ""][:3]
+
+
 def _build_row_dict(item: BatchItem) -> dict[str, str | int | None]:
     """Build a flat export row dict for one BatchItem."""
+    snapshot = item.classification_snapshot
+    if snapshot is None and item.status in _FOUND_STATUSES and item.inchikey:
+        snapshot = snapshot_current_classification(item.inchikey)
+
+    completed = item.status in _FOUND_STATUSES and snapshot is not None
     row: dict[str, str | int | None] = {
-        "row_order": item.row_order,
-        "external_id": item.external_id,
-        "original_input": item.original_input,
-        "detected_type": item.detected_type,
-        "inchikey": item.inchikey,
-        "status": item.status,
-        "message": item.message,
-        "kingdom_name": None,
-        "kingdom_chemont_id": None,
-        "superclass_name": None,
-        "superclass_chemont_id": None,
-        "class_name": None,
-        "class_chemont_id": None,
-        "subclass_name": None,
-        "subclass_chemont_id": None,
-        "direct_parent_name": None,
-        "direct_parent_chemont_id": None,
-        "source_type": None,
-        "source_priority": None,
-        "source_ref": None,
-        "classification_version": None,
-        "retrieved_at": None,
+        "InChIKey": item.inchikey,
+        "ClassyFy Status": "Completed" if completed else "Failed",
+        "Kingdom": None,
+        "Superclass": None,
+        "Class": None,
+        "Subclass": None,
+        "Parent Level 1": None,
+        "Parent Level 2": None,
+        "Parent Level 3": None,
     }
 
-    if item.status in _FOUND_STATUSES and item.inchikey:
-        result = lookup_current_classification(item.inchikey)
-        if result is not None:
-            if result.kingdom:
-                row["kingdom_name"] = result.kingdom.name
-                row["kingdom_chemont_id"] = result.kingdom.chemont_id
-            if result.superclass:
-                row["superclass_name"] = result.superclass.name
-                row["superclass_chemont_id"] = result.superclass.chemont_id
-            if result.class_:
-                row["class_name"] = result.class_.name
-                row["class_chemont_id"] = result.class_.chemont_id
-            if result.subclass:
-                row["subclass_name"] = result.subclass.name
-                row["subclass_chemont_id"] = result.subclass.chemont_id
-            if result.direct_parent:
-                row["direct_parent_name"] = result.direct_parent.name
-                row["direct_parent_chemont_id"] = result.direct_parent.chemont_id
-            row["source_type"] = result.source_type
-            row["source_priority"] = result.source_priority
-            row["source_ref"] = result.source_ref
-            row["classification_version"] = result.classification_version
-            row["retrieved_at"] = (
-                result.retrieved_at.isoformat() if result.retrieved_at else None
-            )
+    if completed and isinstance(snapshot, dict):
+        row["Kingdom"] = _label_name(snapshot, "kingdom")
+        row["Superclass"] = _label_name(snapshot, "superclass")
+        row["Class"] = _label_name(snapshot, "class")
+        row["Subclass"] = _label_name(snapshot, "subclass")
+        parent_1, parent_2, parent_3 = _parent_levels(snapshot)
+        row["Parent Level 1"] = parent_1
+        row["Parent Level 2"] = parent_2
+        row["Parent Level 3"] = parent_3
 
     return row
 

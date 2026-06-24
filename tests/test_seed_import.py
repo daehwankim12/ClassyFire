@@ -68,6 +68,12 @@ def _stream_import(seed_import_id: int, *, resume: bool = False):
     )
 
 
+def _write_zst(path: Path, content: str) -> Path:
+    cctx = zstd.ZstdCompressor()
+    path.write_bytes(cctx.compress(content.encode()))
+    return path
+
+
 # ---------------------------------------------------------------------------
 # TEST: Checksum validation
 # ---------------------------------------------------------------------------
@@ -148,6 +154,32 @@ def test_import_chemont_bad_parent_raises(tmp_path):
         import_chemont(bad_tsv)
 
 
+@pytest.mark.django_db(transaction=True)
+def test_import_chemont_accepts_zenodo_v3_dictionary(tmp_path):
+    """The Zenodo v3 numeric dictionary format is loaded with parent FKs."""
+    from apps.chemont.importers import import_chemont
+    from apps.chemont.models import ChemOntNode
+
+    tsv = tmp_path / "chemont_v3.tsv"
+    tsv.write_text(
+        "numeric_id\tchemont_id\tname\tparent_numeric_id\tparent_name\n"
+        "0\tCHEMONTID:0000000\tOrganic compounds\t9999999\tChemical entities\n"
+        "12\tCHEMONTID:0000012\tOrganooxygen compounds\t0\tOrganic compounds\n"
+        "9999999\tCHEMONTID:9999999\tChemical entities\tnull\t\n",
+        encoding="utf-8",
+    )
+
+    result = import_chemont(tsv, ontology_version="2.1-v3", replace=True)
+
+    assert result["total"] == 3
+    root = ChemOntNode.objects.get(numeric_id=9999999)
+    organic = ChemOntNode.objects.get(numeric_id=0)
+    oxygen = ChemOntNode.objects.get(numeric_id=12)
+    assert root.parent is None
+    assert organic.parent_id == 9999999
+    assert oxygen.parent_id == 0
+
+
 # ---------------------------------------------------------------------------
 # TEST: Streaming TSV import
 # ---------------------------------------------------------------------------
@@ -191,6 +223,119 @@ def test_stream_import_seed_source_id():
     from apps.classifications.models import ClassyfireSeed
     source_ids = set(ClassyfireSeed.objects.values_list("seed_source_id", flat=True))
     assert source_ids == {si.pk}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stream_import_accepts_zenodo_v3_seed_schema(tmp_path):
+    """Zenodo v3 compact seed rows are converted into the normalized seed table."""
+    from apps.chemont.importers import import_chemont
+    from apps.classifications.models import ClassyfireSeed
+    from apps.classifications.seed_manifest import compute_sha256, create_seed_import_row
+    from apps.classifications.seed_stream import stream_import
+
+    chemont_tsv = tmp_path / "chemont_v3.tsv"
+    chemont_tsv.write_text(
+        "numeric_id\tchemont_id\tname\tparent_numeric_id\tparent_name\n"
+        "0\tCHEMONTID:0000000\tOrganic compounds\t9999999\tChemical entities\n"
+        "12\tCHEMONTID:0000012\tOrganooxygen compounds\t0\tOrganic compounds\n"
+        "324\tCHEMONTID:0000324\tCarboxylic acids\t3909\tOrganooxygen compounds\n"
+        "1095\tCHEMONTID:0001095\tCarnitines\t324\tCarboxylic acids\n"
+        "3909\tCHEMONTID:0003909\tOrganic oxygen compounds\t12\tOrganooxygen compounds\n"
+        "9999999\tCHEMONTID:9999999\tChemical entities\tnull\t\n",
+        encoding="utf-8",
+    )
+    import_chemont(chemont_tsv, ontology_version="2.1-v3", replace=True)
+
+    seed_tsv = (
+        "inchikey\tcid\tzinc_id\tsmiles\tchemont_tree_json\tchemont_other_json\n"
+        'RDHQFKQIGNGIED-UHFFFAOYSA-N\t1\t\tC\\\\C=C/C\t[0,12,3909,324,1095]\t{"alternative_parents":[346],"mapped_features":[0,346]}\n'
+        'INCSWYKICIYAHB-UHFFFAOYSA-N\t3\tZINC000000000003\tC1=CC(O)=CC=C1\t[0,12,null,324,1095]\t{}\n'
+    )
+    seed_zst = _write_zst(tmp_path / "v3_seed.tsv.zst", seed_tsv)
+    manifest = {
+        "doi": None,
+        "record_id": "test-v3",
+        "filename": seed_zst.name,
+        "checksum": compute_sha256(seed_zst),
+        "license": None,
+        "expected_row_count": 2,
+    }
+    si = create_seed_import_row(manifest)
+
+    result = stream_import(seed_zst, si.pk, "zenodo-v3", target_table="classyfire_seed")
+
+    assert result["rows_written"] == 2
+    first = ClassyfireSeed.objects.get(inchikey="RDHQFKQIGNGIED-UHFFFAOYSA-N")
+    assert first.inchikey14 == "RDHQFKQIGNGIED"
+    assert first.pubchem_cid == 1
+    assert first.representative_smiles == r"C\\C=C/C"
+    assert first.kingdom_id == 0
+    assert first.superclass_id == 12
+    assert first.class_node_id == 3909
+    assert first.subclass_id == 324
+    assert first.direct_parent_id == 1095
+    assert first.other_labels == {"alternative_parents": [346], "mapped_features": [0, 346]}
+
+    second = ClassyfireSeed.objects.get(inchikey="INCSWYKICIYAHB-UHFFFAOYSA-N")
+    assert second.class_node is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_seed_import_full_creates_versioned_table_for_v3_seed(tmp_path):
+    """FULL import creates and records the versioned physical seed table."""
+    from django.core.management import call_command
+
+    from apps.chemont.importers import import_chemont
+    from apps.classifications.seed_manifest import compute_sha256, create_seed_import_row
+
+    chemont_tsv = tmp_path / "chemont_v3.tsv"
+    chemont_tsv.write_text(
+        "numeric_id\tchemont_id\tname\tparent_numeric_id\tparent_name\n"
+        "0\tCHEMONTID:0000000\tOrganic compounds\t9999999\tChemical entities\n"
+        "12\tCHEMONTID:0000012\tOrganooxygen compounds\t0\tOrganic compounds\n"
+        "324\tCHEMONTID:0000324\tCarboxylic acids\t12\tOrganooxygen compounds\n"
+        "1095\tCHEMONTID:0001095\tCarnitines\t324\tCarboxylic acids\n"
+        "3909\tCHEMONTID:0003909\tOrganic oxygen compounds\t12\tOrganooxygen compounds\n"
+        "9999999\tCHEMONTID:9999999\tChemical entities\tnull\t\n",
+        encoding="utf-8",
+    )
+    import_chemont(chemont_tsv, ontology_version="2.1-v3", replace=True)
+
+    seed_zst = _write_zst(
+        tmp_path / "v3_seed.tsv.zst",
+        "inchikey\tcid\tzinc_id\tsmiles\tchemont_tree_json\tchemont_other_json\n"
+        "RDHQFKQIGNGIED-UHFFFAOYSA-N\t1\t\tCCO\t[0,12,3909,324,1095]\t{}\n",
+    )
+    manifest = {
+        "doi": None,
+        "record_id": "test-v3",
+        "filename": seed_zst.name,
+        "checksum": compute_sha256(seed_zst),
+        "license": None,
+        "expected_row_count": 1,
+    }
+    si = create_seed_import_row(manifest)
+
+    call_command(
+        "seed_import",
+        profile="FULL",
+        source=str(seed_zst),
+        seed_import_id=si.pk,
+        seed_version="zenodo-v3",
+    )
+
+    si.refresh_from_db()
+    versioned_table = f"classyfire_seed_v{si.pk}"
+    assert si.activated_table == versioned_table
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = %s)",
+            [versioned_table],
+        )
+        assert cur.fetchone()[0] is True
+        cur.execute(f"SELECT COUNT(*) FROM {versioned_table}")
+        assert cur.fetchone()[0] == 1
 
 
 # ---------------------------------------------------------------------------

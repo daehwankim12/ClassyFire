@@ -321,6 +321,54 @@ def test_smiles_miss_remote_enabled_creates_remote_task():
 
 
 @pytest.mark.django_db(transaction=True)
+def test_structured_miss_remote_disabled_does_not_create_remote_task():
+    """SMILES input with remote disabled must not enqueue remote work."""
+    from apps.batches.services import create_job
+    from apps.core.enums import BatchItemStatus
+    from apps.remote.models import RemoteTask
+
+    rows = [{"raw": ETHANOL_SMILES, "row_index": 0}]
+
+    job, _secret = create_job(rows, remote_enabled=False)
+    item = job.items.get()
+
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.inchikey == ETHANOL_INCHIKEY
+    assert item.compound is not None
+    assert RemoteTask.objects.filter(inchikey=ETHANOL_INCHIKEY).count() == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_key_only_remote_task_gets_structure_attached_later():
+    """A later structure submission attaches to the active key-only task."""
+    from apps.batches.services import create_job
+    from apps.core.enums import BatchItemStatus
+    from apps.remote.models import RemoteTask
+
+    first_job, _secret = create_job(
+        [{"raw": ETHANOL_INCHIKEY, "row_index": 0}],
+        remote_enabled=True,
+    )
+    first_item = first_job.items.get()
+    task = RemoteTask.objects.get(inchikey=ETHANOL_INCHIKEY)
+
+    assert first_item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert first_item.compound is None
+    assert task.compound is None
+
+    second_job, _secret = create_job(
+        [{"raw": ETHANOL_SMILES, "row_index": 0}],
+        remote_enabled=True,
+    )
+    second_item = second_job.items.get()
+    task.refresh_from_db()
+
+    assert second_item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert second_item.compound is not None
+    assert task.compound_id == second_item.compound_id
+
+
+@pytest.mark.django_db(transaction=True)
 def test_global_dedupe_one_active_remote_task():
     """Two jobs with the same inchikey-only miss → exactly ONE active RemoteTask, both items PENDING."""
     from apps.batches.models import BatchItem

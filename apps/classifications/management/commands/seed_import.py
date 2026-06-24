@@ -17,7 +17,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import psycopg.sql as pgsql
 from django.core.management.base import BaseCommand, CommandError
+from django.db import connection
 
 from apps.classifications.seed_manifest import (
     compute_sha256,
@@ -25,6 +27,17 @@ from apps.classifications.seed_manifest import (
     versioned_table_name,
 )
 from apps.classifications.seed_stream import StreamImportError, stream_import
+
+
+def _ensure_seed_table(table_name: str) -> None:
+    """Create a versioned seed table with the same shape as classyfire_seed."""
+    with connection.cursor() as cur:
+        cur.execute(
+            pgsql.SQL(
+                "CREATE TABLE IF NOT EXISTS {} "
+                "(LIKE classyfire_seed INCLUDING ALL)"
+            ).format(pgsql.Identifier(table_name))
+        )
 
 
 class Command(BaseCommand):
@@ -97,10 +110,11 @@ class Command(BaseCommand):
         from apps.operations.models import SeedImport
 
         seed_import_id = options["seed_import_id"]
-        if resume and seed_import_id:
+        if seed_import_id:
             try:
                 seed_import = SeedImport.objects.get(pk=seed_import_id)
-                self.stdout.write(f"Resuming SeedImport pk={seed_import_id}")
+                action = "Resuming" if resume else "Using"
+                self.stdout.write(f"{action} SeedImport pk={seed_import_id}")
             except SeedImport.DoesNotExist as exc:
                 raise CommandError(f"SeedImport {seed_import_id} not found") from exc
         elif resume:
@@ -142,7 +156,10 @@ class Command(BaseCommand):
         if profile == "FULL" and not dry_run and target_table == "classyfire_seed":
             vt = versioned_table_name(seed_import_id)
             self.stdout.write(f"FULL profile: will write to versioned table {vt}")
+            _ensure_seed_table(vt)
             target_table = vt
+            seed_import.activated_table = vt
+            seed_import.save(update_fields=["activated_table"])
 
         self.stdout.write(
             f"Importing {source} (profile={profile}, target={target_table})..."

@@ -85,6 +85,11 @@ class BatchItem(models.Model):
     message = models.TextField(
         null=True, blank=True, help_text="Human-readable detail for the status."
     )
+    classification_snapshot = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Pinned classification labels/provenance used by this item.",
+    )
 
     class Meta:
         db_table = "batch_items"

@@ -53,7 +53,11 @@ from django.utils import timezone
 
 from apps.batches.ingest import ingest_rows
 from apps.batches.models import BatchItem, BatchJob
-from apps.classifications.services import LookupTier, lookup_current_classification
+from apps.classifications.services import (
+    LookupTier,
+    classification_lookup_snapshot,
+    lookup_current_classification,
+)
 from apps.compounds.models import CompoundStructure, CompoundUsage
 from apps.compounds.validators import normalize_row
 from apps.core.enums import (
@@ -85,22 +89,46 @@ def _get_or_create_compound(
     original_input: str,
     canonical_smiles: str | None,
     inchi: str | None,
-) -> CompoundStructure:
+) -> CompoundStructure | None:
     """Get or create a CompoundStructure for *inchikey*.
 
-    If a structure already exists, we do NOT overwrite it (first-write wins).
-    Uses get_or_create to be safe against concurrent inserts.
+    Key-only inputs do not create blank structure rows.  If a blank row exists
+    from older data, a later real structure fills the missing fields exactly
+    once; existing populated structures still keep first-write-wins semantics.
     """
-    compound, _ = CompoundStructure.objects.get_or_create(
-        inchikey=inchikey,
-        defaults={
-            "original_input": original_input,
-            "original_smiles": canonical_smiles,  # input may already be canonical
-            "canonical_smiles": canonical_smiles,
-            "inchi": inchi,
-        },
-    )
-    return compound
+    if canonical_smiles is None and inchi is None:
+        return None
+
+    with transaction.atomic():
+        compound = (
+            CompoundStructure.objects.select_for_update()
+            .filter(inchikey=inchikey)
+            .order_by("created_at", "pk")
+            .first()
+        )
+        if compound is None:
+            return CompoundStructure.objects.create(
+                inchikey=inchikey,
+                original_input=original_input,
+                original_smiles=canonical_smiles,
+                canonical_smiles=canonical_smiles,
+                inchi=inchi,
+            )
+
+        if not compound.canonical_smiles and not compound.inchi:
+            compound.original_input = original_input
+            compound.original_smiles = canonical_smiles
+            compound.canonical_smiles = canonical_smiles
+            compound.inchi = inchi
+            compound.save(
+                update_fields=[
+                    "original_input",
+                    "original_smiles",
+                    "canonical_smiles",
+                    "inchi",
+                ]
+            )
+        return compound
 
 
 def _update_usage(inchikey: str) -> None:
@@ -136,6 +164,11 @@ def _get_or_create_remote_task(
         state__in=ACTIVE_TASK_STATES,
     ).first()
     if existing is not None:
+        if compound is not None and existing.compound_id is None:
+            RemoteTask.objects.filter(pk=existing.pk, compound__isnull=True).update(
+                compound=compound
+            )
+            existing.refresh_from_db(fields=["compound"])
         return existing
 
     # No active task found — create one in a savepoint.
@@ -160,6 +193,8 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
     Updates item fields (inchikey, detected_type, compound, message) in place;
     the caller is responsible for calling item.save().
     """
+    item.classification_snapshot = None
+
     # Step 0: Guard — reject rows whose structure string exceeds MAX_STRUCTURE_LEN.
     # This check lives here (service layer) so it covers BOTH the UI and API paths.
     # For an over-limit row we preserve a bounded preview of the original input
@@ -189,34 +224,38 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
         item.inchikey = norm.inchikey
         result = lookup_current_classification(norm.inchikey)
         if result is not None:
+            item.classification_snapshot = classification_lookup_snapshot(result)
             if result.tier == LookupTier.LIVE:
                 return BatchItemStatus.FOUND_LIVE_CACHE
             else:
                 return BatchItemStatus.FOUND_SEED_CACHE
 
-        # Step 4: Local miss — create/reuse compound
-        compound = _get_or_create_compound(
-            norm.inchikey,
-            norm.original_input,
-            norm.canonical_smiles,
-            norm.inchi,
+        # Step 4: Local miss — create/reuse structure only if one was supplied.
+        has_structure = norm.detected_type != DetectedInputType.INCHIKEY
+        compound = (
+            _get_or_create_compound(
+                norm.inchikey,
+                norm.original_input,
+                norm.canonical_smiles,
+                norm.inchi,
+            )
+            if has_structure
+            else None
         )
         item.compound = compound
         _update_usage(norm.inchikey)
 
-        # Decision: do we have a structure?
-        has_structure = norm.detected_type != DetectedInputType.INCHIKEY
-
-        if has_structure or remote_enabled:
-            # Create/reuse a RemoteTask
-            _get_or_create_remote_task(
-                norm.inchikey,
-                compound if has_structure else None,
+        if not remote_enabled:
+            return (
+                BatchItemStatus.REMOTE_DELAYED
+                if has_structure
+                else BatchItemStatus.NEED_STRUCTURE
             )
-            return BatchItemStatus.PENDING_CLASSIFICATION
-        else:
-            # InChIKey-only, remote disabled
-            return BatchItemStatus.NEED_STRUCTURE
+
+        # Create/reuse a RemoteTask. Key-only tasks are entity lookups; structure
+        # tasks can proceed to calculation if entity lookup misses.
+        _get_or_create_remote_task(norm.inchikey, compound)
+        return BatchItemStatus.PENDING_CLASSIFICATION
 
     # inchikey is None after normalization → the input could not be parsed at all
     # (this shouldn't normally happen — normalize_row returns an error — but be safe)
@@ -332,7 +371,17 @@ def process_job_items(job: BatchJob) -> None:
     for item in qs:
         status = _process_item(item, remote_enabled=job.remote_enabled)
         item.status = status
-        item.save(update_fields=["status", "detected_type", "inchikey", "compound", "message", "original_input"])
+        item.save(
+            update_fields=[
+                "status",
+                "detected_type",
+                "inchikey",
+                "compound",
+                "message",
+                "original_input",
+                "classification_snapshot",
+            ]
+        )
 
     recompute_job_counters(job.pk)
     # Refresh in-memory

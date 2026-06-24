@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import psycopg.sql as pgsql
 
@@ -42,6 +44,15 @@ TSV_COLUMNS = [
     "direct_parent_id",
     "other_labels",
 ]
+TSV_COLUMN_SET = set(TSV_COLUMNS)
+ZENODO_V3_COLUMNS = {
+    "inchikey",
+    "cid",
+    "zinc_id",
+    "smiles",
+    "chemont_tree_json",
+    "chemont_other_json",
+}
 
 # DB columns that map to the physical ``classyfire_seed`` table.
 # Note: model field ``class_node`` uses db_column ``class_id``.
@@ -77,6 +88,117 @@ def _null_or_int(val: str) -> str:
 def _null_or_text(val: str) -> str:
     v = val.strip()
     return r"\N" if not v else v
+
+
+def _copy_field(val: str) -> str:
+    """Escape a single value for PostgreSQL text COPY."""
+    if val == r"\N":
+        return val
+    return (
+        val.replace("\\", "\\\\")
+        .replace("\t", r"\t")
+        .replace("\n", r"\n")
+        .replace("\r", r"\r")
+    )
+
+
+def _format_copy_line(values: list[str]) -> str:
+    return "\t".join(_copy_field(value) for value in values) + "\n"
+
+
+def _detect_schema(
+    fieldnames: Sequence[str] | None,
+) -> Literal["normalized", "zenodo_v3"]:
+    if fieldnames is None:
+        raise StreamImportError("Seed TSV has no header row.")
+
+    fields = set(fieldnames)
+    if TSV_COLUMN_SET <= fields:
+        return "normalized"
+    if ZENODO_V3_COLUMNS <= fields:
+        return "zenodo_v3"
+
+    raise StreamImportError(
+        "Seed TSV missing supported columns: "
+        f"normalized missing={TSV_COLUMN_SET - fields}; "
+        f"zenodo_v3 missing={ZENODO_V3_COLUMNS - fields}"
+    )
+
+
+def _parse_tree_slots(raw: str) -> list[str]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise StreamImportError(f"Invalid chemont_tree_json: {raw!r}") from exc
+
+    if not isinstance(value, list) or len(value) != 5:
+        raise StreamImportError("chemont_tree_json must be a five-element array")
+
+    slots: list[str] = []
+    for item in value:
+        if item is None:
+            slots.append(r"\N")
+        elif isinstance(item, int):
+            slots.append(str(item))
+        else:
+            raise StreamImportError(
+                "chemont_tree_json values must be integer IDs or null"
+            )
+    return slots
+
+
+def _normalize_json_text(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return r"\N"
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise StreamImportError(f"Invalid chemont_other_json: {raw!r}") from exc
+    return json.dumps(parsed, separators=(",", ":"))
+
+
+def _db_values_for_row(
+    row: dict[str, str],
+    schema: Literal["normalized", "zenodo_v3"],
+    seed_import_id: int,
+    seed_version: str,
+) -> list[str]:
+    inchikey = row.get("inchikey", "").strip()
+
+    if schema == "normalized":
+        values = [
+            inchikey,
+            row.get("inchikey14", "").strip(),
+            _null_or_int(row.get("pubchem_cid", "")),
+            _null_or_text(row.get("zinc_id", "")),
+            _null_or_text(row.get("representative_smiles", "")),
+            _null_or_int(row.get("kingdom_id", "")),
+            _null_or_int(row.get("superclass_id", "")),
+            _null_or_int(row.get("class_id", "")),
+            _null_or_int(row.get("subclass_id", "")),
+            _null_or_int(row.get("direct_parent_id", "")),
+            _null_or_text(row.get("other_labels", "")),
+        ]
+    else:
+        kingdom_id, superclass_id, class_id, subclass_id, direct_parent_id = (
+            _parse_tree_slots(row.get("chemont_tree_json", ""))
+        )
+        values = [
+            inchikey,
+            inchikey[:14],
+            _null_or_int(row.get("cid", "")),
+            _null_or_text(row.get("zinc_id", "")),
+            _null_or_text(row.get("smiles", "")),
+            kingdom_id,
+            superclass_id,
+            class_id,
+            subclass_id,
+            direct_parent_id,
+            _normalize_json_text(row.get("chemont_other_json", "")),
+        ]
+
+    return [*values, str(seed_import_id), seed_version]
 
 
 def stream_import(
@@ -142,11 +264,13 @@ def stream_import(
         with dctx.stream_reader(raw_fh) as reader:
             text_reader = io.TextIOWrapper(reader, encoding="utf-8")
             csv_reader = csv.DictReader(text_reader, delimiter="\t")
+            schema = _detect_schema(csv_reader.fieldnames)
 
             if dry_run:
-                # Just count rows without writing.
-                for _row in csv_reader:
+                # Parse and count rows without writing.
+                for row in csv_reader:
                     offset += 1
+                    _db_values_for_row(row, schema, seed_import_id, seed_version)
                 seed_import.actual_row_count = offset
                 seed_import.import_status = "DRY_RUN"
                 seed_import.save(update_fields=["actual_row_count", "import_status"])
@@ -162,15 +286,15 @@ def stream_import(
             from django.db import connection
 
             with connection.cursor() as cursor:
-                shard_buf: list[str] = []
+                shard_buf: list[list[str]] = []
 
-                def flush_shard(buf: list[str]) -> tuple[int, int]:
+                def flush_shard(buf: list[list[str]]) -> tuple[int, int]:
                     """COPY a shard to the target table. Returns (written, dupes)."""
                     if not buf:
                         return 0, 0
                     written = 0
                     dupes = 0
-                    copy_data = "".join(buf)
+                    copy_data = "".join(_format_copy_line(values) for values in buf)
                     tbl = pgsql.Identifier(target_table)
                     col_list = pgsql.SQL(", ").join(
                         pgsql.Identifier(c) for c in DB_COLUMNS
@@ -197,10 +321,10 @@ def stream_import(
                                 pgsql.Placeholder() for _ in DB_COLUMNS
                             ),
                         ).as_string(cursor.connection)
-                        for line in buf:
-                            raw_parts = line.rstrip("\n").split("\t")
-                            # COPY uses '\N' for NULL; convert back to None for
-                            # parameterized INSERT bindings.
+                        for raw_parts in buf:
+                            # COPY uses '\N' for NULL; convert to None for
+                            # parameterized INSERT bindings. Use the raw value
+                            # list, not escaped COPY text, to preserve strings.
                             parts = [
                                 None if v == r"\N" else v for v in raw_parts
                             ]
@@ -222,34 +346,9 @@ def stream_import(
                         rows_skipped += 1
                         continue
 
-                    inchikey = row.get("inchikey", "").strip()
-                    inchikey14 = row.get("inchikey14", "").strip()
-                    pubchem_cid = _null_or_int(row.get("pubchem_cid", ""))
-                    zinc_id = _null_or_text(row.get("zinc_id", ""))
-                    smiles = _null_or_text(row.get("representative_smiles", ""))
-                    kingdom_id = _null_or_int(row.get("kingdom_id", ""))
-                    superclass_id = _null_or_int(row.get("superclass_id", ""))
-                    class_id = _null_or_int(row.get("class_id", ""))
-                    subclass_id = _null_or_int(row.get("subclass_id", ""))
-                    direct_parent_id = _null_or_int(row.get("direct_parent_id", ""))
-                    other_labels = _null_or_text(row.get("other_labels", ""))
-
-                    line = "\t".join([
-                        inchikey,
-                        inchikey14,
-                        pubchem_cid,
-                        zinc_id,
-                        smiles,
-                        kingdom_id,
-                        superclass_id,
-                        class_id,
-                        subclass_id,
-                        direct_parent_id,
-                        other_labels,
-                        str(seed_import_id),
-                        seed_version,
-                    ]) + "\n"
-                    shard_buf.append(line)
+                    shard_buf.append(
+                        _db_values_for_row(row, schema, seed_import_id, seed_version)
+                    )
 
                     if len(shard_buf) >= shard_size:
                         w, d = flush_shard(shard_buf)

@@ -197,17 +197,21 @@ class RemoteWorker:
             submit = self.provider.submit_structures(structures)
         except RetryableProviderError as exc:
             self.circuit.record_failure()
-            if exc.retry_after is not None:
-                self.rate_limiter.submit.penalize(exc.retry_after)
-                queue.retry_after_override(task, exc.retry_after)
-            else:
-                queue.schedule_retry(task)
-            fanout.mark_items_delayed(task.inchikey)
+            retry_after = exc.retry_after
+            if retry_after is not None:
+                self.rate_limiter.submit.penalize(retry_after)
+            for member in members:
+                if retry_after is not None:
+                    queue.retry_after_override(member, retry_after)
+                else:
+                    queue.schedule_retry(member)
+                fanout.mark_items_delayed(member.inchikey)
             return
         except NonRetryableProviderError:
             self.circuit.record_success()
-            fanout.fan_out_result(task.inchikey, BatchItemStatus.INVALID_INPUT)
-            queue.finish_task(task)
+            for member in members:
+                fanout.fan_out_result(member.inchikey, BatchItemStatus.INVALID_INPUT)
+                queue.finish_task(member)
             return
 
         self.circuit.record_success()

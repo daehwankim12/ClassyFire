@@ -22,31 +22,19 @@ from apps.batches.ingest import parse_text_input
 from apps.batches.services import create_job
 
 ASPIRIN_SMILES = "CC(=O)Oc1ccccc1C(=O)O"
+ASPIRIN_INCHIKEY = "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"
 CAFFEINE_SMILES = "Cn1cnc2c1c(=O)n(c(=O)n2C)C"
 
 EXPECTED_COLUMNS = [
-    "row_order",
-    "external_id",
-    "original_input",
-    "detected_type",
-    "inchikey",
-    "status",
-    "message",
-    "kingdom_name",
-    "kingdom_chemont_id",
-    "superclass_name",
-    "superclass_chemont_id",
-    "class_name",
-    "class_chemont_id",
-    "subclass_name",
-    "subclass_chemont_id",
-    "direct_parent_name",
-    "direct_parent_chemont_id",
-    "source_type",
-    "source_priority",
-    "source_ref",
-    "classification_version",
-    "retrieved_at",
+    "InChIKey",
+    "ClassyFy Status",
+    "Kingdom",
+    "Superclass",
+    "Class",
+    "Subclass",
+    "Parent Level 1",
+    "Parent Level 2",
+    "Parent Level 3",
 ]
 
 
@@ -54,6 +42,51 @@ def _create_simple_job():
     """Create a job with one ASPIRIN row."""
     rows = list(parse_text_input(ASPIRIN_SMILES))
     return create_job(rows, remote_enabled=False)
+
+
+def _make_chemont(
+    numeric_id: int,
+    name: str,
+    *,
+    parent_id: int | None = None,
+) -> object:
+    from apps.chemont.models import ChemOntNode
+
+    return ChemOntNode.objects.create(
+        numeric_id=numeric_id,
+        chemont_id=f"CHEMONT:{numeric_id:07d}",
+        name=name,
+        parent_id=parent_id,
+        ontology_version="2.1",
+    )
+
+
+def _make_live(
+    inchikey: str,
+    *,
+    kingdom_id: int | None = None,
+    superclass_id: int | None = None,
+    class_id: int | None = None,
+    subclass_id: int | None = None,
+    direct_parent_id: int | None = None,
+    version: str = "v1",
+) -> object:
+    import datetime as dt
+
+    from apps.classifications.models import ClassyfireLive
+
+    return ClassyfireLive.objects.create(
+        inchikey=inchikey,
+        source_type="WISHART_LIVE_QUERY",
+        source_priority=100,
+        retrieved_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        classification_version=version,
+        kingdom_id=kingdom_id,
+        superclass_id=superclass_id,
+        class_node_id=class_id,
+        subclass_id=subclass_id,
+        direct_parent_id=direct_parent_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +127,69 @@ def test_csv_export_columns():
     fieldnames = reader.fieldnames or []
     for col in EXPECTED_COLUMNS:
         assert col in fieldnames, f"Column '{col}' missing from CSV"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_csv_export_requested_classyfy_row_shape():
+    kingdom = _make_chemont(1000, "Organic compounds")
+    superclass = _make_chemont(
+        1001, "Lipids and lipid-like molecules", parent_id=kingdom.numeric_id
+    )
+    klass = _make_chemont(1002, "Fatty Acyls", parent_id=superclass.numeric_id)
+    subclass = _make_chemont(1003, "Fatty acid esters", parent_id=klass.numeric_id)
+    parent = _make_chemont(1004, "Acyl carnitines", parent_id=subclass.numeric_id)
+    _make_live(
+        ASPIRIN_INCHIKEY,
+        kingdom_id=kingdom.numeric_id,
+        superclass_id=superclass.numeric_id,
+        class_id=klass.numeric_id,
+        subclass_id=subclass.numeric_id,
+        direct_parent_id=parent.numeric_id,
+    )
+
+    job, secret = _create_simple_job()
+    client = Client()
+    raw = _get_export_bytes(client, str(job.pk), secret, "csv")
+    text = raw.decode("utf-8")
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    row = next(csv.DictReader(lines))
+
+    assert row == {
+        "InChIKey": ASPIRIN_INCHIKEY,
+        "ClassyFy Status": "Completed",
+        "Kingdom": "Organic compounds",
+        "Superclass": "Lipids and lipid-like molecules",
+        "Class": "Fatty Acyls",
+        "Subclass": "Fatty acid esters",
+        "Parent Level 1": "Acyl carnitines",
+        "Parent Level 2": "",
+        "Parent Level 3": "",
+    }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_export_uses_pinned_classification_after_live_cache_changes():
+    original = _make_chemont(1100, "Original kingdom")
+    replacement = _make_chemont(1101, "Replacement kingdom")
+    _make_live(ASPIRIN_INCHIKEY, kingdom_id=original.numeric_id, version="v1")
+
+    job, secret = _create_simple_job()
+
+    from apps.classifications.models import ClassyfireLive
+
+    ClassyfireLive.objects.filter(inchikey=ASPIRIN_INCHIKEY).update(
+        kingdom_id=replacement.numeric_id,
+        classification_version="v2",
+    )
+
+    client = Client()
+    raw = _get_export_bytes(client, str(job.pk), secret, "csv")
+    text = raw.decode("utf-8")
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    row = next(csv.DictReader(lines))
+
+    assert row["ClassyFy Status"] == "Completed"
+    assert row["Kingdom"] == "Original kingdom"
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +244,8 @@ def test_csv_gz_export_decompresses_to_valid_csv():
     lines = [line for line in text.splitlines() if not line.startswith("#")]
     reader = csv.DictReader(lines)
     fieldnames = reader.fieldnames or []
-    assert "row_order" in fieldnames
-    assert "inchikey" in fieldnames
+    assert "InChIKey" in fieldnames
+    assert "ClassyFy Status" in fieldnames
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +282,8 @@ def test_row_order_preserved():
     reader = csv.DictReader(lines)
     data_rows = list(reader)
     assert len(data_rows) == 2
-    assert int(data_rows[0]["row_order"]) == 0
-    assert int(data_rows[1]["row_order"]) == 1
+    assert data_rows[0]["InChIKey"] == "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"
+    assert data_rows[1]["InChIKey"] == "RYYVLZVUVIJVGH-UHFFFAOYSA-N"
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +306,12 @@ def test_duplicate_rows_preserved():
 
 
 # ---------------------------------------------------------------------------
-# 8. Source fields present
+# 8. Requested status field present
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.django_db(transaction=True)
-def test_source_fields_present():
+def test_requested_status_field_present():
     job, secret = _create_simple_job()
     client = Client()
     raw = _get_export_bytes(client, str(job.pk), secret, "csv")
@@ -223,8 +319,7 @@ def test_source_fields_present():
     lines = [line for line in text_out.splitlines() if not line.startswith("#")]
     reader = csv.DictReader(lines)
     fieldnames = reader.fieldnames or []
-    for col in ["source_type", "source_ref", "classification_version", "retrieved_at"]:
-        assert col in fieldnames, f"Source field '{col}' missing"
+    assert "ClassyFy Status" in fieldnames
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +361,9 @@ def test_citation_metadata_json():
 
 @pytest.mark.django_db(transaction=True)
 def test_injection_escaping():
-    rows = [{"raw": ASPIRIN_SMILES, "row_index": 0, "external_id": "=1+1"}]
+    dangerous = _make_chemont(900, "=Formula Kingdom")
+    _make_live(ASPIRIN_INCHIKEY, kingdom_id=dangerous.numeric_id)
+    rows = [{"raw": ASPIRIN_SMILES, "row_index": 0}]
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
     raw = _get_export_bytes(client, str(job.pk), secret, "csv")
@@ -275,8 +372,10 @@ def test_injection_escaping():
     reader = csv.DictReader(lines)
     data_rows = list(reader)
     assert len(data_rows) == 1
-    ext_id = data_rows[0]["external_id"]
-    assert ext_id == "'=1+1", f"Expected injection-escaped value, got {ext_id!r}"
+    kingdom = data_rows[0]["Kingdom"]
+    assert kingdom == "'=Formula Kingdom", (
+        f"Expected injection-escaped value, got {kingdom!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +404,7 @@ def test_export_token_download():
     raw = b"".join(dl.streaming_content) if hasattr(dl, "streaming_content") else dl.content
     content = raw.decode("utf-8")
     # Should be a valid CSV with our header
-    assert "row_order" in content
+    assert "InChIKey" in content
 
 
 # ---------------------------------------------------------------------------

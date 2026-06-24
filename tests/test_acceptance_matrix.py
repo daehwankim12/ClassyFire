@@ -164,7 +164,9 @@ EVIDENCE: dict[str, Evidence] = {
         "tests": [
             "test_row_order_preserved",
             "test_duplicate_rows_preserved",
-            "test_source_fields_present",
+            "test_requested_status_field_present",
+            "test_csv_export_requested_classyfy_row_shape",
+            "test_export_uses_pinned_classification_after_live_cache_changes",
             "test_injection_escaping",
         ],
     },

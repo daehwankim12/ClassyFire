@@ -3,8 +3,9 @@
 Reads a TSV file (chemont_dictionary.tsv) into :class:`ChemOntNode`, validating
 parent reference integrity (every parent_id must exist in the file or DB).
 
-TSV columns (header required):
+Supported TSV columns (header required):
     chemont_id  name  parent_id  ontology_version
+    numeric_id  chemont_id  name  parent_numeric_id  parent_name
 
 Parent IDs are resolved in a two-pass approach:
   1. Insert all nodes with parent=NULL.
@@ -14,20 +15,25 @@ from __future__ import annotations
 
 import csv
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TypedDict
 
 from django.db import transaction
 
 from apps.chemont.models import ChemOntNode
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
 
-# Expected columns in the TSV file.
-REQUIRED_COLUMNS = {"chemont_id", "name", "parent_id", "ontology_version"}
+# Expected columns in supported TSV files.
+LEGACY_COLUMNS = {"chemont_id", "name", "parent_id", "ontology_version"}
+ZENODO_V3_COLUMNS = {
+    "numeric_id",
+    "chemont_id",
+    "name",
+    "parent_numeric_id",
+    "parent_name",
+}
 
 
 def _parse_numeric_id(chemont_id: str) -> int:
@@ -43,6 +49,68 @@ def _parse_numeric_id(chemont_id: str) -> int:
 
 class ChemOntImportError(Exception):
     """Raised when the TSV file has structural or integrity problems."""
+
+
+class NormalizedChemOntRow(TypedDict):
+    numeric_id: int
+    chemont_id: str
+    name: str
+    parent_numeric_id: int | None
+    ontology_version: str
+
+
+def _is_null_parent(value: str) -> bool:
+    return value.strip().lower() in {"", "null", "none", r"\n"}
+
+
+def _normalize_rows(
+    rows: list[dict[str, str]],
+    fieldnames: Sequence[str],
+    ontology_version: str | None,
+) -> list[NormalizedChemOntRow]:
+    fields = set(fieldnames)
+    normalized: list[NormalizedChemOntRow] = []
+
+    if LEGACY_COLUMNS <= fields:
+        for row in rows:
+            cid = row["chemont_id"].strip()
+            parent_id = row.get("parent_id", "").strip()
+            normalized.append(
+                {
+                    "numeric_id": _parse_numeric_id(cid),
+                    "chemont_id": cid,
+                    "name": row["name"].strip(),
+                    "parent_numeric_id": (
+                        None if _is_null_parent(parent_id) else _parse_numeric_id(parent_id)
+                    ),
+                    "ontology_version": ontology_version
+                    or row["ontology_version"].strip(),
+                }
+            )
+        return normalized
+
+    if ZENODO_V3_COLUMNS <= fields:
+        for row in rows:
+            parent_numeric = row.get("parent_numeric_id", "").strip()
+            normalized.append(
+                {
+                    "numeric_id": int(row["numeric_id"].strip()),
+                    "chemont_id": row["chemont_id"].strip(),
+                    "name": row["name"].strip(),
+                    "parent_numeric_id": (
+                        None if _is_null_parent(parent_numeric) else int(parent_numeric)
+                    ),
+                    "ontology_version": ontology_version or "zenodo-v3",
+                }
+            )
+        return normalized
+
+    missing_legacy = LEGACY_COLUMNS - fields
+    missing_v3 = ZENODO_V3_COLUMNS - fields
+    raise ChemOntImportError(
+        "TSV missing supported ChemOnt columns: "
+        f"legacy missing={missing_legacy}; zenodo_v3 missing={missing_v3}"
+    )
 
 
 def import_chemont(
@@ -75,31 +143,30 @@ def import_chemont(
         reader = csv.DictReader(fh, delimiter="\t")
         if reader.fieldnames is None:
             raise ChemOntImportError("TSV file has no header row.")
-        missing = REQUIRED_COLUMNS - set(reader.fieldnames)
-        if missing:
-            raise ChemOntImportError(f"TSV missing columns: {missing}")
         rows = list(reader)
 
     if not rows:
         logger.warning("chemont TSV is empty; nothing to import.")
         return {"inserted": 0, "updated": 0, "skipped": 0, "total": 0}
 
+    normalized_rows = _normalize_rows(rows, reader.fieldnames, ontology_version)
+
     # Build in-file id set for integrity check.
-    file_ids: set[str] = {r["chemont_id"].strip() for r in rows}
+    file_ids: set[int] = {int(r["numeric_id"]) for r in normalized_rows}
 
     # Validate parent refs: every non-empty parent_id must be in file_ids.
-    orphans: list[str] = []
-    for row in rows:
-        pid = row.get("parent_id", "").strip()
-        if pid and pid not in file_ids:
+    orphans: list[int] = []
+    for row in normalized_rows:
+        pid = row["parent_numeric_id"]
+        if pid is not None and pid not in file_ids:
             # Also accept if it already exists in DB.
             orphans.append(pid)
 
     if orphans:
         # Check DB for existing parents.
         db_ids = set(
-            ChemOntNode.objects.filter(chemont_id__in=orphans).values_list(
-                "chemont_id", flat=True
+            ChemOntNode.objects.filter(numeric_id__in=orphans).values_list(
+                "numeric_id", flat=True
             )
         )
         still_missing = set(orphans) - db_ids
@@ -117,21 +184,16 @@ def import_chemont(
             ChemOntNode.objects.all().delete()
 
         # Pass 1: upsert all nodes with parent=NULL.
-        id_map: dict[str, int] = {}  # chemont_id -> numeric_id
-        for row in rows:
-            cid = row["chemont_id"].strip()
-            name = row["name"].strip()
-            ver = ontology_version or row["ontology_version"].strip()
-            numeric = _parse_numeric_id(cid)
-            id_map[cid] = numeric
+        for row in normalized_rows:
+            numeric = int(row["numeric_id"])
 
             _obj, created = ChemOntNode.objects.update_or_create(
                 numeric_id=numeric,
                 defaults={
-                    "chemont_id": cid,
-                    "name": name,
+                    "chemont_id": str(row["chemont_id"]),
+                    "name": str(row["name"]),
                     "parent": None,
-                    "ontology_version": ver,
+                    "ontology_version": str(row["ontology_version"]),
                 },
             )
             if created:
@@ -140,18 +202,15 @@ def import_chemont(
                 updated += 1
 
         # Pass 2: set parent FKs.
-        for row in rows:
-            pid = row.get("parent_id", "").strip()
-            if not pid:
+        for row in normalized_rows:
+            parent_numeric = row["parent_numeric_id"]
+            if parent_numeric is None:
                 continue
-            cid = row["chemont_id"].strip()
-            numeric = id_map[cid]
-            parent_numeric = _parse_numeric_id(pid)
-            ChemOntNode.objects.filter(numeric_id=numeric).update(
-                parent_id=parent_numeric
+            ChemOntNode.objects.filter(numeric_id=int(row["numeric_id"])).update(
+                parent_id=int(parent_numeric)
             )
 
-    total = len(rows)
+    total = len(normalized_rows)
     logger.info(
         "ChemOnt import complete: inserted=%d updated=%d skipped=%d total=%d",
         inserted,

@@ -176,6 +176,14 @@ def write_live_result(
             reason="existing higher priority",
         )
 
+    if existing.source_priority == priority and existing.retrieved_at >= retrieved_at:
+        return WriteOutcome(
+            applied=False,
+            live_id=existing.id,
+            archived_history=False,
+            reason="existing same priority is newer or equal",
+        )
+
     # >= priority: the new result supersedes. Snapshot the prior row to history
     # FIRST, then update the live row in place (no delete+create window).
     _snapshot(existing).save()

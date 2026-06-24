@@ -79,6 +79,7 @@ local_settings.py
 !apps/**/sql/*.sql
 
 # Seed artifacts
+seed_cache/
 *.tsv.zst
 *.jsonl.zst
 # ...but small committed test fixtures are an exception

@@ -22,6 +22,13 @@ WAITING_STATUSES = (
     BatchItemStatus.PENDING_CLASSIFICATION,
 )
 
+FOUND_STATUSES = (
+    BatchItemStatus.FOUND_LIVE_CACHE,
+    BatchItemStatus.FOUND_SEED_CACHE,
+    BatchItemStatus.FOUND_WISHART_ENTITY,
+    BatchItemStatus.COMPLETE_AFTER_WISHART,
+)
+
 
 def mark_items_delayed(inchikey: str) -> list[uuid.UUID]:
     """Transition all PENDING_CLASSIFICATION items for *inchikey* to REMOTE_DELAYED.
@@ -62,6 +69,13 @@ def fan_out_result(inchikey: str, status: BatchItemStatus) -> list[uuid.UUID]:
     """
     # Import here to avoid circular imports at module load time.
     from apps.batches.services import recompute_job_counters
+    from apps.classifications.services import snapshot_current_classification
+
+    snapshot = (
+        snapshot_current_classification(inchikey)
+        if status in FOUND_STATUSES
+        else None
+    )
 
     with transaction.atomic():
         affected_jobs: list[uuid.UUID] = list(
@@ -71,9 +85,15 @@ def fan_out_result(inchikey: str, status: BatchItemStatus) -> list[uuid.UUID]:
             .values_list("job_id", flat=True)
             .distinct()
         )
+        update_values: dict[str, object] = {"status": status}
+        if snapshot is not None:
+            update_values["classification_snapshot"] = snapshot
+        elif status not in FOUND_STATUSES:
+            update_values["classification_snapshot"] = None
+
         BatchItem.objects.filter(
             inchikey=inchikey, status__in=WAITING_STATUSES
-        ).update(status=status)
+        ).update(**update_values)
         for job_id in affected_jobs:
             recompute_job_counters(job_id)
     return affected_jobs

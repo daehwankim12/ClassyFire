@@ -250,6 +250,62 @@ def test_batch_extra_without_structure_is_not_claimed(settings):
     assert no_struct.lock_owner is None
 
 
+def test_batch_submit_retryable_failure_retries_all_claimed_members(settings):
+    # If a batched /queries submit fails before a RemoteQuery is created, every
+    # task included in that submit must be released into retry. Extras have
+    # already been LOCKED by _claim_batch_extras, so handling only the primary
+    # task would strand the rest until stale-lock recovery.
+    settings.REMOTE_BATCH_SIZE = 3
+    job = _job()
+    for row, ik in enumerate((IK_A, IK_B, IK_C)):
+        comp = _compound(ik)
+        _item(job, ik, row, compound=comp)
+        queue.enqueue_task(ik, compound_id=comp.id)
+
+    provider = MockProvider(submit_retryable=True)
+    worker = _worker(provider)
+
+    worker.tick()
+
+    assert len(provider.submit_calls) == 1
+    assert len(provider.submit_calls[0]) == 3
+    for ik in (IK_A, IK_B, IK_C):
+        task = RemoteTask.objects.get(inchikey=ik)
+        assert task.state == TaskState.RETRY_WAIT, ik
+        assert task.lock_owner is None, ik
+        assert task.locked_at is None, ik
+        assert task.attempt == 1, ik
+        item = BatchItem.objects.get(job=job, inchikey=ik)
+        assert item.status == BatchItemStatus.REMOTE_DELAYED, ik
+
+
+def test_batch_submit_non_retryable_failure_invalidates_all_claimed_members(settings):
+    # A non-retryable submit failure applies to the submitted payload. All tasks
+    # folded into that payload must reach terminal INVALID_INPUT instead of
+    # leaving extras LOCKED/PENDING_CLASSIFICATION.
+    settings.REMOTE_BATCH_SIZE = 3
+    job = _job()
+    for row, ik in enumerate((IK_A, IK_B, IK_C)):
+        comp = _compound(ik)
+        _item(job, ik, row, compound=comp)
+        queue.enqueue_task(ik, compound_id=comp.id)
+
+    provider = MockProvider(submit_non_retryable=True)
+    worker = _worker(provider)
+
+    worker.tick()
+
+    assert len(provider.submit_calls) == 1
+    assert len(provider.submit_calls[0]) == 3
+    for ik in (IK_A, IK_B, IK_C):
+        task = RemoteTask.objects.get(inchikey=ik)
+        assert task.state == TaskState.DONE, ik
+        assert task.lock_owner is None, ik
+        assert task.locked_at is None, ik
+        item = BatchItem.objects.get(job=job, inchikey=ik)
+        assert item.status == BatchItemStatus.INVALID_INPUT, ik
+
+
 # ---------------------------------------------------------------------------
 # poll flow
 # ---------------------------------------------------------------------------
@@ -589,6 +645,39 @@ def test_duplicate_write_does_not_raise_or_lose_history():
     assert live.id == first.live_id
     assert ClassyfireLive.objects.filter(inchikey=IK_A).count() == 1
     assert ClassificationHistory.objects.filter(inchikey=IK_A).count() == 1
+
+
+def test_equal_priority_older_result_does_not_overwrite_newer_live():
+    from apps.classifications.result_writer import write_live_result
+    from apps.remote.mock import parse_wishart_payload
+
+    newer = dt.datetime(2026, 1, 2, 12, 0, tzinfo=dt.UTC)
+    older = dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.UTC)
+
+    first = write_live_result(
+        IK_A,
+        parse_wishart_payload(
+            build_raw(IK_A, kingdom="Organic compounds", version="newer")
+        ),
+        source_type=SourceType.WISHART_LIVE_QUERY,
+        retrieved_at=newer,
+    )
+    second = write_live_result(
+        IK_A,
+        parse_wishart_payload(
+            build_raw(IK_A, kingdom="Inorganic compounds", version="older")
+        ),
+        source_type=SourceType.WISHART_LIVE_QUERY,
+        retrieved_at=older,
+    )
+
+    live = ClassyfireLive.objects.get(inchikey=IK_A)
+    assert first.applied is True
+    assert second.applied is False
+    assert second.reason == "existing same priority is newer or equal"
+    assert live.classification_version == "newer"
+    assert live.retrieved_at == newer
+    assert ClassificationHistory.objects.filter(inchikey=IK_A).count() == 0
 
 
 def test_concurrent_create_race_falls_back_to_update(monkeypatch):

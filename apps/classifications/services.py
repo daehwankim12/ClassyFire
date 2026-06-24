@@ -40,6 +40,43 @@ class ClassificationLookupResult:
     tier: LookupTier
 
 
+def _label_snapshot(label: ChemOntLabel | None) -> dict[str, str | None] | None:
+    if label is None:
+        return None
+    return {"chemont_id": label.chemont_id, "name": label.name}
+
+
+def classification_lookup_snapshot(
+    result: ClassificationLookupResult,
+) -> dict[str, Any]:
+    """Serialize a lookup result for pinning on a BatchItem."""
+    retrieved_at = (
+        result.retrieved_at.isoformat() if result.retrieved_at is not None else None
+    )
+    return {
+        "inchikey": result.inchikey,
+        "kingdom": _label_snapshot(result.kingdom),
+        "superclass": _label_snapshot(result.superclass),
+        "class": _label_snapshot(result.class_),
+        "subclass": _label_snapshot(result.subclass),
+        "direct_parent": _label_snapshot(result.direct_parent),
+        "source_type": result.source_type,
+        "source_priority": result.source_priority,
+        "source_ref": result.source_ref,
+        "classification_version": result.classification_version,
+        "retrieved_at": retrieved_at,
+        "query_id": result.query_id,
+        "tier": result.tier.value,
+    }
+
+
+def snapshot_current_classification(inchikey: str) -> dict[str, Any] | None:
+    result = lookup_current_classification(inchikey)
+    if result is None:
+        return None
+    return classification_lookup_snapshot(result)
+
+
 def _label(row: dict[str, Any], prefix: str) -> ChemOntLabel | None:
     cid = row.get(f"{prefix}_chemont_id")
     name = row.get(f"{prefix}_name")
