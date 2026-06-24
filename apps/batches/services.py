@@ -439,6 +439,20 @@ def _process_item(
     item.classification_snapshot = None
     item.resolved_classification_id = None
 
+    # Pre-Step: Reject rows flagged by the parser as overlong without sending
+    # them to RDKit.  This fires for both the legacy single-item path and the
+    # bulk-chunk path (via the norms.append(None) branch in _process_chunk).
+    if item.parse_error:
+        total = item.overflow_length or len(item.original_input)
+        item.original_input = (
+            f"{item.original_input[:200]}[truncated, {total} chars total]"
+        )
+        item.status = BatchItemStatus.INVALID_INPUT
+        item.message = (
+            f"Row exceeds maximum length ({total} chars; limit {MAX_STRUCTURE_LEN})"
+        )
+        return BatchItemStatus.INVALID_INPUT
+
     if norm_override is _NO_LOOKUP_OVERRIDE:
         # Step 0: Guard — reject rows whose structure string exceeds
         # MAX_STRUCTURE_LEN. This check lives here (service layer) so it covers
@@ -690,6 +704,11 @@ def _process_chunk(
     norms: list[NormalizedRow | None] = []
     candidate_keys: list[str] = []
     for item in items:
+        # Parser-flagged overlong rows: route to _process_item without
+        # normalization (mirrors the RowTooLongError branch below).
+        if item.parse_error:
+            norms.append(None)
+            continue
         try:
             check_structure_length(item.original_input)
         except RowTooLongError:

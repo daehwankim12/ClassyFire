@@ -237,10 +237,11 @@ def test_sdf_huge_record_is_capped_not_buffered():
         iter_upload_rows(io.BytesIO(block.encode()), filename="x.sdf", content_type=None)
     )
     assert len(rows) == 2
-    # First record over the cap → bounded preview marker, original huge content
-    # is NOT retained in full.
-    assert "truncated" in rows[0]["raw"]
-    assert len(rows[0]["raw"]) < MAX_SDF_RECORD_LEN
+    # First record over the cap → overflow dict: parse_error set, raw is a
+    # bounded preview (≤200 chars), original huge content is NOT retained.
+    assert rows[0]["parse_error"] == "SDF_RECORD_TOO_LONG"
+    assert len(rows[0]["raw"]) <= 200
+    assert rows[0]["overflow_length"] > MAX_SDF_RECORD_LEN
     # The following well-formed record still parses with its external_id.
     assert rows[1]["external_id"] == "CPD-001"
 
