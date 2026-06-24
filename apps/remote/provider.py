@@ -74,10 +74,19 @@ def classify_http_status(status_code: int) -> HttpOutcome:
 
 
 class EntityLookupStatus(StrEnum):
-    """Outcome of an entity (cached classification) lookup."""
+    """Outcome of an entity (cached classification) lookup.
+
+    ``NOT_FOUND`` (HTTP 404) is a GENUINE entity miss — the key is simply not in
+    the cache, so the worker may try to calculate it via a structure submit. It
+    is kept distinct from ``PROTOCOL_ERROR`` (a permanent input/protocol failure
+    such as a 400/422) which must NEVER trigger a calculation. ``MISS`` remains
+    the (provider-agnostic, e.g. MockProvider) "no entity, may submit" trigger;
+    both ``NOT_FOUND`` and ``MISS`` route to the submit/NEED_STRUCTURE path.
+    """
 
     FOUND = "FOUND"
     MISS = "MISS"
+    NOT_FOUND = "NOT_FOUND"
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
     AUTH_FAILURE = "AUTH_FAILURE"
     PROTOCOL_ERROR = "PROTOCOL_ERROR"
@@ -109,6 +118,8 @@ class EntityLookupResult:
     retry_after: float | None = None
     detail: str | None = None
     http_status: int | None = None
+    raw_text: str | None = None
+    safe_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,8 @@ class SubmitResult:
     remote_query_id: str
     raw_json: dict[str, Any] | None = None
     http_status: int | None = None
+    raw_text: str | None = None
+    safe_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,6 +142,8 @@ class PollResult:
     retry_after: float | None = None
     detail: str | None = None
     http_status: int | None = None
+    raw_text: str | None = None
+    safe_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -159,7 +174,25 @@ class NormalizedClassification:
 
 
 class ProviderError(Exception):
-    """Base class for provider failures."""
+    """Base class for provider failures.
+
+    Carries the raw response BODY text + allow-listed headers + HTTP status so
+    the worker can record a COMPLETE, reproducible audit row even when a submit
+    failed (non-JSON / permanent-error bodies are not silently dropped).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str | None = None,
+        safe_headers: dict[str, str] | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.safe_headers = safe_headers or {}
+        self.http_status = http_status
 
 
 class RetryableProviderError(ProviderError):
@@ -169,8 +202,21 @@ class RetryableProviderError(ProviderError):
     computed backoff (server ``429``/``Retry-After``).
     """
 
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        raw_text: str | None = None,
+        safe_headers: dict[str, str] | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            raw_text=raw_text,
+            safe_headers=safe_headers,
+            http_status=http_status,
+        )
         self.retry_after = retry_after
 
 

@@ -229,21 +229,37 @@ class SubmissionState(models.TextChoices):
     deterministic idempotency key ``(provider, payload_hash)`` can be reused by a
     later submit. The partial-UNIQUE over the non-FAILED states guarantees that a
     crash between intent and confirmation cannot cause a second POST: the next
-    worker tick finds the existing PENDING/SUBMITTED row and reconciles instead.
+    worker tick finds the existing live row and reconciles instead.
+
+    UNKNOWN is the in-doubt terminus: when a PENDING intent cannot be confirmed
+    (the provider may have ACCEPTED the POST but the socket dropped, then the
+    reconcile cap / TTL elapsed) it is parked as UNKNOWN rather than FAILED.
+    UNKNOWN is a LIVE state — it HOLDS the idempotency key — so the worker NEVER
+    auto-re-POSTs the same structures (which would duplicate the upstream
+    submission). An operator (``manage.py resolve_submission``) resolves it:
+    confirm acceptance → SUBMITTED, or verify non-acceptance → FAILED (key freed).
 
     State machine:
-      PENDING ──success──> SUBMITTED (terminal: links RemoteQuery)
-              ──failure──> FAILED    (terminal: key reusable)
+      PENDING ──success───> SUBMITTED (terminal: links RemoteQuery)
+              ──failure───> FAILED    (terminal: key reusable)
+              ──in-doubt──> UNKNOWN   (parked: key HELD; operator-resolved only)
+      UNKNOWN ──operator confirmed acceptance──> SUBMITTED
+              ──operator verified non-acceptance──> FAILED (key freed)
     """
 
     PENDING = "PENDING", "Pending"
     SUBMITTED = "SUBMITTED", "Submitted"
+    UNKNOWN = "UNKNOWN", "Unknown provider acceptance"
     FAILED = "FAILED", "Failed"
 
     @classmethod
     def live_states(cls) -> tuple[SubmissionState, ...]:
-        """States that hold the idempotency slot (everything but FAILED)."""
-        return (cls.PENDING, cls.SUBMITTED)
+        """States that hold the idempotency slot (everything but FAILED).
+
+        UNKNOWN is included so an in-doubt intent keeps the partial-UNIQUE slot
+        and is never auto-re-POSTed while provider acceptance is ambiguous.
+        """
+        return (cls.PENDING, cls.SUBMITTED, cls.UNKNOWN)
 
 
 # Raw string values of the submission states that hold the idempotency slot,

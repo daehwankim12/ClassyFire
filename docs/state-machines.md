@@ -432,18 +432,22 @@ Enum: `SubmissionState`. Column: `remote_submissions.state`. The outbox makes a
 `/queries` POST crash-safe and idempotent. The deterministic idempotency key is
 `(provider, payload_hash)` where `payload_hash = sha256(canonical request
 payload)`. A **partial-UNIQUE** index over the live states (`PENDING`,
-`SUBMITTED`) guarantees at most one in-flight submission per payload, so a crash
-between the POST and its commit cannot cause a second POST.
+`SUBMITTED`, `UNKNOWN`) guarantees at most one in-flight submission per payload,
+so a crash between the POST and its commit cannot cause a second POST.
 
 | State | Meaning | Terminal? |
 | --- | --- | --- |
 | `PENDING` | Intent written BEFORE the network call. | no |
 | `SUBMITTED` | POST confirmed; `query_id`/`remote_query_id` linked (same txn). | yes |
+| `UNKNOWN` | In-doubt: provider MAY have accepted the dropped POST but acceptance is unconfirmed. Key HELD; never auto-re-POSTed; operator-resolved only. | parked |
 | `FAILED` | No provider id obtained; idempotency key reusable. | yes |
 
 ```
-PENDING ─success─▶ SUBMITTED      (links remote_query in ONE txn)
-        ─failure─▶ FAILED         (key freed for a later retry)
+PENDING ─success──▶ SUBMITTED     (links remote_query in ONE txn)
+        ─failure──▶ FAILED        (key freed for a later retry)
+        ─in-doubt─▶ UNKNOWN       (key HELD; operator-resolved only)
+UNKNOWN ─operator confirmed acceptance──▶ SUBMITTED
+        ─operator verified non-acceptance─▶ FAILED  (key freed)
 ```
 
 Protocol: write `PENDING` intent → POST → **durable-first** success path: create
@@ -453,15 +457,21 @@ lease is later lost); THEN park members in `POLL_WAIT` in a separate step that
 tolerates a per-member `LeaseLost` (a stolen member is skipped + left for reclaim
 — its durable query link means the result is not lost). On reconcile (a
 pre-existing live row found for the key): if `SUBMITTED`, re-link tasks to the
-existing query; if `PENDING` (in-doubt), do NOT re-POST.
+existing query; if `PENDING`/`UNKNOWN` (in-doubt), do NOT re-POST.
 
-**Aging out in-doubt `PENDING` (liveness):** each in-doubt reconcile bumps
-`reconcile_attempts`. Once it exceeds `REMOTE_SUBMISSION_RECONCILE_MAX` OR the
-intent is older than `REMOTE_SUBMISSION_TTL_SECONDS`, it is flipped to `FAILED`
-(freeing the `(provider, payload_hash)` key) so EXACTLY ONE genuine re-POST can
-occur on a later tick — never a second POST while the key is still live. The
-operator command `manage.py reconcile_submissions [--fail ID | --fail-aged]`
-lists and force-resolves in-doubt intents.
+**Parking in-doubt `PENDING` as `UNKNOWN` (exactly-once):** each in-doubt
+reconcile bumps `reconcile_attempts`. Once it exceeds
+`REMOTE_SUBMISSION_RECONCILE_MAX` OR the intent is older than
+`REMOTE_SUBMISSION_TTL_SECONDS`, it is parked as `UNKNOWN` — **not** `FAILED`.
+Because the provider may have ACCEPTED the dropped POST, auto-freeing the key
+would risk a DUPLICATE upstream submission; `UNKNOWN` is a live state that KEEPS
+holding the `(provider, payload_hash)` key, so the worker NEVER auto-re-POSTs.
+An operator resolves it out-of-band with
+`manage.py resolve_submission --submission-id ID (--remote-query-id QID |
+--mark-failed)`: confirm acceptance → `SUBMITTED` (links the now-known query), or
+verify non-acceptance → `FAILED` (frees the key for a genuine re-POST). The older
+`manage.py reconcile_submissions [--fail ID | --fail-aged]` still lists and
+force-resolves `PENDING` intents.
 
 ---
 

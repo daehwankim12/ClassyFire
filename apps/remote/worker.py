@@ -95,6 +95,21 @@ class CircuitLike(Protocol):
 DEFAULT_LEASE_SECONDS = 300.0
 
 
+def _raw_body_text(raw_payload: object | None, raw_body_text: str | None) -> str:
+    """Return the literal response BODY text for hashing/auditing.
+
+    Prefer the verbatim ``raw_body_text`` captured from the provider response
+    (preserves non-JSON bodies exactly). When only a parsed payload is available
+    (e.g. tests, or a payload reconstructed without the original bytes), fall
+    back to canonical JSON so the sha256 is deterministic across processes.
+    """
+    if raw_body_text is not None:
+        return raw_body_text
+    return json.dumps(
+        raw_payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+
+
 def make_worker_id() -> str:
     """A stable-ish unique id for this worker process (host:pid:uuid)."""
     return f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
@@ -191,6 +206,10 @@ class RemoteWorker:
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
             if result.retry_after is not None:
                 self.rate_limiter.entity.penalize(result.retry_after)
@@ -209,6 +228,10 @@ class RemoteWorker:
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
             logger.error(
                 "remote entity AUTH_FAILURE (operator action) for %s: %s",
@@ -228,6 +251,10 @@ class RemoteWorker:
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
             logger.error(
                 "remote entity PROTOCOL_ERROR for %s: %s",
@@ -241,30 +268,59 @@ class RemoteWorker:
         self.circuit.record_success()
 
         if result.status == EntityLookupStatus.FOUND and result.raw_json is not None:
+            norm = self.provider.parse_result(result.raw_json)
             self._record_attempt(
                 RemoteAttempt.OPERATION_ENTITY,
                 classification="FOUND",
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
+                task=task,
+                request_inchikey=task.inchikey,
+                returned_inchikey=norm.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
-            norm = self.provider.parse_result(result.raw_json)
             if not self._key_matches(task.inchikey, norm.inchikey):
-                self._handle_key_mismatch(task)
+                self._handle_key_mismatch(task, norm, query=None)
                 return
-            write_live_result(
-                task.inchikey,
-                norm,
-                source_type=SourceType.WISHART_LIVE_ENTITY,
-                retrieved_at=timezone.now(),
+            self._apply_result_with_fence(
+                task,
+                query=None,
+                norm=norm,
+                final_status=BatchItemStatus.FOUND_WISHART_ENTITY,
             )
-            fanout.fan_out_result(
-                task.inchikey, BatchItemStatus.FOUND_WISHART_ENTITY
-            )
-            queue.finish_task(task)
             return
 
-        # MISS: submit a structure query if we have a structure, else NEED_STRUCTURE.
-        self._handle_entity_miss(task)
+        # GENUINE entity miss only (HTTP 404 -> NOT_FOUND, or the provider-agnostic
+        # MISS from e.g. MockProvider): the key is simply not cached, so we may try
+        # to CALCULATE it via a structure submit (else NEED_STRUCTURE). A
+        # PROTOCOL_ERROR (400/422) was already handled above and NEVER reaches here,
+        # so a malformed request can never trigger a calculation. Be explicit (do
+        # not fall through on an unexpected status) so future statuses fail loud.
+        if result.status in (EntityLookupStatus.NOT_FOUND, EntityLookupStatus.MISS):
+            self._handle_entity_miss(task)
+            return
+
+        # Unexpected/unmapped status with circuit success recorded: surface it as a
+        # protocol error rather than silently submitting or dropping the task.
+        logger.error(
+            "remote entity unexpected status %s for %s; retrying without submit",
+            result.status,
+            task.inchikey,
+        )
+        self._record_attempt(
+            RemoteAttempt.OPERATION_ENTITY,
+            classification="PROTOCOL_ERROR",
+            raw_payload=result.raw_json,
+            http_status=result.http_status,
+            detail=f"unexpected entity status {result.status}",
+            task=task,
+            request_inchikey=task.inchikey,
+            raw_body_text=result.raw_text,
+            safe_headers=result.safe_headers,
+        )
+        queue.schedule_retry(task)
+        fanout.mark_items_delayed(task.inchikey)
 
     def _handle_entity_miss(self, task: RemoteTask) -> None:
         structure = self._structure_for(task)
@@ -376,6 +432,13 @@ class RemoteWorker:
                 classification="RETRYABLE",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             # Free the idempotency key so a later retry can re-submit.
             self._fail_submission(submission, detail=f"retryable: {exc}")
@@ -397,6 +460,13 @@ class RemoteWorker:
                 classification="AUTH_FAILURE",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"auth: {exc}")
             logger.error("remote submit AUTH_FAILURE (operator action): %s", exc)
@@ -412,6 +482,13 @@ class RemoteWorker:
                 classification="PROTOCOL_ERROR",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"protocol: {exc}")
             logger.error("remote submit PROTOCOL_ERROR: %s", exc)
@@ -426,6 +503,13 @@ class RemoteWorker:
                 classification="PERMANENT",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"permanent: {exc}")
             for member in members:
@@ -463,6 +547,12 @@ class RemoteWorker:
                 query=query,
                 http_status=submit.http_status,
                 remote_query_id=submit.remote_query_id,
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                raw_body_text=submit.raw_text,
+                safe_headers=submit.safe_headers,
             )
             for member in members:
                 RemoteQueryItem.objects.get_or_create(
@@ -512,10 +602,14 @@ class RemoteWorker:
           POST result but left tasks unparked). Per-member LeaseLost is tolerated.
         * PENDING (in-doubt: POST may have hit the provider but never committed)
           → do NOT re-POST on this tick. Bump ``reconcile_attempts``; once it
-          exceeds the cap OR the intent's TTL has elapsed, AGE IT OUT to FAILED
-          (freeing the idempotency key) so a single genuine re-POST may occur on
-          a later tick. The crucial invariant: no second POST is issued WHILE the
-          key is still live — only after it is freed.
+          exceeds the cap OR the intent's TTL has elapsed, PARK it as UNKNOWN.
+          UNKNOWN is a LIVE state, so it KEEPS HOLDING the idempotency key — the
+          worker NEVER auto-re-POSTs the same structures (which would duplicate
+          the upstream submission when the provider had in fact accepted the
+          dropped POST). An operator resolves UNKNOWN out-of-band via
+          ``manage.py resolve_submission`` (confirm → SUBMITTED, or verify
+          non-acceptance → FAILED). The crucial invariant: while the key is held
+          (PENDING or UNKNOWN) no second POST is EVER issued.
         """
         poll_at = timezone.now() + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS)
         if submission.state == SubmissionState.SUBMITTED and submission.query_id:
@@ -533,19 +627,20 @@ class RemoteWorker:
             self._park_members_poll_wait(members, poll_at)
             return
 
-        # PENDING in-doubt: avoid a second POST while the key is live; age out.
+        # PENDING in-doubt: NEVER re-POST while the key is held. Once the cap or
+        # TTL elapses, PARK as UNKNOWN (still a live state → key STAYS held).
         attempts = submission.reconcile_attempts + 1
         ttl = timedelta(seconds=settings.REMOTE_SUBMISSION_TTL_SECONDS)
         age = timezone.now() - submission.created_at
-        aged_out = (
+        park_unknown = (
             attempts > settings.REMOTE_SUBMISSION_RECONCILE_MAX or age >= ttl
         )
         submission.reconcile_attempts = attempts
-        if aged_out:
-            submission.state = SubmissionState.FAILED
+        if park_unknown:
+            submission.state = SubmissionState.UNKNOWN
             submission.detail = (
-                f"aged-out in-doubt PENDING after {attempts} reconcile(s), "
-                f"age={age.total_seconds():.0f}s; key freed for one re-POST"
+                f"provider acceptance unknown after {attempts} reconcile(s), "
+                f"age={age.total_seconds():.0f}s; automatic re-submit is blocked"
             )
             submission.save(
                 update_fields=[
@@ -557,14 +652,21 @@ class RemoteWorker:
             )
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
-                classification="AGED_OUT",
+                classification="UNKNOWN_ACCEPTANCE",
                 raw_payload=None,
                 remote_query_id=submission.remote_query_id,
                 detail=submission.detail,
+                submission=submission,
+                request_payload_hash=submission.payload_hash,
+                # Batch-level reconcile spans many members; record a
+                # representative member's key (or null when none) — the brief
+                # permits a null request_inchikey here, do NOT fabricate one.
+                task=members[0] if members else None,
+                request_inchikey=members[0].inchikey if members else None,
             )
             logger.warning(
-                "reconcile: aged out in-doubt PENDING submission %s -> FAILED "
-                "(key freed for exactly one re-POST)",
+                "reconcile: in-doubt PENDING submission %s -> UNKNOWN "
+                "(key HELD; operator must resolve via resolve_submission)",
                 submission.pk,
             )
         else:
@@ -576,10 +678,11 @@ class RemoteWorker:
                 attempts,
                 settings.REMOTE_SUBMISSION_RECONCILE_MAX,
             )
-        # Re-park members for a later tick regardless (a freed key lets the next
-        # tick genuinely re-POST; a still-live key reconciles again).
+        # Re-park members for a later tick regardless. The key stays held in both
+        # branches (PENDING below the cap, UNKNOWN at/above it), so no later tick
+        # ever re-POSTs — UNKNOWN is cleared only by the operator command.
         for member in members:
-            queue.defer_task(member, delay_seconds=5)
+            queue.defer_task(member, delay_seconds=self.lease_seconds)
             fanout.mark_items_delayed(member.inchikey)
 
     @staticmethod
@@ -599,8 +702,26 @@ class RemoteWorker:
         http_status: int | None = None,
         remote_query_id: str | None = None,
         detail: str | None = None,
+        task: RemoteTask | None = None,
+        submission: RemoteSubmission | None = None,
+        request_inchikey: str | None = None,
+        returned_inchikey: str | None = None,
+        request_payload_hash: str | None = None,
+        request_structure_hash: str | None = None,
+        raw_body_text: str | None = None,
+        safe_headers: dict[str, str] | None = None,
     ) -> None:
-        """Append an audit row for ONE remote attempt (F-10, per-attempt raw)."""
+        """Append a COMPLETE audit row for ONE remote attempt (F-10).
+
+        Records not just the parsed ``raw_payload`` but the request/response
+        IDENTITY: the originating task + its requested InChIKey, the request
+        payload/structure hashes, the returned InChIKey where known, the raw
+        response BODY text (verbatim, preserving non-JSON bodies) and its
+        sha256, and the allow-listed safe response headers. Every remote side
+        effect is therefore auditable and reproducible.
+        """
+        body_text = _raw_body_text(raw_payload, raw_body_text)
+        body_sha256 = hashlib.sha256(body_text.encode()).hexdigest()
         RemoteAttempt.objects.create(
             provider=PROVIDER,
             operation=operation,
@@ -610,6 +731,15 @@ class RemoteWorker:
             http_status=http_status,
             remote_query_id=remote_query_id,
             detail=detail,
+            task=task,
+            submission=submission,
+            request_inchikey=request_inchikey,
+            returned_inchikey=returned_inchikey,
+            request_payload_hash=request_payload_hash,
+            request_structure_hash=request_structure_hash,
+            raw_body_text=body_text,
+            raw_body_sha256=body_sha256,
+            safe_headers=safe_headers,
         )
 
     def _claim_batch_extras(self, task: RemoteTask) -> list[RemoteTask]:
@@ -710,6 +840,10 @@ class RemoteWorker:
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
                 detail=poll.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             if poll.retry_after is not None:
                 queue.retry_after_override(task, poll.retry_after)
@@ -729,6 +863,10 @@ class RemoteWorker:
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
                 detail=poll.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             logger.error("remote poll AUTH_FAILURE (operator action): %s", poll.detail)
             queue.defer_task(task, delay_seconds=self.lease_seconds)
@@ -747,6 +885,10 @@ class RemoteWorker:
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
                 detail=poll.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             logger.error("remote poll %s: %s", poll.status, poll.detail)
             queue.schedule_retry(task)
@@ -763,6 +905,10 @@ class RemoteWorker:
                 query=query,
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             query.state = QueryState.POLLING
             query.next_poll_at = timezone.now() + timedelta(
@@ -787,6 +933,10 @@ class RemoteWorker:
             query=query,
             http_status=poll.http_status,
             remote_query_id=remote_query_id,
+            task=task,
+            request_inchikey=task.inchikey,
+            raw_body_text=poll.raw_text,
+            safe_headers=poll.safe_headers,
         )
         query.state = QueryState.COMPLETE
         query.raw_response = raw
@@ -864,19 +1014,74 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
         if not self._key_matches(task.inchikey, norm.inchikey):
-            self._handle_key_mismatch(task)
+            self._handle_key_mismatch(task, norm, query=query)
             return
-        write_live_result(
-            task.inchikey,
-            norm,
-            source_type=SourceType.WISHART_LIVE_QUERY,
-            remote_query_id=query.remote_query_id,
-            retrieved_at=timezone.now(),
+        self._apply_result_with_fence(
+            task,
+            query=query,
+            norm=norm,
+            final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
         )
-        fanout.fan_out_result(
-            task.inchikey, BatchItemStatus.COMPLETE_AFTER_WISHART
+
+    # -- fenced result application (F-07) ----------------------------------
+
+    def _apply_result_with_fence(
+        self,
+        task: RemoteTask,
+        *,
+        query: RemoteQuery | None,
+        norm: NormalizedClassification,
+        final_status: BatchItemStatus,
+    ) -> None:
+        """Apply a successful result under ONE lease-fenced transaction (F-07).
+
+        The lease guard runs FIRST: :func:`queue.lock_owned_task` row-locks the
+        task and re-asserts this worker still owns the lease before ANY side
+        effect. A stale worker (whose lease was stolen after a crash/stale-lock
+        recovery) raises :class:`LeaseLost` here and writes NOTHING — no
+        ClassificationResult event, no fan-out, no transition. Only an owning
+        worker reaches the write/fan-out/DONE, and all three commit atomically
+        with the lease check, so the result is applied exactly once.
+        """
+        with transaction.atomic():
+            locked = queue.lock_owned_task(task)
+            write_live_result(
+                locked.inchikey,
+                norm,
+                source_type=(
+                    SourceType.WISHART_LIVE_QUERY
+                    if query is not None
+                    else SourceType.WISHART_LIVE_ENTITY
+                ),
+                remote_query_id=query.remote_query_id if query is not None else None,
+                retrieved_at=query.submitted_at if query is not None else timezone.now(),
+            )
+            fanout.fan_out_result(locked.inchikey, final_status)
+            queue.transition_locked(
+                locked, TaskState.DONE, lock_owner=None, locked_at=None
+            )
+
+    def apply_fenced_result_for_test(
+        self, task: RemoteTask, norm: NormalizedClassification, *, remote_query_id: str
+    ) -> None:
+        """Test-only hook: drive the fenced query-result apply for ``task``.
+
+        Mirrors the query-resolved path: obtains (or creates) the RemoteQuery for
+        ``remote_query_id`` exactly as the real poll path links it, then calls
+        :meth:`_apply_result_with_fence`. Named ``for_test`` so it is obviously a
+        harness entry point and never wired into production flow.
+        """
+        query, _ = RemoteQuery.objects.get_or_create(
+            provider=PROVIDER,
+            remote_query_id=remote_query_id,
+            defaults={"payload_hash": f"test:{remote_query_id}"},
         )
-        queue.finish_task(task)
+        self._apply_result_with_fence(
+            task,
+            query=query,
+            norm=norm,
+            final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
+        )
 
     # -- helpers -----------------------------------------------------------
 
@@ -884,10 +1089,30 @@ class RemoteWorker:
     def _key_matches(requested: str, returned: str | None) -> bool:
         return returned is not None and returned == requested
 
-    def _handle_key_mismatch(self, task: RemoteTask) -> None:
-        """Result key mismatch: do NOT auto-apply; mark items + terminal task."""
-        fanout.fan_out_result(task.inchikey, BatchItemStatus.RESULT_KEY_MISMATCH)
-        queue.finish_task(task)
+    def _handle_key_mismatch(
+        self,
+        task: RemoteTask,
+        norm: NormalizedClassification,
+        *,
+        query: RemoteQuery | None,
+    ) -> None:
+        """Result key mismatch: persist the rejected result, never advance live.
+
+        Routes the mismatched ``norm`` through the SAME lease-fenced apply as a
+        clean result. ``write_live_result`` records an immutable
+        ``REJECTED_MISMATCH`` event (requested vs returned key + raw payload, with
+        remote provenance when ``query`` is set) and deliberately leaves the live
+        pointer UNCHANGED, so the mismatch is audited without ever becoming the
+        current classification. Fan-out marks waiting items RESULT_KEY_MISMATCH and
+        the task ends DONE — all under the F-07 fence, so a STALE worker writes
+        NOTHING (the rejected event included).
+        """
+        self._apply_result_with_fence(
+            task,
+            query=query,
+            norm=norm,
+            final_status=BatchItemStatus.RESULT_KEY_MISMATCH,
+        )
 
     def _structure_for(self, task: RemoteTask) -> str | None:
         """Return a submittable structure (SMILES/InChI) for the task, if any."""
