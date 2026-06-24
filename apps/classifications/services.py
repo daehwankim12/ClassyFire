@@ -39,6 +39,7 @@ class ClassificationLookupResult:
     retrieved_at: datetime | None
     query_id: str | None
     tier: LookupTier
+    result_id: int | None = None
 
 
 def _label_snapshot(label: ChemOntLabel | None) -> dict[str, str | None] | None:
@@ -68,6 +69,7 @@ def classification_lookup_snapshot(
         "retrieved_at": retrieved_at,
         "query_id": result.query_id,
         "tier": result.tier.value,
+        "result_id": result.result_id,
     }
 
 
@@ -135,6 +137,7 @@ def lookup_current_classification(inchikey: str) -> ClassificationLookupResult |
             retrieved_at=row.get("retrieved_at"),
             query_id=row.get("remote_query_id"),
             tier=LookupTier.LIVE,
+            result_id=row.get("result_id"),
         )
 
     row = get_seed_classification(inchikey)

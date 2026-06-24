@@ -41,10 +41,9 @@ from django.conf import settings
 from django.contrib.auth.hashers import check_password
 
 from apps.batches.models import BatchItem, BatchJob
-from apps.classifications.services import snapshot_current_classification
 
 if TYPE_CHECKING:
-    pass
+    from apps.classifications.models import ClassificationResult
 
 EXPORT_DIR: Path = settings.BASE_DIR / "export_cache"
 
@@ -162,11 +161,36 @@ def _parent_levels(snapshot: dict[str, object]) -> list[str]:
     return [*levels, "", "", ""][:3]
 
 
+def _event_to_snapshot(event: ClassificationResult) -> dict[str, object]:
+    """Adapt a pinned immutable event into the export snapshot label shape.
+
+    The event's ``labels`` JSONB already stores each ChemOnt slot as
+    ``{"chemont_id": ..., "name": ...}`` — the exact shape the export consumes —
+    so the pinned event is byte-stable provenance with no live re-query.
+    """
+    labels = event.labels if isinstance(event.labels, dict) else {}
+    return {
+        "kingdom": labels.get("kingdom"),
+        "superclass": labels.get("superclass"),
+        "class": labels.get("class"),
+        "subclass": labels.get("subclass"),
+        "direct_parent": labels.get("direct_parent"),
+    }
+
+
 def _build_row_dict(item: BatchItem) -> dict[str, str | int | None]:
-    """Build a flat export row dict for one BatchItem."""
-    snapshot = item.classification_snapshot
-    if snapshot is None and item.status in _FOUND_STATUSES and item.inchikey:
-        snapshot = snapshot_current_classification(item.inchikey)
+    """Build a flat export row dict for one BatchItem.
+
+    Reads ONLY pinned provenance: the immutable ``resolved_classification`` event
+    (new source of truth) or, failing that, the pinned ``classification_snapshot``
+    JSON. NEVER re-queries the live cache, so a row stays byte-stable after live
+    is later superseded (F-04/F-05).
+    """
+    event = item.resolved_classification
+    if event is not None:
+        snapshot: dict[str, object] | None = _event_to_snapshot(event)
+    else:
+        snapshot = item.classification_snapshot
 
     completed = item.status in _FOUND_STATUSES and snapshot is not None
     row: dict[str, str | int | None] = {
@@ -196,7 +220,11 @@ def _build_row_dict(item: BatchItem) -> dict[str, str | int | None]:
 
 def _rows_for_job(job: BatchJob) -> list[dict[str, str | int | None]]:
     """Return all export row dicts for a job, ordered by row_order."""
-    items = BatchItem.objects.filter(job=job).order_by("row_order")
+    items = (
+        BatchItem.objects.filter(job=job)
+        .select_related("resolved_classification")
+        .order_by("row_order")
+    )
     return [_build_row_dict(item) for item in items]
 
 

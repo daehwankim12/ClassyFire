@@ -38,6 +38,40 @@ SOURCE_PRIORITY: dict[str, int] = {
 }
 
 
+class ResultKind(models.TextChoices):
+    """Disposition of a single immutable ``classification_results`` event.
+
+    Every write to the classification store appends exactly one
+    ``ClassificationResult`` row (one INSERT, never UPDATE/DELETE). ``kind``
+    records what happened to that event *relative to the live pointer* at write
+    time so a future Go/Rust reader can audit the full history:
+
+    * ``APPLIED`` — the event materialized the current live row (no prior row, or
+      it claimed a previously-empty slot).
+    * ``SUPERSEDED`` — the event overwrote an existing live row (prior row was
+      archived to ``classification_history`` first); the new event is now live.
+    * ``REJECTED_MISMATCH`` — the source returned a different InChIKey than the
+      one requested. The mismatch is STORED (not discarded); live is unchanged.
+    * ``REJECTED_LOWER_PRIORITY`` — a strictly higher-trust row already exists;
+      the event is recorded but live is unchanged.
+    * ``REJECTED_STALE`` — same priority but the existing live row is newer or
+      equal; the event is recorded but live is unchanged.
+    """
+
+    APPLIED = "APPLIED", "Applied"
+    SUPERSEDED = "SUPERSEDED", "Superseded"
+    REJECTED_MISMATCH = "REJECTED_MISMATCH", "Rejected (key mismatch)"
+    REJECTED_LOWER_PRIORITY = "REJECTED_LOWER_PRIORITY", "Rejected (lower priority)"
+    REJECTED_STALE = "REJECTED_STALE", "Rejected (stale)"
+
+
+# Result kinds that materialized the current live row (live.result points here).
+APPLIED_RESULT_KINDS: tuple[str, ...] = (
+    ResultKind.APPLIED.value,
+    ResultKind.SUPERSEDED.value,
+)
+
+
 class BatchJobStatus(models.TextChoices):
     """Coarse lifecycle status for a batch job (batch_jobs.status).
 
