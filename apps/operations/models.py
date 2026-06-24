@@ -1,6 +1,8 @@
 """Operational tables: seed imports and the system event log."""
 from __future__ import annotations
 
+from typing import Any
+
 from django.db import models
 
 from apps.core.enums import EventCategory
@@ -36,6 +38,17 @@ class SeedImport(models.Model):
         return f"seed_import:{self.pk} ({self.import_status})"
 
 
+class SystemEventManager(models.Manager["SystemEvent"]):
+    """Manager that signs every event created through the normal ORM path."""
+
+    def create(self, **kwargs: Any) -> SystemEvent:
+        event = super().create(**kwargs)
+        from apps.operations.audit import sign_system_event
+
+        sign_system_event(event)
+        return event
+
+
 class SystemEvent(models.Model):
     """Append-only structured event log (worker/remote/backup/seed/security)."""
 
@@ -43,6 +56,8 @@ class SystemEvent(models.Model):
     event_type = models.TextField(help_text="Specific event type within the category.")
     payload = models.JSONField(default=dict, blank=True, help_text="Event detail as JSONB.")
     created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = SystemEventManager()
 
     class Meta:
         db_table = "system_events"

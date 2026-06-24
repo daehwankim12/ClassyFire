@@ -148,7 +148,7 @@ Commit message: `feat: add artifact storage seam`.
 - Modify: `apps/remote/mock.py`
 - Test: `tests/test_provider_contract.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests proving:
 - unknown `classification_status` is a protocol error, not complete;
@@ -158,19 +158,19 @@ Add tests proving:
 
 Expected: fails because contract validators and fault injection flags are absent.
 
-- [ ] **Step 2: Implement validators**
+- [x] **Step 2: Implement validators**
 
 Validate only fields the application consumes. Preserve raw payload in attempts/results.
 
-- [ ] **Step 3: Wire provider**
+- [x] **Step 3: Wire provider**
 
 Call validators before returning success/complete statuses.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run `tests/test_provider_contract.py tests/test_remote_provider.py tests/test_remote_queue.py`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit message: `feat: validate remote provider contracts`.
 
@@ -224,23 +224,23 @@ Commit message: `feat: add remote budget fairness and audit signing`.
 - Modify: `docs/acceptance-test-results.md`
 - Test: `tests/test_gate3_load_probe.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests proving the script can generate deterministic dry-run SQL/EXPLAIN commands without inserting a million rows by default.
 
-- [ ] **Step 2: Implement script**
+- [x] **Step 2: Implement script**
 
 Support `--dry-run`, `--rows`, `--explain-only`, and explicit DB env usage. Default is dry-run.
 
-- [ ] **Step 3: Document manual runbook**
+- [x] **Step 3: Document manual runbook**
 
 Record that actual million-row execution is manual evidence and explain expected artifacts.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run `tests/test_gate3_load_probe.py`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit message: `test: add gate3 load probe`.
 

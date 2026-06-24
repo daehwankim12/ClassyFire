@@ -488,6 +488,7 @@ def test_admin_retry_does_not_reset_done_or_running():
 
 def test_admin_retry_logs_event():
     from apps.operations.admin_views import retry_failed_tasks
+    from apps.operations.audit import verify_system_event_signature
 
     before = SystemEvent.objects.filter(
         category="WORKER", event_type="retry_deferred_tasks"
@@ -497,6 +498,10 @@ def test_admin_retry_logs_event():
         category="WORKER", event_type="retry_deferred_tasks"
     ).count()
     assert after == before + 1
+    event = SystemEvent.objects.filter(
+        category="WORKER", event_type="retry_deferred_tasks"
+    ).latest("created_at")
+    assert verify_system_event_signature(event) is True
 
 
 # ---------------------------------------------------------------------------

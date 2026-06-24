@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 from django.db import IntegrityError, transaction
 from django.db.models import F, Q
@@ -115,7 +116,19 @@ def enqueue_task(
         ).first()
 
 
-def claim_task(worker_id: str) -> RemoteTask | None:
+def _due_ready_tasks(now):
+    return (
+        RemoteTask.objects.filter(state=TaskState.READY)
+        .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
+    )
+
+
+def claim_task(
+    worker_id: str,
+    *,
+    exclude_ids: set[int] | None = None,
+    structure_required: bool = False,
+) -> RemoteTask | None:
     """Atomically claim the next due READY task with FOR UPDATE SKIP LOCKED.
 
     Must be called inside a transaction-managing caller; we open our own atomic
@@ -123,33 +136,53 @@ def claim_task(worker_id: str) -> RemoteTask | None:
     """
     now = timezone.now()
     with transaction.atomic():
-        candidates = list(
-            RemoteTask.objects.select_for_update(skip_locked=True)
-            .filter(state=TaskState.READY)
-            .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
-            .order_by("-priority", "next_run_at", "id")[:50]
-        )
-        if not candidates:
+        base_qs = _due_ready_tasks(now)
+        if exclude_ids:
+            base_qs = base_qs.exclude(id__in=exclude_ids)
+        if structure_required:
+            base_qs = base_qs.filter(
+                Q(compound__canonical_smiles__isnull=False)
+                | Q(compound__inchi__isnull=False)
+            )
+
+        top_priority = base_qs.order_by("-priority").values_list(
+            "priority", flat=True
+        ).first()
+        if top_priority is None:
             return None
-        top_priority = candidates[0].priority
-        top_candidates = [task for task in candidates if task.priority == top_priority]
-        principals = {task.principal for task in top_candidates}
+        principals = list(
+            base_qs.filter(priority=top_priority)
+            .order_by("principal")
+            .values_list("principal", flat=True)
+            .distinct()
+        )
         states = {
             state.principal: state
             for state in RemotePrincipalState.objects.filter(principal__in=principals)
         }
 
-        def fairness_key(task: RemoteTask) -> tuple[bool, object, object, int]:
-            state = states.get(task.principal)
+        def principal_fairness_key(principal: str) -> tuple[bool, object, str]:
+            state = states.get(principal)
             last_claimed_at = state.last_claimed_at if state is not None else None
             return (
                 last_claimed_at is not None,
                 last_claimed_at or MIN_AWARE_DATETIME,
-                task.next_run_at or MIN_AWARE_DATETIME,
-                task.id,
+                principal,
             )
 
-        task = min(top_candidates, key=fairness_key)
+        task = None
+        for principal in sorted(principals, key=principal_fairness_key):
+            candidate_qs = (
+                base_qs.select_for_update(skip_locked=True)
+                .filter(priority=top_priority, principal=principal)
+                .order_by("next_run_at", "id")
+            )
+            task = cast("RemoteTask | None", candidate_qs.first())
+            if task is not None:
+                break
+        if task is None:
+            return None
+
         # Issue a fresh fencing token + bump the monotonic lease version (F-07)
         # so any previous holder's late writes are rejected.
         task.state = TaskState.LOCKED

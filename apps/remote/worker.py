@@ -32,7 +32,6 @@ from typing import Protocol
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q
 from django.utils import timezone
 
 from apps.classifications.result_writer import write_live_result
@@ -625,27 +624,38 @@ class RemoteWorker:
         do not own. Rows we cannot lock are skipped (``skip_locked=True``); rows
         without a submittable structure are released back to READY.
         """
-        now = timezone.now()
         extras: list[RemoteTask] = []
-        with transaction.atomic():
-            candidates = list(
-                RemoteTask.objects.select_for_update(skip_locked=True)
-                .filter(state=TaskState.READY)
-                .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
-                .exclude(id=task.id)
-                .exclude(query_items__query__state__in=[
-                    QueryState.SUBMITTED,
-                    QueryState.POLLING,
-                ])
-                .order_by("-priority", "id")[: settings.REMOTE_BATCH_SIZE - 1]
+        exclude_ids = {task.id}
+        while len(extras) < settings.REMOTE_BATCH_SIZE - 1:
+            extra = queue.claim_task(
+                self.worker_id,
+                exclude_ids=exclude_ids,
+                structure_required=True,
             )
-            for extra in candidates:
-                if self._structure_for(extra) is None:
-                    continue
-                # Claim with a fresh fencing lease so subsequent fenced
-                # transitions of the extra are owned by this worker (F-07).
-                queue.claim_extra(extra, self.worker_id)
-                extras.append(extra)
+            if extra is None:
+                break
+            exclude_ids.add(extra.id)
+            if extra.query_items.filter(
+                query__state__in=[QueryState.SUBMITTED, QueryState.POLLING]
+            ).exists():
+                queue.transition(
+                    extra,
+                    TaskState.READY,
+                    lock_owner=None,
+                    locked_at=None,
+                    lease_token=None,
+                )
+                continue
+            if self._structure_for(extra) is None:
+                queue.transition(
+                    extra,
+                    TaskState.READY,
+                    lock_owner=None,
+                    locked_at=None,
+                    lease_token=None,
+                )
+                continue
+            extras.append(extra)
         return extras
 
     # -- poll flow ---------------------------------------------------------

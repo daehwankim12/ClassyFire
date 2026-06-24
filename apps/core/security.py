@@ -80,14 +80,21 @@ def _is_dev_open() -> bool:
     return not _get_shared_hash().strip()
 
 
-def _check_bearer(request: HttpRequest) -> bool:
-    """Validate bearer token from Authorization header or X-Shared-Access-Token."""
-    token: str = ""
+def _shared_access_token_from_request(request: HttpRequest) -> tuple[str, str] | None:
+    """Return the presented shared-access token kind and value, if any."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        token = auth_header[len("Bearer "):].strip()
-    else:
-        token = request.headers.get("X-Shared-Access-Token", "")
+        return "bearer", auth_header[len("Bearer "):].strip()
+    token = request.headers.get("X-Shared-Access-Token", "").strip()
+    if token:
+        return "shared-token", token
+    return None
+
+
+def _check_bearer(request: HttpRequest) -> bool:
+    """Validate bearer token from Authorization header or X-Shared-Access-Token."""
+    token_info = _shared_access_token_from_request(request)
+    token = token_info[1] if token_info is not None else ""
 
     if not token:
         return False
@@ -335,14 +342,11 @@ def _client_ip(request: HttpRequest) -> str:
 def _principal(request: HttpRequest) -> str:
     if hasattr(request, "user") and request.user.is_authenticated:
         return f"user:{request.user.pk}"
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        digest = hashlib.sha256(auth_header.encode("utf-8")).hexdigest()[:32]
-        return f"bearer:{digest}"
-    shared_header = request.headers.get("X-Shared-Access-Token", "")
-    if shared_header:
-        digest = hashlib.sha256(shared_header.encode("utf-8")).hexdigest()[:32]
-        return f"shared-token:{digest}"
+    token_info = _shared_access_token_from_request(request)
+    if token_info is not None and _check_bearer(request):
+        token_kind, token = token_info
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
+        return f"{token_kind}:{digest}"
     if hasattr(request, "session") and request.session.get(SHARED_ACCESS_SESSION_KEY) is True:
         session_key = request.session.session_key or "unsaved"
         digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]

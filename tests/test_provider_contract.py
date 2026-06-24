@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
-from apps.remote.mock import build_raw
+from apps.remote.mock import MockProvider, build_raw
 from apps.remote.provider import (
     EntityLookupStatus,
     PollStatus,
@@ -139,3 +139,18 @@ def test_valid_success_payloads_still_parse_and_preserve_raw_payloads():
         IK_A,
         IK_B,
     ]
+
+
+def test_mock_provider_can_inject_protocol_faults():
+    provider = MockProvider(
+        entity_protocol_error_for={IK_A},
+        poll_protocol_error_for={"q-bad-schema"},
+    )
+
+    entity = provider.lookup_entity(IK_A)
+    poll = provider.poll_query("q-bad-schema")
+
+    assert entity.status == EntityLookupStatus.PROTOCOL_ERROR
+    assert entity.raw_json is not None
+    assert poll.status == PollStatus.PROTOCOL_ERROR
+    assert poll.raw_json is not None

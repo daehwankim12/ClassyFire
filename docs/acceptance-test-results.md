@@ -300,6 +300,15 @@ usage during upload.  Not suitable for automated CI.
 2. Stream-upload via the API.
 3. Monitor memory usage (should not exceed 2× peak file size).
 4. Confirm the job accepts the upload without OOM errors.
+5. For database plan evidence, run the Gate 3 dry-run first, then execute it
+   only against a disposable or staging database:
+   ```bash
+   PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=classyfire_probe PGUSER=classyfire \
+     uv run --locked scripts/gate3_load_probe.py --rows 1000000 --dry-run
+   PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=classyfire_probe PGUSER=classyfire \
+     uv run --locked scripts/gate3_load_probe.py --rows 1000000 --execute \
+     | tee gate3-load-probe.log
+   ```
 
 ---
 

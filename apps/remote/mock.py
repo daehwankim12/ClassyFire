@@ -85,10 +85,12 @@ class MockProvider:
 
     # Forced failures (counted across calls of each operation).
     entity_retryable_for: set[str] = field(default_factory=set)
+    entity_protocol_error_for: set[str] = field(default_factory=set)
     entity_retry_after: float | None = None
     submit_retryable: bool = False
     submit_non_retryable: bool = False
     poll_retryable_for: set[str] = field(default_factory=set)
+    poll_protocol_error_for: set[str] = field(default_factory=set)
 
     # Call counters (assertable by tests).
     entity_calls: list[str] = field(default_factory=list)
@@ -112,6 +114,13 @@ class MockProvider:
                 inchikey=inchikey,
                 retry_after=self.entity_retry_after,
                 detail="simulated retryable error",
+            )
+        if inchikey in self.entity_protocol_error_for:
+            return EntityLookupResult(
+                status=EntityLookupStatus.PROTOCOL_ERROR,
+                inchikey=inchikey,
+                raw_json={"inchikey": inchikey, "kingdom": "malformed"},
+                detail="simulated malformed entity payload",
             )
         raw = self.entities.get(inchikey)
         if raw is None:
@@ -138,6 +147,12 @@ class MockProvider:
         if remote_query_id in self.poll_retryable_for:
             return PollResult(
                 status=PollStatus.RETRYABLE_ERROR, detail="simulated poll 5xx"
+            )
+        if remote_query_id in self.poll_protocol_error_for:
+            return PollResult(
+                status=PollStatus.PROTOCOL_ERROR,
+                raw_json={"classification_status": "Bogus", "entities": []},
+                detail="simulated malformed query payload",
             )
         script = self.poll_script.get(remote_query_id)
         if not script:

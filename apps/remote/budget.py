@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, time
 
 from django.conf import settings
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import Sum
 from django.utils import timezone
 
@@ -25,6 +26,25 @@ def _daily_window_start():
         datetime.combine(now.date(), time.min),
         timezone.get_current_timezone(),
     )
+
+
+def budget_advisory_lock_keys(principal: str, window_start) -> tuple[int, int]:
+    """Return stable signed 32-bit advisory-lock keys for one budget window."""
+    digest = hashlib.sha256(
+        f"remote-budget\0{principal}\0{window_start.date().isoformat()}".encode()
+    ).digest()
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:8], "big", signed=True),
+    )
+
+
+def _acquire_budget_advisory_lock(principal: str, window_start) -> None:
+    if connection.vendor != "postgresql":
+        return
+    key1, key2 = budget_advisory_lock_keys(principal, window_start)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s, %s)", [key1, key2])
 
 
 def reserve_remote_budget(
@@ -49,6 +69,7 @@ def reserve_remote_budget(
     principal = normalize_principal(principal)
     window_start = _daily_window_start()
     with transaction.atomic():
+        _acquire_budget_advisory_lock(principal, window_start)
         used = (
             RemoteBudgetLedger.objects.filter(
                 principal=principal,

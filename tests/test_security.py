@@ -985,6 +985,27 @@ class TestSecurityImplementationGuards:
         assert first != different_ip
         assert all(-(2**31) <= value < 2**31 for value in first)
 
+    def test_invalid_bearer_header_does_not_spoof_session_principal(self) -> None:
+        from django.contrib.auth.hashers import make_password
+        from django.test import RequestFactory
+
+        from apps.core.security import SHARED_ACCESS_SESSION_KEY, _principal
+
+        request = RequestFactory().post(
+            "/api/jobs",
+            REMOTE_ADDR="198.51.100.20",
+            HTTP_AUTHORIZATION="Bearer attacker-controlled",
+        )
+        request.session = types.SimpleNamespace(
+            session_key="stable-session",
+            get=lambda key, default=None: (
+                True if key == SHARED_ACCESS_SESSION_KEY else default
+            ),
+        )
+
+        with override_settings(SHARED_ACCESS_PASSWORD_HASH=make_password("correct")):
+            assert _principal(request).startswith("session:")
+
     @pytest.mark.django_db(transaction=True)
     def test_create_job_under_quota_processes_items_after_quota_transaction(
         self,

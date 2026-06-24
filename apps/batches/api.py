@@ -62,6 +62,7 @@ from apps.batches.services import (
     StructureSubmissionError,
     submit_structure_for_item,
 )
+from apps.batches.storage import get_artifact_storage
 from apps.batches.upload import iter_combined_rows
 from apps.core.enums import BatchItemStatus
 from apps.core.security import (
@@ -424,6 +425,6 @@ def download_export_view(
     else:
         content_type = "application/octet-stream"
 
-    response = FileResponse(open(path, "rb"), content_type=content_type)
+    response = FileResponse(get_artifact_storage().open(path, "rb"), content_type=content_type)
     response["Content-Disposition"] = f'attachment; filename="{path.name}"'
     return response

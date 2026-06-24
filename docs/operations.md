@@ -358,3 +358,28 @@ when **Retry deferred** is triggered manually.
 2. Run backup retention: `docker compose exec web python manage.py run_backup`
 3. Remove expired uploads and exports: `docker compose run --rm cleanup`
 4. Consider moving the backup directory to a larger volume
+
+---
+
+## Gate 3 Load Probe
+
+The Gate 3 load probe is a manual PostgreSQL sanity check for query plans under
+large row counts. It is dry-run by default and only prints the SQL plus the
+explicit `PG*` environment-derived `psql` command:
+
+```bash
+PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=classyfire PGUSER=classyfire \
+  uv run --locked scripts/gate3_load_probe.py --rows 1000000 --dry-run
+```
+
+To execute against a disposable or staging database, pass `--execute`. The probe
+uses a temporary table and records EXPLAIN output on stdout:
+
+```bash
+PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=classyfire_probe PGUSER=classyfire \
+  uv run --locked scripts/gate3_load_probe.py --rows 1000000 --execute \
+  | tee gate3-load-probe-$(date +%Y%m%d).log
+```
+
+Use `--explain-only` when the temporary table was prepared separately and only
+the EXPLAIN statements should be printed or executed.
