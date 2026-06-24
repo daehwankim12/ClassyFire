@@ -42,6 +42,12 @@ class RemoteTask(models.Model):
     priority = models.IntegerField(
         default=0, help_text="Higher is claimed first."
     )
+    principal = models.CharField(
+        max_length=128,
+        default="system",
+        db_default="system",
+        help_text="Principal used for fair scheduling and remote budget accounting.",
+    )
     attempt = models.IntegerField(default=0, help_text="Retry attempt counter.")
     next_run_at = models.DateTimeField(
         null=True, blank=True, help_text="Earliest time the task may be claimed."
@@ -91,6 +97,10 @@ class RemoteTask(models.Model):
             models.Index(
                 fields=["state", "priority", "next_run_at"],
                 name="remote_task_claim_idx",
+            ),
+            models.Index(
+                fields=["principal", "state"],
+                name="remote_task_princ_state_idx",
             ),
         ]
 
@@ -400,3 +410,62 @@ class RemoteAttempt(models.Model):
         return f"attempt:{self.operation}:{self.classification}"
 
 
+class RemoteBudgetLedger(models.Model):
+    """Append-only remote-budget reservation ledger."""
+
+    principal = models.CharField(max_length=128)
+    units = models.IntegerField(default=1)
+    reason = models.CharField(max_length=64, default="remote_task")
+    task = models.ForeignKey(
+        RemoteTask,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="budget_reservations",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "remote_budget_ledger"
+        indexes = [
+            models.Index(
+                fields=["principal", "created_at"],
+                name="remote_budget_princ_day_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                name="remote_budget_units_positive",
+                condition=Q(units__gt=0),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"remote-budget:{self.principal}:{self.units}"
+
+
+class RemotePrincipalState(models.Model):
+    """Fair-scheduling state for a remote-work principal."""
+
+    principal = models.CharField(max_length=128, unique=True)
+    last_claimed_at = models.DateTimeField(null=True, blank=True)
+    claim_count = models.IntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_principal_states"
+        indexes = [
+            models.Index(
+                fields=["last_claimed_at", "principal"],
+                name="remote_principal_claim_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                name="remote_principal_claim_count_nonneg",
+                condition=Q(claim_count__gte=0),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"remote-principal:{self.principal}"

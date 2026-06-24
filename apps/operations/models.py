@@ -52,3 +52,33 @@ class SystemEvent(models.Model):
 
     def __str__(self) -> str:
         return f"event:{self.category}/{self.event_type}"
+
+
+class AuditSignature(models.Model):
+    """HMAC signature for an append-only SystemEvent payload."""
+
+    event = models.OneToOneField(
+        SystemEvent,
+        on_delete=models.CASCADE,
+        related_name="audit_signature",
+    )
+    key_id = models.CharField(max_length=64, default="default")
+    payload_sha256 = models.CharField(max_length=64)
+    signature = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "audit_signatures"
+        constraints = [
+            models.CheckConstraint(
+                name="audit_signature_payload_sha_hex64",
+                condition=models.Q(payload_sha256__regex=r"^[0-9a-f]{64}$"),
+            ),
+            models.CheckConstraint(
+                name="audit_signature_hex64",
+                condition=models.Q(signature__regex=r"^[0-9a-f]{64}$"),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"audit-signature:{self.event_id}:{self.key_id}"

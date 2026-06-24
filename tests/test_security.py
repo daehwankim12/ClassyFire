@@ -1008,9 +1008,15 @@ class TestSecurityImplementationGuards:
             rows_arg: list[dict[str, object]],
             *,
             remote_enabled: bool,
+            remote_principal: str = "system",
         ):
             create_atomic_states.append(connection.in_atomic_block)
-            return original_create_job_records(rows_arg, remote_enabled=remote_enabled)
+            assert remote_principal.startswith("ip:")
+            return original_create_job_records(
+                rows_arg,
+                remote_enabled=remote_enabled,
+                remote_principal=remote_principal,
+            )
 
         def spy_process_job_items(job):
             process_atomic_states.append(connection.in_atomic_block)

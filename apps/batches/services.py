@@ -77,9 +77,10 @@ from apps.core.enums import (
     BatchJobStatus,
     BatchProcessingState,
     DetectedInputType,
-    TaskState,
 )
 from apps.core.security import MAX_STRUCTURE_LEN, RowTooLongError, check_structure_length
+from apps.remote import queue as remote_queue
+from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
 from apps.remote.models import RemoteTask
 
 # Number of characters preserved in the bounded preview for an over-limit row.
@@ -235,6 +236,8 @@ def _update_usage(inchikey: str) -> None:
 def _get_or_create_remote_task(
     inchikey: str,
     compound: CompoundStructure | None,
+    *,
+    principal: str | None = None,
 ) -> RemoteTask:
     """Get or create an active RemoteTask for *inchikey* (global dedupe).
 
@@ -261,11 +264,14 @@ def _get_or_create_remote_task(
     # No active task found — create one in a savepoint.
     try:
         with transaction.atomic():
-            return RemoteTask.objects.create(
+            task = remote_queue.enqueue_task(
                 inchikey=inchikey,
-                compound=compound,
-                state=TaskState.READY,
+                compound_id=compound.pk if compound is not None else None,
+                principal=principal,
             )
+            if task is None:
+                raise IntegrityError("remote task create race")
+            return task
     except IntegrityError:
         # A concurrent create beat us; fetch the winner.
         existing = RemoteTask.objects.filter(
@@ -363,7 +369,16 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                         "resolved_classification",
                     ]
                 )
-                _get_or_create_remote_task(resolved_inchikey, compound)
+                try:
+                    _get_or_create_remote_task(
+                        resolved_inchikey,
+                        compound,
+                        principal=job.remote_principal,
+                    )
+                except RemoteBudgetExceededError:
+                    item.status = BatchItemStatus.REMOTE_DELAYED
+                    item.message = "Remote budget exceeded for this principal."
+                    item.save(update_fields=["status", "message"])
             else:
                 item.status = BatchItemStatus.REMOTE_DELAYED
                 item.message = "Structure provided; remote classification disabled."
@@ -392,6 +407,7 @@ def _process_item(
     item: BatchItem,
     *,
     remote_enabled: bool,
+    remote_principal: str = "system",
     lookup_override: object = _NO_LOOKUP_OVERRIDE,
     norm_override: object = _NO_LOOKUP_OVERRIDE,
 ) -> BatchItemStatus:
@@ -485,7 +501,15 @@ def _process_item(
 
         # Create/reuse a RemoteTask. Key-only tasks are entity lookups; structure
         # tasks can proceed to calculation if entity lookup misses.
-        _get_or_create_remote_task(norm.inchikey, compound)
+        try:
+            _get_or_create_remote_task(
+                norm.inchikey,
+                compound,
+                principal=remote_principal,
+            )
+        except RemoteBudgetExceededError:
+            item.message = "Remote budget exceeded for this principal."
+            return BatchItemStatus.REMOTE_DELAYED
         return BatchItemStatus.PENDING_CLASSIFICATION
 
     # inchikey is None after normalization → the input could not be parsed at all
@@ -629,7 +653,12 @@ _ITEM_UPDATE_FIELDS = [
 ]
 
 
-def _process_chunk(items: list[BatchItem], *, remote_enabled: bool) -> None:
+def _process_chunk(
+    items: list[BatchItem],
+    *,
+    remote_enabled: bool,
+    remote_principal: str = "system",
+) -> None:
     """Normalize + resolve a chunk of items with ONE bulk lookup (no N+1).
 
     Two passes:
@@ -668,7 +697,11 @@ def _process_chunk(items: list[BatchItem], *, remote_enabled: bool) -> None:
             if chunk_norm is None:
                 # Over-limit row: drive the legacy guard branch (length check
                 # re-raises, truncates original_input + sets INVALID_INPUT).
-                item.status = _process_item(item, remote_enabled=remote_enabled)
+                item.status = _process_item(
+                    item,
+                    remote_enabled=remote_enabled,
+                    remote_principal=remote_principal,
+                )
                 continue
             override: object = _NO_LOOKUP_OVERRIDE
             if (
@@ -680,6 +713,7 @@ def _process_chunk(items: list[BatchItem], *, remote_enabled: bool) -> None:
             item.status = _process_item(
                 item,
                 remote_enabled=remote_enabled,
+                remote_principal=remote_principal,
                 lookup_override=override,
                 norm_override=chunk_norm,
             )
@@ -722,7 +756,11 @@ def process_job_items(job: BatchJob) -> None:
         BatchJob.objects.filter(pk=job.pk).update(
             processing_state=BatchProcessingState.LOCAL_LOOKUP
         )
-        _process_chunk(chunk, remote_enabled=job.remote_enabled)
+        _process_chunk(
+            chunk,
+            remote_enabled=job.remote_enabled,
+            remote_principal=job.remote_principal,
+        )
 
         # Checkpoint: advance the cursor to the highest row_order in this chunk.
         # A restarted worker re-queries PENDING_NORMALIZATION (the true resume
@@ -814,6 +852,7 @@ def create_job_records(
     rows: Iterable[dict],
     *,
     remote_enabled: bool = True,
+    remote_principal: str = "system",
 ) -> tuple[BatchJob, str]:
     """Create a BatchJob and ingest its raw rows without local processing.
 
@@ -837,6 +876,7 @@ def create_job_records(
             secret_hash=secret_hash,
             status=BatchJobStatus.PENDING,
             remote_enabled=remote_enabled,
+            remote_principal=normalize_principal(remote_principal),
             # PARSING is a claimable state: the durable worker can pick the job
             # up if the synchronous path does not (or has not yet) processed it.
             processing_state=BatchProcessingState.PARSING,
@@ -858,6 +898,7 @@ def create_job_records_streaming(
     rows: Iterable[dict],
     *,
     remote_enabled: bool = True,
+    remote_principal: str = "system",
     max_rows: int | None = None,
 ) -> tuple[BatchJob, str, int]:
     """Create a BatchJob and STREAM-ingest its rows, returning the row count.
@@ -877,6 +918,7 @@ def create_job_records_streaming(
             secret_hash=secret_hash,
             status=BatchJobStatus.PENDING,
             remote_enabled=remote_enabled,
+            remote_principal=normalize_principal(remote_principal),
             processing_state=BatchProcessingState.PARSING,
         )
         row_count = ingest_rows(job, rows, max_rows=max_rows)
@@ -888,6 +930,7 @@ def create_job(
     rows: Iterable[dict],
     *,
     remote_enabled: bool = True,
+    remote_principal: str = "system",
 ) -> tuple[BatchJob, str]:
     """Create a BatchJob, ingest rows, and run local processing.
 
@@ -897,6 +940,7 @@ def create_job(
     job, plaintext_secret = create_job_records(
         rows,
         remote_enabled=remote_enabled,
+        remote_principal=remote_principal,
     )
 
     # Local processing runs outside the creation transaction so that a partial

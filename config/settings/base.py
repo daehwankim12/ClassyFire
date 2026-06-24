@@ -175,6 +175,9 @@ REMOTE_SUBMISSION_RECONCILE_MAX: int = env_int("REMOTE_SUBMISSION_RECONCILE_MAX"
 REMOTE_SUBMISSION_TTL_SECONDS: int = env_int(
     "REMOTE_SUBMISSION_TTL_SECONDS", 3600
 )
+REMOTE_DAILY_BUDGET_PER_PRINCIPAL: int = env_int(
+    "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", -1
+)
 
 # ---------------------------------------------------------------------------
 # Upload / retention
@@ -212,3 +215,5 @@ SECURE_REFERRER_POLICY = "no-referrer"
 
 REMOTE_CIRCUIT_THRESHOLD: int = env_int("REMOTE_CIRCUIT_THRESHOLD", 5)
 REMOTE_CIRCUIT_RESET_SECONDS: int = env_int("REMOTE_CIRCUIT_RESET_SECONDS", 300)
+
+AUDIT_SIGNING_KEY: str = env_str("AUDIT_SIGNING_KEY", "")

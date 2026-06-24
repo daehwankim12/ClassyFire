@@ -493,6 +493,7 @@ def create_job_under_quota(
         job, plaintext_secret = services.create_job_records(
             rows,
             remote_enabled=remote_enabled,
+            remote_principal=principal,
         )
         BatchQuotaEvent.objects.create(
             kind=BatchQuotaEvent.KIND_JOB_CREATE,
@@ -549,6 +550,7 @@ def stage_job_under_quota(
             job, plaintext_secret, row_count = services.create_job_records_streaming(
                 row_iter,  # type: ignore[arg-type]
                 remote_enabled=remote_enabled,
+                remote_principal=principal,
                 max_rows=max_rows,
             )
 

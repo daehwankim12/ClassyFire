@@ -21,14 +21,15 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 from django.db import IntegrityError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.core.enums import TaskState
-from apps.remote.models import RemoteTask
+from apps.remote.budget import normalize_principal, reserve_remote_budget
+from apps.remote.models import RemotePrincipalState, RemoteTask
 
 
 class LeaseLost(Exception):  # noqa: N818 - domain name fixed by the F-07 contract
@@ -57,6 +58,7 @@ BACKOFF_SCHEDULE_SECONDS: tuple[int, ...] = (
 )
 # Max retry attempts before a task is parked as DEFERRED.
 MAX_ATTEMPTS = len(BACKOFF_SCHEDULE_SECONDS)
+MIN_AWARE_DATETIME = datetime.min.replace(tzinfo=UTC)
 
 
 def jitter_fraction(attempt: int, inchikey: str) -> float:
@@ -77,7 +79,11 @@ def backoff_seconds(attempt: int, inchikey: str) -> float:
 
 
 def enqueue_task(
-    inchikey: str, *, compound_id: int | None = None, priority: int = 0
+    inchikey: str,
+    *,
+    compound_id: int | None = None,
+    priority: int = 0,
+    principal: str | None = None,
 ) -> RemoteTask | None:
     """Create the single active RemoteTask for ``inchikey`` (idempotent).
 
@@ -91,12 +97,16 @@ def enqueue_task(
         return existing
     try:
         with transaction.atomic():
-            return RemoteTask.objects.create(
+            normalized_principal = normalize_principal(principal)
+            task = RemoteTask.objects.create(
                 inchikey=inchikey,
                 compound_id=compound_id,
                 priority=priority,
+                principal=normalized_principal,
                 state=TaskState.READY,
             )
+            reserve_remote_budget(normalized_principal, task=task)
+            return task
     except IntegrityError:
         # Lost the race: another worker inserted the active task first.
         return RemoteTask.objects.filter(
@@ -113,15 +123,33 @@ def claim_task(worker_id: str) -> RemoteTask | None:
     """
     now = timezone.now()
     with transaction.atomic():
-        task = (
+        candidates = list(
             RemoteTask.objects.select_for_update(skip_locked=True)
             .filter(state=TaskState.READY)
             .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
-            .order_by("-priority", "next_run_at", "id")
-            .first()
+            .order_by("-priority", "next_run_at", "id")[:50]
         )
-        if task is None:
+        if not candidates:
             return None
+        top_priority = candidates[0].priority
+        top_candidates = [task for task in candidates if task.priority == top_priority]
+        principals = {task.principal for task in top_candidates}
+        states = {
+            state.principal: state
+            for state in RemotePrincipalState.objects.filter(principal__in=principals)
+        }
+
+        def fairness_key(task: RemoteTask) -> tuple[bool, object, object, int]:
+            state = states.get(task.principal)
+            last_claimed_at = state.last_claimed_at if state is not None else None
+            return (
+                last_claimed_at is not None,
+                last_claimed_at or MIN_AWARE_DATETIME,
+                task.next_run_at or MIN_AWARE_DATETIME,
+                task.id,
+            )
+
+        task = min(top_candidates, key=fairness_key)
         # Issue a fresh fencing token + bump the monotonic lease version (F-07)
         # so any previous holder's late writes are rejected.
         task.state = TaskState.LOCKED
@@ -138,6 +166,14 @@ def claim_task(worker_id: str) -> RemoteTask | None:
                 "lease_version",
                 "updated_at",
             ]
+        )
+        principal_state, _created = RemotePrincipalState.objects.get_or_create(
+            principal=task.principal,
+            defaults={"last_claimed_at": None, "claim_count": 0},
+        )
+        RemotePrincipalState.objects.filter(pk=principal_state.pk).update(
+            last_claimed_at=now,
+            claim_count=F("claim_count") + 1,
         )
         return task
 

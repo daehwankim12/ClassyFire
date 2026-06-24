@@ -50,6 +50,12 @@ class BatchJob(models.Model):
     invalid_count = models.IntegerField(default=0)
 
     remote_enabled = models.BooleanField(default=True)
+    remote_principal = models.CharField(
+        max_length=128,
+        default="system",
+        db_default="system",
+        help_text="Principal used for remote-budget and fair-scheduling policy.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
