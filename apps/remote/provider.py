@@ -74,10 +74,19 @@ def classify_http_status(status_code: int) -> HttpOutcome:
 
 
 class EntityLookupStatus(StrEnum):
-    """Outcome of an entity (cached classification) lookup."""
+    """Outcome of an entity (cached classification) lookup.
+
+    ``NOT_FOUND`` (HTTP 404) is a GENUINE entity miss — the key is simply not in
+    the cache, so the worker may try to calculate it via a structure submit. It
+    is kept distinct from ``PROTOCOL_ERROR`` (a permanent input/protocol failure
+    such as a 400/422) which must NEVER trigger a calculation. ``MISS`` remains
+    the (provider-agnostic, e.g. MockProvider) "no entity, may submit" trigger;
+    both ``NOT_FOUND`` and ``MISS`` route to the submit/NEED_STRUCTURE path.
+    """
 
     FOUND = "FOUND"
     MISS = "MISS"
+    NOT_FOUND = "NOT_FOUND"
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
     AUTH_FAILURE = "AUTH_FAILURE"
     PROTOCOL_ERROR = "PROTOCOL_ERROR"

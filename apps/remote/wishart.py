@@ -139,8 +139,11 @@ class WishartDirectProvider:
         raw_text = resp.text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.NOT_FOUND:
+            # 404 is a GENUINE entity miss (key absent from the cache). Surface
+            # NOT_FOUND so the worker may try to CALCULATE it via a structure
+            # submit — distinct from a PERMANENT protocol error below.
             return EntityLookupResult(
-                status=EntityLookupStatus.MISS,
+                status=EntityLookupStatus.NOT_FOUND,
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 raw_text=raw_text,
@@ -166,9 +169,11 @@ class WishartDirectProvider:
                 safe_headers=headers,
             )
         if outcome is HttpOutcome.PERMANENT:
-            # Definite 4xx input error: surface as MISS (no entity, do not retry).
+            # Definite 4xx input/protocol error (400/422/other non-404 4xx): this
+            # is NOT an entity miss. Surface PROTOCOL_ERROR so the worker records
+            # the attempt and NEVER submits a calculation for a malformed request.
             return EntityLookupResult(
-                status=EntityLookupStatus.MISS,
+                status=EntityLookupStatus.PROTOCOL_ERROR,
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",

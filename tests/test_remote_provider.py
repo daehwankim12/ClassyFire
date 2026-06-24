@@ -148,13 +148,16 @@ def test_wishart_entity_found():
     assert result.raw_json is not None
 
 
-def test_wishart_entity_404_is_miss():
+def test_wishart_entity_404_is_not_found():
+    # A 404 is a GENUINE entity miss (key absent) -> NOT_FOUND, so the worker may
+    # try to calculate it via a structure submit. Distinct from PROTOCOL_ERROR.
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, text="not found")
 
     provider = _wishart_with(handler)
     result = provider.lookup_entity(IK_A)
-    assert result.status == EntityLookupStatus.MISS
+    assert result.status == EntityLookupStatus.NOT_FOUND
+    assert result.raw_text == "not found"
 
 
 def test_wishart_entity_429_retryable_with_retry_after():
@@ -298,12 +301,16 @@ def test_wishart_entity_unknown_status_is_protocol_error():
     assert result.status != EntityLookupStatus.FOUND
 
 
-def test_wishart_entity_permanent_4xx_is_miss():
+def test_wishart_entity_permanent_4xx_is_protocol_error():
+    # A definite non-404 4xx (e.g. 422) is a PERMANENT protocol/input error, NOT
+    # an entity miss: surface PROTOCOL_ERROR so the worker NEVER submits a
+    # calculation for a malformed request.
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(422, text="unprocessable")
 
     result = _wishart_with(handler).lookup_entity(IK_A)
-    assert result.status == EntityLookupStatus.MISS
+    assert result.status == EntityLookupStatus.PROTOCOL_ERROR
+    assert result.raw_text == "unprocessable"
 
 
 def test_wishart_submit_401_raises_auth_error():

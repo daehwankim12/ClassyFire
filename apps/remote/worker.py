@@ -291,8 +291,36 @@ class RemoteWorker:
             )
             return
 
-        # MISS: submit a structure query if we have a structure, else NEED_STRUCTURE.
-        self._handle_entity_miss(task)
+        # GENUINE entity miss only (HTTP 404 -> NOT_FOUND, or the provider-agnostic
+        # MISS from e.g. MockProvider): the key is simply not cached, so we may try
+        # to CALCULATE it via a structure submit (else NEED_STRUCTURE). A
+        # PROTOCOL_ERROR (400/422) was already handled above and NEVER reaches here,
+        # so a malformed request can never trigger a calculation. Be explicit (do
+        # not fall through on an unexpected status) so future statuses fail loud.
+        if result.status in (EntityLookupStatus.NOT_FOUND, EntityLookupStatus.MISS):
+            self._handle_entity_miss(task)
+            return
+
+        # Unexpected/unmapped status with circuit success recorded: surface it as a
+        # protocol error rather than silently submitting or dropping the task.
+        logger.error(
+            "remote entity unexpected status %s for %s; retrying without submit",
+            result.status,
+            task.inchikey,
+        )
+        self._record_attempt(
+            RemoteAttempt.OPERATION_ENTITY,
+            classification="PROTOCOL_ERROR",
+            raw_payload=result.raw_json,
+            http_status=result.http_status,
+            detail=f"unexpected entity status {result.status}",
+            task=task,
+            request_inchikey=task.inchikey,
+            raw_body_text=result.raw_text,
+            safe_headers=result.safe_headers,
+        )
+        queue.schedule_retry(task)
+        fanout.mark_items_delayed(task.inchikey)
 
     def _handle_entity_miss(self, task: RemoteTask) -> None:
         structure = self._structure_for(task)
