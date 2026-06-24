@@ -29,6 +29,20 @@ def test_worker_has_external_network():
     assert "external" in worker_networks
 
 
+def test_compose_web_and_worker_wait_for_migrate():
+    compose = load_compose()
+    services = compose["services"]
+
+    assert "migrate" in services
+    assert services["migrate"]["command"] == ["python", "manage.py", "migrate", "--noinput"]
+    assert services["migrate"]["restart"] == "no"
+
+    for service_name in ["web", "worker"]:
+        depends_on = services[service_name]["depends_on"]
+        assert depends_on["db"]["condition"] == "service_healthy"
+        assert depends_on["migrate"]["condition"] == "service_completed_successfully"
+
+
 def test_db_no_external_network():
     compose = load_compose()
     db_networks = compose["services"]["db"]["networks"]

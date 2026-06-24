@@ -13,12 +13,10 @@
 FROM python:3.12-slim AS base
 
 # ── System packages ──────────────────────────────────────────────────────────
-# build-essential   : needed by some Python C-extensions
-# libpq-dev         : psycopg binary wheel dep on some platforms
+# libpq5            : PostgreSQL client runtime library
 # libxrender1, libxext6 : RDKit rendering (optional but avoids runtime warnings)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
+        libpq5 \
         libxrender1 \
         libxext6 \
     && rm -rf /var/lib/apt/lists/*
@@ -31,18 +29,13 @@ RUN groupadd --gid 1001 appgroup \
 WORKDIR /app
 
 # ── Python dependencies ──────────────────────────────────────────────────────
-# Copy only the project descriptor first to benefit from layer caching.
-COPY pyproject.toml ./
-
-# Install the project in editable-ish mode (no source yet) to pull in deps,
-# then copy source.  We use --no-build-isolation for speed (system build tools
-# already present).
-RUN pip install --upgrade pip setuptools wheel \
- && pip install --no-cache-dir ".[dev]" \
- || pip install --no-cache-dir .
-
 # ── Application source ───────────────────────────────────────────────────────
 COPY . .
+
+# Install only runtime dependencies in the production image. Developer tools
+# are installed by local workflows through `uv run --locked --extra dev`.
+RUN pip install --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir .
 
 # ── Static files ─────────────────────────────────────────────────────────────
 # Collect static files at build time so the web container is ready immediately.

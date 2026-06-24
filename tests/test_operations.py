@@ -775,3 +775,57 @@ def test_cleanup_does_not_delete_pending_jobs():
     cleanup_expired(actor="test")
     # PENDING jobs should NOT be deleted (only COMPLETE/FAILED)
     assert BatchJob.objects.filter(pk=pk).exists()
+
+
+def test_cleanup_removes_expired_exports_and_uploads(tmp_path, monkeypatch, settings):
+    from apps.batches.models import BatchJob
+    from apps.operations.cleanup import cleanup_expired
+
+    export_dir = tmp_path / "export_cache"
+    export_dir.mkdir()
+    monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
+    settings.EXPORT_RETENTION_DAYS = 14
+    settings.UPLOAD_RETENTION_DAYS = 30
+
+    old_export = export_dir / "old-token.csv"
+    old_meta = export_dir / "old-token.meta.json"
+    fresh_export = export_dir / "fresh-token.csv"
+    fresh_meta = export_dir / "fresh-token.meta.json"
+
+    old_export.write_text("expired")
+    old_meta.write_text(
+        json.dumps(
+            {
+                "token": "old-token",
+                "job_id": "job-1",
+                "fmt": "csv",
+                "expires_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            }
+        )
+    )
+    fresh_export.write_text("fresh")
+    fresh_meta.write_text(
+        json.dumps(
+            {
+                "token": "fresh-token",
+                "job_id": "job-2",
+                "fmt": "csv",
+                "expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            }
+        )
+    )
+
+    old_time = dj_timezone.now() - timedelta(days=35)
+    upload_job = _batch_job(status="PENDING", created_at_override=old_time)
+
+    result = cleanup_expired(actor="test")
+
+    upload_job.refresh_from_db()
+    assert upload_job.secret_hash == ""
+    assert result.jobs_secrets_wiped == 1
+    assert result.exports_deleted == 2
+    assert not old_export.exists()
+    assert not old_meta.exists()
+    assert fresh_export.exists()
+    assert fresh_meta.exists()
+    assert BatchJob.objects.filter(pk=upload_job.pk).exists()

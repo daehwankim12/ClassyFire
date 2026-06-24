@@ -6,12 +6,14 @@ classification_history). Only removes expired operational/transient data.
 Retention days are read from settings:
   UPLOAD_RETENTION_DAYS  (default 30) — BatchJobs older than N days get secret_hash wiped
   JOB_RETENTION_DAYS     (default 90) — BatchJobs completed more than N days ago get deleted
-  EXPORT_RETENTION_DAYS  (default 14) — (reserved; no export model yet, logged only)
+  EXPORT_RETENTION_DAYS  (default 14) — expired export cache files are deleted
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from django.conf import settings
 from django.utils import timezone
@@ -31,6 +33,57 @@ def _retention_days(attr: str, default: int) -> int:
     return int(getattr(settings, attr, default))
 
 
+def _delete_if_exists(path: Path) -> int:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return 0
+    return 1
+
+
+def _cleanup_expired_exports(now: datetime, retention_days: int) -> int:
+    from apps.batches import exports
+
+    export_dir = exports.EXPORT_DIR
+    if not export_dir.exists():
+        return 0
+
+    cutoff = now - timedelta(days=retention_days)
+    deleted = 0
+    retained_payloads: set[Path] = set()
+
+    for meta_path in export_dir.glob("*.meta.json"):
+        should_delete = False
+        payload_path: Path | None = None
+        try:
+            raw = json.loads(meta_path.read_text())
+            token = str(raw["token"])
+            fmt = str(raw["fmt"])
+            expires_at = datetime.fromisoformat(str(raw["expires_at"]))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            payload_path = export_dir / f"{token}.{fmt}"
+            should_delete = expires_at <= now
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            should_delete = True
+
+        if should_delete:
+            deleted += _delete_if_exists(meta_path)
+            if payload_path is not None:
+                deleted += _delete_if_exists(payload_path)
+        elif payload_path is not None:
+            retained_payloads.add(payload_path)
+
+    for payload_path in export_dir.iterdir():
+        if payload_path.name.endswith(".meta.json") or payload_path in retained_payloads:
+            continue
+        modified_at = datetime.fromtimestamp(payload_path.stat().st_mtime, tz=UTC)
+        if modified_at < cutoff:
+            deleted += _delete_if_exists(payload_path)
+
+    return deleted
+
+
 def cleanup_expired(actor: str = "system") -> CleanupResult:
     """Run all retention cleanup tasks and log a SystemEvent."""
     from apps.batches.models import BatchJob
@@ -40,6 +93,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
 
     upload_days = _retention_days("UPLOAD_RETENTION_DAYS", 30)
     job_days = _retention_days("JOB_RETENTION_DAYS", 90)
+    export_days = _retention_days("EXPORT_RETENTION_DAYS", 14)
 
     upload_cutoff = now - timedelta(days=upload_days)
     job_cutoff = now - timedelta(days=job_days)
@@ -57,7 +111,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
     )
     jobs_deleted, _ = delete_qs.delete()
 
-    exports_deleted = 0
+    exports_deleted = _cleanup_expired_exports(now, export_days)
 
     result = CleanupResult(
         jobs_secrets_wiped=secrets_wiped,
@@ -75,6 +129,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             "exports_deleted": exports_deleted,
             "upload_retention_days": upload_days,
             "job_retention_days": job_days,
+            "export_retention_days": export_days,
         },
     )
 

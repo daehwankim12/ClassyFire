@@ -417,21 +417,18 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
     completed  = FOUND_LIVE_CACHE + FOUND_SEED_CACHE + FOUND_WISHART_ENTITY
                  + COMPLETE_AFTER_WISHART + INVALID_INPUT + RESULT_KEY_MISMATCH
                  (every item in a terminal state that requires no further action)
-    remote_pending = PENDING_CLASSIFICATION + REMOTE_DELAYED
+    blocking = PENDING_NORMALIZATION + PENDING_CLASSIFICATION + REMOTE_DELAYED
     need_structure = NEED_STRUCTURE  (awaiting external user input)
 
     Status rules:
-    - COMPLETE when remote_pending == 0  (no in-flight remote work remains)
-    - NEED_STRUCTURE items do NOT block COMPLETE; they await user input and are
-      shown separately via need_structure_count.
+    - IN_PROGRESS while any blocking item remains.
+    - COMPLETE_WITH_ACTION_REQUIRED when all remaining terminal rows need user
+      structure input.
+    - COMPLETE when no item requires more work or user action.
     - Status is derived from current item state on every call; if pending items
       appear later, a previously COMPLETE job can return to IN_PROGRESS.
     """
     from django.db.models import Count, Q
-
-    job = BatchJob.objects.filter(pk=job_id).first()
-    if job is None:
-        return
 
     terminal_complete = (
         BatchItemStatus.FOUND_LIVE_CACHE,
@@ -442,58 +439,66 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
         BatchItemStatus.RESULT_KEY_MISMATCH,
     )
 
-    counts = BatchItem.objects.filter(job=job).aggregate(
-        total=Count("pk"),
-        local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
-        seed_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_SEED_CACHE)),
-        remote_pending=Count(
-            "pk",
-            filter=Q(
-                status__in=(
-                    BatchItemStatus.PENDING_CLASSIFICATION,
-                    BatchItemStatus.REMOTE_DELAYED,
-                )
+    blocking_statuses = (
+        BatchItemStatus.PENDING_NORMALIZATION,
+        BatchItemStatus.PENDING_CLASSIFICATION,
+        BatchItemStatus.REMOTE_DELAYED,
+    )
+
+    with transaction.atomic():
+        job = BatchJob.objects.select_for_update().filter(pk=job_id).first()
+        if job is None:
+            return
+
+        counts = BatchItem.objects.filter(job=job).aggregate(
+            total=Count("pk"),
+            local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
+            seed_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_SEED_CACHE)),
+            remote_pending=Count(
+                "pk",
+                filter=Q(
+                    status__in=(
+                        BatchItemStatus.PENDING_CLASSIFICATION,
+                        BatchItemStatus.REMOTE_DELAYED,
+                    )
+                ),
             ),
-        ),
-        need_structure=Count("pk", filter=Q(status=BatchItemStatus.NEED_STRUCTURE)),
-        invalid=Count("pk", filter=Q(status=BatchItemStatus.INVALID_INPUT)),
-        completed=Count("pk", filter=Q(status__in=terminal_complete)),
-    )
+            blocking=Count("pk", filter=Q(status__in=blocking_statuses)),
+            need_structure=Count("pk", filter=Q(status=BatchItemStatus.NEED_STRUCTURE)),
+            invalid=Count("pk", filter=Q(status=BatchItemStatus.INVALID_INPUT)),
+            completed=Count("pk", filter=Q(status__in=terminal_complete)),
+        )
 
-    total = counts["total"]
-    local_hit = counts["local_hit"]
-    seed_hit = counts["seed_hit"]
-    remote_pending = counts["remote_pending"]
-    need_structure = counts["need_structure"]
-    invalid = counts["invalid"]
-    completed = counts["completed"]
+        total = counts["total"]
+        local_hit = counts["local_hit"]
+        seed_hit = counts["seed_hit"]
+        remote_pending = counts["remote_pending"]
+        blocking = counts["blocking"]
+        need_structure = counts["need_structure"]
+        invalid = counts["invalid"]
+        completed = counts["completed"]
 
-    # Status: COMPLETE when no item is in-flight (remote_pending == 0).
-    # NEED_STRUCTURE items await user input — they don't block COMPLETE.
-    # The status is always derived from ground-truth item counts; this function
-    # is the authoritative recompute, so current pending items make the job
-    # IN_PROGRESS regardless of its previous status.
-    from datetime import datetime as _datetime
+        if blocking:
+            new_status = BatchJobStatus.IN_PROGRESS
+            completed_at = None
+        elif total and need_structure and completed + need_structure == total:
+            new_status = BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED
+            completed_at = job.completed_at or timezone.now()
+        else:
+            new_status = BatchJobStatus.COMPLETE
+            completed_at = job.completed_at or timezone.now()
 
-    completed_at: _datetime | None
-    if remote_pending == 0:
-        new_status = BatchJobStatus.COMPLETE
-        completed_at = job.completed_at if job.completed_at is not None else timezone.now()
-    else:
-        new_status = BatchJobStatus.IN_PROGRESS
-        completed_at = job.completed_at
-
-    BatchJob.objects.filter(pk=job.pk).update(
-        total_count=total,
-        completed_count=completed,
-        local_hit_count=local_hit,
-        seed_hit_count=seed_hit,
-        remote_pending_count=remote_pending,
-        need_structure_count=need_structure,
-        invalid_count=invalid,
-        status=new_status,
-        completed_at=completed_at,
-    )
+        BatchJob.objects.filter(pk=job.pk).update(
+            total_count=total,
+            completed_count=completed,
+            local_hit_count=local_hit,
+            seed_hit_count=seed_hit,
+            remote_pending_count=remote_pending,
+            need_structure_count=need_structure,
+            invalid_count=invalid,
+            status=new_status,
+            completed_at=completed_at,
+        )
 
 
 def process_job_items(job: BatchJob) -> None:
