@@ -350,16 +350,24 @@ owner now drives the job), and `manage.py process_jobs` logs it and claims the
 next job rather than crashing. This is the ingest-side analogue of the remote
 queue's lease-token + `lease_version` fencing (F-07).
 
-**Two upload-route modes (`INGEST_DEFER_HEAVY_PROCESSING`).** The web
-`submit_view` and API `create_job_view` run in one of two modes, selected by the
-boolean setting (env `INGEST_DEFER_HEAVY_PROCESSING`, default **False**):
+**Upload routes are always deferred (`INGEST_DEFER_HEAVY_PROCESSING`, default
+**True**).** The web `submit_view` and API `create_job_view` authenticate, parse
+the upload as a bounded stream, stage rows, and RETURN — they never run heavy
+processing inside the HTTP request. The route consumes the row *iterator*
+straight into BatchItems via `stage_job_under_quota` (no full row-list
+materialization) and returns immediately (API: `202 Accepted` with
+`processing_state`; web: redirect to the job's claim page) with the job in
+`PARSING` and items `PENDING_NORMALIZATION`. The durable `process_jobs` worker
+then claims + drains the job to its final statuses/pins.
 
-| Mode | Setting | Route behavior |
-| --- | --- | --- |
-| Synchronous (default) | `False` | Route parses (streaming) → `create_job_under_quota` stages items AND runs `process_job_items` inline → returns with the job already resolved. Preserves the existing immediate-result contract. |
-| Deferred | `True` | Route parses (streaming) → `stage_job_under_quota` consumes the row *iterator* straight into BatchItems (no full row-list materialization) and RETURNS immediately with the job in `PARSING` and items `PENDING_NORMALIZATION`. The durable `process_jobs` worker then claims + drains it to the SAME final statuses/pins. |
+The legacy synchronous helper `create_job_under_quota` (which staged items AND
+ran `process_job_items` inline) is retained ONLY for service-level tests and
+diagnostics: it raises `RuntimeError` when `INGEST_DEFER_HEAVY_PROCESSING` is
+enabled (the default), so no production route can run processing in-request.
+Tests that need inline processing call `create_job_records` + `process_job_items`
+(or `run_pending_jobs`) directly, or set the flag `False` explicitly.
 
-In deferred mode the per-job `MAX_ROWS_PER_JOB` cap is enforced **mid-stream**
+The per-job `MAX_ROWS_PER_JOB` cap is enforced **mid-stream**
 (`RowCapExceededError` → 413, transaction rolled back, no partial job); the
 daily row cap is re-checked once the true streamed count is known.
 
