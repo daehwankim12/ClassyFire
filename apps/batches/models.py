@@ -223,6 +223,10 @@ class ExportArtifact(models.Model):
                 condition=Q(checksum__regex=r"^[0-9a-f]{64}$"),
             ),
             models.CheckConstraint(
+                name="export_artifact_rows_sig_hex64",
+                condition=Q(rows_signature__regex=r"^[0-9a-f]{64}$"),
+            ),
+            models.CheckConstraint(
                 name="export_artifact_byte_size_nonneg",
                 condition=Q(byte_size__gte=0),
             ),
@@ -230,6 +234,11 @@ class ExportArtifact(models.Model):
         indexes = [
             models.Index(fields=["job", "fmt"], name="export_artifact_job_fmt_idx"),
             models.Index(fields=["expires_at"], name="export_artifact_expires_idx"),
+            # Covers the dedup lookup: filter(job, fmt, rows_signature, expires_at)
+            models.Index(
+                fields=["job", "fmt", "rows_signature"],
+                name="export_artifact_dedup_idx",
+            ),
         ]
 
     def __str__(self) -> str:

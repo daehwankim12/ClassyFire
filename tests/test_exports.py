@@ -612,22 +612,18 @@ def test_legacy_export_metadata_without_rows_signature_is_not_served():
 
 @pytest.mark.django_db(transaction=True)
 def test_streaming_uses_iterator(monkeypatch):
-    """Export generation calls .iterator() on the queryset (memory-bounded)."""
-    from apps.batches.models import BatchItem
-
+    """Export generation calls .iterator() with a chunk_size (memory-bounded)."""
     iterator_called = []
-    original_iterator = BatchItem._default_manager.__class__.iterator
+    real_iterator = __import__(
+        "django.db.models.query", fromlist=["QuerySet"]
+    ).QuerySet.iterator
 
-    def patched_iterator(self, chunk_size=None):
+    def spy_iterator(self, chunk_size=None):
         iterator_called.append(chunk_size)
-        return original_iterator(self, chunk_size=chunk_size)
+        return real_iterator(self, chunk_size=chunk_size)
 
     monkeypatch.setattr(
-        "django.db.models.query.QuerySet.iterator",
-        lambda self, chunk_size=None: (
-            iterator_called.append(chunk_size) or
-            iter(list(self))  # still iterate results
-        ),
+        "django.db.models.query.QuerySet.iterator", spy_iterator
     )
 
     job, secret = _create_simple_job()
@@ -635,7 +631,57 @@ def test_streaming_uses_iterator(monkeypatch):
     _get_export_bytes(client, str(job.pk), secret, "csv")
 
     assert len(iterator_called) > 0, (
-        "Expected .iterator() to be called during export generation, but it was not"
+        "Expected .iterator() to be called during export generation"
+    )
+    # A real chunk_size must be passed (memory-bounding the fetch), not None.
+    assert any(cs is not None and cs > 0 for cs in iterator_called), (
+        f"Expected .iterator(chunk_size=N>0); got chunk sizes {iterator_called}"
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_streaming_write_consumes_rows_lazily(monkeypatch):
+    """_write_export_to_temp pulls rows one at a time — no full-list build.
+
+    We feed it a generator that records the maximum number of rows that have
+    been pulled but NOT yet consumed by the writer.  A streaming writer pulls
+    one row, writes it, then pulls the next, so the in-flight count never
+    exceeds 1.  A writer that materialised list(rows) would pull all N rows
+    before writing any, driving the in-flight count to N.
+    """
+    from apps.batches import exports as exp_module
+
+    job, _secret = _create_simple_job()
+
+    n_rows = 50
+    state = {"in_flight": 0, "max_in_flight": 0, "produced": 0}
+
+    base_row = dict.fromkeys(EXPECTED_COLUMNS, "")
+
+    def tracking_generator(_job):
+        for i in range(n_rows):
+            state["in_flight"] += 1
+            state["produced"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+            row = dict(base_row)
+            row["InChIKey"] = f"ROW{i:026d}"[:27]
+            yield row
+            # Once the writer pulls the NEXT row, this one has been consumed.
+            state["in_flight"] -= 1
+
+    monkeypatch.setattr(exp_module, "_iter_rows_for_job", tracking_generator)
+
+    tmp_path, _sig, row_count, _bytes = exp_module._write_export_to_temp(
+        job, "csv", "lazytoken"
+    )
+    exp_module._discard_temp(tmp_path)
+
+    assert state["produced"] == n_rows
+    assert row_count == n_rows
+    # Streaming: at most one row in flight at any instant.
+    assert state["max_in_flight"] == 1, (
+        f"Writer is not lazy: peak in-flight rows was {state['max_in_flight']} "
+        f"(expected 1 for a streaming writer)"
     )
 
 

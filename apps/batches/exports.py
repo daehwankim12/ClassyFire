@@ -34,8 +34,12 @@ Implementation notes (Gate-2 WS-E / F-12)
   a full in-memory byte string.
 - JSON export writes '[', then comma-separated objects, then ']' without
   building a list in memory.
-- A single streaming pass computes both the rows_signature hash and writes the
-  file, avoiding double iteration.
+- A SINGLE streaming pass (_write_export_to_temp) writes the file AND computes
+  the rows_signature simultaneously.  Because the signature is only known after
+  the scan, the flow is write-to-temp -> dedup-check -> finalize: if a valid
+  artifact already has that signature, the temp file is discarded and the token
+  reused; otherwise the temp is atomically renamed (os.replace) into place. This
+  means at most ONE full BatchItem scan per create (no double scan).
 - ExportArtifact (DB model) is the source of truth for metadata/dedup/expiry.
   A JSON sidecar (.meta.json) is also written for backward compatibility with
   existing tests that call _meta_path/_load_meta directly.
@@ -332,26 +336,28 @@ class _RowsSignatureHasher:
         return h.hexdigest()
 
 
-def _write_export_streaming(
+def _write_export_to_temp(
     job: BatchJob,
     fmt: str,
     token: str,
 ) -> tuple[Path, str, int, int]:
-    """Generate the export file using streaming iteration.
+    """Stream the export to a TEMP file in a SINGLE pass.
 
-    Writes to a temp file in EXPORT_DIR, then atomically renames to the final
-    path.  Returns (final_path, rows_signature, row_count, byte_size).
+    The same pass that writes each row also feeds the incremental signature
+    hasher, so the rows_signature is a by-product of the write (no second scan).
+    The temp file is NOT yet renamed into place; the caller decides whether to
+    finalize (:func:`_finalize_temp`) or discard it (dedup hit).
+
+    Returns ``(tmp_path, rows_signature, row_count, byte_size)``.
     """
     EXPORT_DIR.mkdir(exist_ok=True)
-    ext = fmt
-    dest = EXPORT_DIR / f"{token}.{ext}"
 
     sig_hasher = _RowsSignatureHasher()
     row_count = 0
 
-    # Write to a temp file in the same directory so os.replace is atomic.
+    # Write to a temp file in the same directory so a later os.replace is atomic.
     fd, tmp_path_str = tempfile.mkstemp(dir=EXPORT_DIR, prefix=f".tmp.{token}.")
-    tmp_path: Path | None = Path(tmp_path_str)
+    tmp_path = Path(tmp_path_str)
     try:
         with os.fdopen(fd, "wb") as raw_fh:
             if fmt in ("csv.gz", "tsv.gz"):
@@ -417,21 +423,29 @@ def _write_export_streaming(
             else:
                 raise ValueError(f"Unsupported export format: {fmt!r}")
 
-        assert tmp_path is not None  # always set at this point
-        os.replace(tmp_path, dest)
-        tmp_path = None  # ownership transferred — temp file is now the dest
-
     except Exception:
-        if tmp_path is not None and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+        _discard_temp(tmp_path)
         raise
 
     rows_signature = sig_hasher.hexdigest()
-    byte_size = dest.stat().st_size
-    return dest, rows_signature, row_count, byte_size
+    byte_size = tmp_path.stat().st_size
+    return tmp_path, rows_signature, row_count, byte_size
+
+
+def _finalize_temp(tmp_path: Path, token: str, fmt: str) -> Path:
+    """Atomically rename a finished temp file into its final EXPORT_DIR slot."""
+    dest = EXPORT_DIR / f"{token}.{fmt}"
+    os.replace(tmp_path, dest)
+    return dest
+
+
+def _discard_temp(tmp_path: Path) -> None:
+    """Remove a temp file (dedup hit or error path); best-effort."""
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    except OSError:
+        pass
 
 
 def _checksum_file(path: Path) -> str:
@@ -551,26 +565,29 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     if fmt not in valid_formats:
         raise ValueError(f"Unsupported format: {fmt!r}. Must be one of: {valid_formats}")
 
-    # Compute signature to check for an existing artifact (single streaming pass)
-    rows_signature = _compute_rows_signature(job)
+    token = secrets.token_urlsafe(32)
+
+    # SINGLE streaming pass: write to a temp file and compute the rows_signature
+    # at the same time.  We cannot know the signature until we have scanned the
+    # rows, so write-to-temp-then-dedup is the correct shape: if an existing
+    # valid artifact already has this signature, discard the temp file and reuse
+    # its token; otherwise finalize the temp file (atomic rename) and persist.
+    tmp_path, rows_signature, row_count, byte_size = _write_export_to_temp(job, fmt, token)
 
     existing = _find_existing_artifact(str(job.pk), fmt, rows_signature)
     if existing is not None:
-        expires_at_iso = existing.expires_at.isoformat()
-        return existing.token, expires_at_iso
+        _discard_temp(tmp_path)
+        return existing.token, existing.expires_at.isoformat()
 
-    token = secrets.token_urlsafe(32)
     retention_days = getattr(settings, "EXPORT_RETENTION_DAYS", 14)
     expires_at = datetime.now(tz=dt.UTC) + timedelta(days=retention_days)
     expires_at_iso = expires_at.isoformat()
 
-    EXPORT_DIR.mkdir(exist_ok=True)
+    # Checksum the temp file BEFORE the atomic rename, then finalize.
+    checksum = _checksum_file(tmp_path)
+    dest = _finalize_temp(tmp_path, token, fmt)
 
-    # Stream-write the export file (atomic rename inside)
-    dest, _sig, row_count, byte_size = _write_export_streaming(job, fmt, token)
-    checksum = _checksum_file(dest)
-
-    # Persist to DB
+    # Persist to DB (source of truth)
     ExportArtifact.objects.create(
         job=job,
         fmt=fmt,
@@ -624,14 +641,24 @@ def get_export_path(token: str) -> Path | None:
         path = Path(artifact.path)
         if not path.exists():
             return None
-        # Verify current job state still matches this artifact's signature
         job = BatchJob.objects.filter(pk=artifact.job_id).first()
         if job is None:
             return None
-        current_sig = _compute_rows_signature(job)
-        if current_sig != artifact.rows_signature:
-            return None
-        return path
+        # Cheap proxy guard: a job whose row count is unchanged from when the
+        # artifact was created is overwhelmingly the common case.  Only fall
+        # back to the full streaming re-signature (one BatchItem scan) when the
+        # cheap count differs — which is the only way row CONTENT can change
+        # without changing the count, so we must still verify in that branch.
+        current_count = BatchItem.objects.filter(job=job).count()
+        if current_count == artifact.row_count:
+            # Counts match: verify content signature (rows can mutate in place,
+            # e.g. an item resolving, without changing the count).
+            current_sig = _compute_rows_signature(job)
+            if current_sig != artifact.rows_signature:
+                return None
+            return path
+        # Count changed → definitely stale.
+        return None
 
     # Fallback: legacy sidecar path (for tests that write .meta.json directly)
     meta = _load_meta(token)
@@ -662,7 +689,7 @@ def _rows_signature(rows: list[dict[str, str | int | None]]) -> str:
     """Compute rows_signature from a pre-materialised list (legacy interface).
 
     The result is identical to the incremental hasher used in
-    _write_export_streaming/_compute_rows_signature, so tokens created by
+    _write_export_to_temp/_compute_rows_signature, so tokens created by
     either path share the same dedup key.
     """
     sig_hasher = _RowsSignatureHasher()

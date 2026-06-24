@@ -840,7 +840,10 @@ def test_cleanup_removes_expired_exports_and_uploads(tmp_path, monkeypatch, sett
     upload_job.refresh_from_db()
     assert upload_job.secret_hash == ""
     assert result.jobs_secrets_wiped == 1
-    assert result.exports_deleted == 2
+    # exports_deleted now counts EXPORTS pruned (one per token), not files.
+    assert result.exports_deleted == 1
+    # export_files_deleted counts individual files unlinked (meta + payload).
+    assert result.export_files_deleted == 2
     assert not old_export.exists()
     assert not old_meta.exists()
     assert fresh_export.exists()

@@ -31,7 +31,12 @@ logger = logging.getLogger(__name__)
 class CleanupResult:
     jobs_secrets_wiped: int
     jobs_deleted: int
+    # exports_deleted counts EXPORT ARTIFACTS pruned: one increment per pruned
+    # ExportArtifact row AND one per legacy sidecar-tracked export removed.  It
+    # does NOT count individual filesystem files (payload + sidecar) separately;
+    # those are tracked by export_files_deleted.
     exports_deleted: int
+    export_files_deleted: int = 0
 
 
 _EXPORT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -65,25 +70,34 @@ def _safe_export_payload_path(export_dir: Path, token: str, fmt: str) -> Path | 
     return payload_path
 
 
-def _cleanup_expired_exports(now: datetime, retention_days: int) -> int:
+def _cleanup_expired_exports(now: datetime, retention_days: int) -> tuple[int, int]:
+    """Prune expired exports.
+
+    Returns ``(artifacts_pruned, files_deleted)`` where ``artifacts_pruned`` is
+    the number of distinct exports removed (one per ExportArtifact row plus one
+    per legacy sidecar-tracked export) and ``files_deleted`` is the number of
+    individual filesystem files unlinked (payloads + sidecars).
+    """
     from apps.batches import exports
     from apps.batches.models import ExportArtifact
 
     export_dir = exports.EXPORT_DIR
-    deleted = 0
+    artifacts_pruned = 0
+    files_deleted = 0
+    pruned_tokens: set[str] = set()
     retained_payloads: set[Path] = set()
 
     # ── Phase 1: prune expired ExportArtifact rows (DB source of truth) ──────
     expired_artifacts = ExportArtifact.objects.filter(expires_at__lte=now)
     for artifact in expired_artifacts.iterator(chunk_size=500):
-        artifact_path = Path(artifact.path)
-        file_deleted = _delete_if_exists(artifact_path)
+        files_deleted += _delete_if_exists(Path(artifact.path))
         # Also delete the legacy sidecar if present
         if export_dir.exists():
             sidecar = export_dir / f"{artifact.token}.meta.json"
-            _delete_if_exists(sidecar)
+            files_deleted += _delete_if_exists(sidecar)
+        pruned_tokens.add(artifact.token)
         artifact.delete()
-        deleted += 1 + file_deleted
+        artifacts_pruned += 1
         logger.info(
             "Pruned expired export artifact token=%s fmt=%s expires_at=%s",
             artifact.token[:12],
@@ -93,13 +107,14 @@ def _cleanup_expired_exports(now: datetime, retention_days: int) -> int:
 
     # ── Phase 2: legacy sidecar-based cleanup (backward compat) ──────────────
     if not export_dir.exists():
-        return deleted
+        return artifacts_pruned, files_deleted
 
     cutoff = now - timedelta(days=retention_days)
 
     for meta_path in export_dir.glob("*.meta.json"):
         should_delete = False
         payload_path: Path | None = None
+        token: str | None = None
         try:
             raw = json.loads(meta_path.read_text())
             token = str(raw["token"])
@@ -112,10 +127,16 @@ def _cleanup_expired_exports(now: datetime, retention_days: int) -> int:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             should_delete = True
 
+        # Skip tokens already accounted for in Phase 1 (DB-tracked).
+        already_pruned = token is not None and token in pruned_tokens
+
         if should_delete:
-            deleted += _delete_if_exists(meta_path)
+            removed = _delete_if_exists(meta_path)
+            files_deleted += removed
             if payload_path is not None:
-                deleted += _delete_if_exists(payload_path)
+                files_deleted += _delete_if_exists(payload_path)
+            if not already_pruned and removed:
+                artifacts_pruned += 1
         elif payload_path is not None:
             retained_payloads.add(payload_path)
 
@@ -130,9 +151,9 @@ def _cleanup_expired_exports(now: datetime, retention_days: int) -> int:
             continue
         modified_at = datetime.fromtimestamp(payload_path.stat().st_mtime, tz=UTC)
         if modified_at < cutoff:
-            deleted += _delete_if_exists(payload_path)
+            files_deleted += _delete_if_exists(payload_path)
 
-    return deleted
+    return artifacts_pruned, files_deleted
 
 
 def cleanup_expired(actor: str = "system") -> CleanupResult:
@@ -167,12 +188,13 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
     )
     jobs_deleted, _ = delete_qs.delete()
 
-    exports_deleted = _cleanup_expired_exports(now, export_days)
+    exports_deleted, export_files_deleted = _cleanup_expired_exports(now, export_days)
 
     result = CleanupResult(
         jobs_secrets_wiped=secrets_wiped,
         jobs_deleted=jobs_deleted,
         exports_deleted=exports_deleted,
+        export_files_deleted=export_files_deleted,
     )
 
     SystemEvent.objects.create(
@@ -183,6 +205,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             "jobs_secrets_wiped": secrets_wiped,
             "jobs_deleted": jobs_deleted,
             "exports_deleted": exports_deleted,
+            "export_files_deleted": export_files_deleted,
             "upload_retention_days": upload_days,
             "job_retention_days": job_days,
             "export_retention_days": export_days,
