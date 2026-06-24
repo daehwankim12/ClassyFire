@@ -64,11 +64,13 @@ def test_documented_deploy_reruns_migrate_before_web_and_worker():
         assert positions == sorted(positions)
 
 
-def test_dockerfile_uses_uv_frozen_runtime_install():
+def test_dockerfile_uses_uv_locked_runtime_install():
     dockerfile = read_file("Dockerfile")
 
     assert "uv==0.11.21" in dockerfile
-    assert "uv sync --frozen" in dockerfile
+    # Gate 6 Task 2 switched --frozen → --locked (fail the build if the lockfile
+    # is out of date rather than silently using it).
+    assert "uv sync --locked" in dockerfile
     assert "--no-dev" in dockerfile
     assert "pip install --no-cache-dir ." not in dockerfile
     assert '".[dev]"' not in dockerfile
