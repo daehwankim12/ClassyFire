@@ -40,6 +40,22 @@ at `127.0.0.1:55432`.
 
 ---
 
+## Ingest Worker
+
+The ingest worker is a default (always-on, no profile required) Compose service
+that drains staged upload jobs by running `python manage.py process_jobs` in a
+restart loop.  It starts automatically with `docker compose up -d` and must be
+running for uploaded batches to be processed.  The service depends on `db`
+(healthy) and `migrate` (completed) before starting.
+
+```bash
+docker compose up -d           # ingest-worker starts alongside web
+docker compose logs -f ingest-worker
+docker compose restart ingest-worker
+```
+
+---
+
 ## Worker Management
 
 The classification worker is a Django management command that polls the

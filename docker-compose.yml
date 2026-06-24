@@ -154,6 +154,30 @@ services:
         condition: service_completed_successfully
     # NO ports: block — background process only
 
+  # ── Ingest Worker (default, always-on) ───────────────────────────────────
+  ingest-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      POSTGRES_HOST: db
+    command:
+      - python
+      - manage.py
+      - process_jobs
+    volumes:
+      - media_files:/app/media
+      - export_files:/app/export_files
+    networks:
+      - internal
+      - external
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
   # ── Cleanup (one-shot, manual profile) ───────────────────────────────────
   cleanup:
     build: .
