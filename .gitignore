@@ -71,6 +71,7 @@ local_settings.py
 # Project-specific
 .superpowers/
 .serena/
+.worktrees/
 
 # Database dumps
 *.sql
