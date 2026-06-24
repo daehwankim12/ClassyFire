@@ -336,9 +336,10 @@ def test_api_items_invalid_page_size_returns_400():
     rows = list(parse_text_input(ASPIRIN_SMILES))
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
+    # Pass secret via header; ?page_size= stays in query string
     response = client.get(
-        f"/api/jobs/{job.pk}/items",
-        {"secret": secret, "page_size": "abc"},
+        f"/api/jobs/{job.pk}/items?page_size=abc",
+        HTTP_X_JOB_SECRET=secret,
     )
     assert response.status_code == 400
     data = response.json()
@@ -351,9 +352,10 @@ def test_api_items_zero_page_size_does_not_crash():
     rows = list(parse_text_input(ASPIRIN_SMILES))
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
+    # Pass secret via header; ?page_size= stays in query string
     response = client.get(
-        f"/api/jobs/{job.pk}/items",
-        {"secret": secret, "page_size": "0"},
+        f"/api/jobs/{job.pk}/items?page_size=0",
+        HTTP_X_JOB_SECRET=secret,
     )
     assert response.status_code == 200
 

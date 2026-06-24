@@ -31,6 +31,7 @@ import functools
 import hashlib
 import io
 import logging
+import re
 import shutil
 import zipfile
 from collections.abc import Callable
@@ -783,3 +784,27 @@ def redact_for_log(value: str, *, max_chars: int = 16) -> str:
     if len(value) > max_chars:
         return f"{_REDACTED}:{len(value)}chars"
     return value
+
+
+class SecretRedactionFilter(logging.Filter):
+    """Logging filter that redacts job secrets and export tokens from log lines.
+
+    Replaces:
+    - ``?secret=<value>`` / ``&secret=<value>`` query parameters with
+      ``?secret=[REDACTED]`` / ``&secret=[REDACTED]``.
+    - ``/api/exports/<token>`` path segments with ``/api/exports/[REDACTED]``.
+
+    Attach to any handler that writes Django request/access log lines to
+    prevent plaintext secrets reaching log storage.
+    """
+
+    QUERY_SECRET_RE = re.compile(r"([?&]secret=)[^&\s]+")
+    EXPORT_PATH_RE = re.compile(r"(/api/exports/)[^/?\\s]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        message = self.QUERY_SECRET_RE.sub(r"\1[REDACTED]", message)
+        message = self.EXPORT_PATH_RE.sub(r"\1[REDACTED]", message)
+        record.msg = message
+        record.args = ()
+        return True
