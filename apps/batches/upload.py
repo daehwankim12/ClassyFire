@@ -296,7 +296,7 @@ def _build_sdf_row(buffer: list[str], row_index: int, overflowed: bool) -> dict:
             "row_index": row_index,
         }
 
-    result: dict = {"raw": block.strip(), "row_index": row_index}
+    result: dict = {"raw": block.rstrip("\r\n"), "row_index": row_index, "input_type": "SDF"}
     ext_id = _extract_sdf_external_id(block)
     if ext_id:
         result["external_id"] = ext_id

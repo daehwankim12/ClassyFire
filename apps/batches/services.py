@@ -403,6 +403,13 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
 _NO_LOOKUP_OVERRIDE = object()
 
 
+def _submitted_type_override(item: BatchItem) -> DetectedInputType | None:
+    """Return a DetectedInputType override from item.submitted_type, or None."""
+    if item.submitted_type in DetectedInputType.values:
+        return DetectedInputType(item.submitted_type)
+    return None
+
+
 def _process_item(
     item: BatchItem,
     *,
@@ -451,7 +458,11 @@ def _process_item(
             return BatchItemStatus.INVALID_INPUT
 
         # Step 1: Normalize
-        norm = normalize_row(item.original_input, external_id=item.external_id)
+        norm = normalize_row(
+            item.original_input,
+            type_override=_submitted_type_override(item),
+            external_id=item.external_id,
+        )
     else:
         norm = cast("NormalizedRow", norm_override)
     item.detected_type = norm.detected_type
@@ -684,7 +695,11 @@ def _process_chunk(
         except RowTooLongError:
             norms.append(None)
             continue
-        norm = normalize_row(item.original_input, external_id=item.external_id)
+        norm = normalize_row(
+            item.original_input,
+            type_override=_submitted_type_override(item),
+            external_id=item.external_id,
+        )
         norms.append(norm)
         if norm.inchikey and len(norm.inchikey) == 27 and norm.error is None:
             candidate_keys.append(norm.inchikey)

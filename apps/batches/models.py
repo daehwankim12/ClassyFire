@@ -158,6 +158,13 @@ class BatchItem(models.Model):
         choices=BatchItemStatus.choices,
         default=BatchItemStatus.PENDING_NORMALIZATION,
     )
+    submitted_type = models.CharField(
+        max_length=16,
+        choices=DetectedInputType.choices,
+        null=True,
+        blank=True,
+        help_text="Parser-supplied input type override, e.g. SDF from upload dispatch.",
+    )
     message = models.TextField(
         null=True, blank=True, help_text="Human-readable detail for the status."
     )

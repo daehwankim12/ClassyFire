@@ -85,6 +85,7 @@ def ingest_rows(
             row_order=row["row_index"],
             original_input=row["raw"],
             external_id=row.get("external_id"),
+            submitted_type=row.get("input_type") or None,
             status=BatchItemStatus.PENDING_NORMALIZATION,
         )
         chunk.append(item)
