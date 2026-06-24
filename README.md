@@ -38,21 +38,23 @@ DJANGO_SECRET_KEY=<50+-character_random_string>
 docker compose up -d
 ```
 
-This starts six containers:
+This starts seven services:
 
 | Service | Role |
 |---|---|
 | `db` | PostgreSQL 16 (internal only, no host port) |
+| `migrate` | One-shot Django migration runner |
 | `web` | Gunicorn (internal only, accessed via proxy) |
 | `worker` | Classification worker (`python manage.py runworker`) |
 | `backup` | Daily backup cron |
 | `proxy` | Caddy reverse proxy (publishes ports 80 and 443) |
 | `ngrok-agent` | Optional ngrok tunnel (requires NGROK_AUTHTOKEN) |
 
-### 4. Run migrations and collect static files
+`web` and `worker` wait for the one-shot `migrate` service before starting.
+
+### 4. Collect static files
 
 ```bash
-docker compose exec web python manage.py migrate
 docker compose exec web python manage.py collectstatic --noinput
 ```
 
@@ -218,14 +220,13 @@ Monitor circuit state on the `/stats/` page.
 # Pull latest code
 git pull origin main
 
-# Pull updated images
+# Pull updated images, then rebuild local app services
 docker compose pull
+docker compose build migrate web worker
 
-# Run migrations (safe on a live database)
-docker compose exec web python manage.py migrate
-
-# Restart application containers
-docker compose up -d --no-deps web worker
+# Rerun migrations with the rebuilt image, then recreate app containers
+docker compose up --force-recreate --abort-on-container-exit migrate
+docker compose up -d --build web worker
 ```
 
 ---
@@ -237,7 +238,7 @@ docker compose up -d --no-deps web worker
 | Worker not processing tasks | `docker compose logs worker`; check circuit state on `/stats/` |
 | Database connection errors | `docker compose ps db`; check `POSTGRES_*` vars in `.env` |
 | Remote API unreachable | Circuit breaker will self-heal; use **Retry deferred** if needed |
-| Disk full / upload rejected | `df -h /`; prune old backups; check disk guard threshold |
+| Disk full / upload rejected | `df -h /`; prune old backups and run `docker compose run --rm cleanup`; check disk guard threshold |
 | Missing classifications | Check NEED_STRUCTURE items; provide structures via the UI or API |
 
 See [docs/operations.md](docs/operations.md) for detailed procedures.
@@ -246,13 +247,14 @@ See [docs/operations.md](docs/operations.md) for detailed procedures.
 
 ## Development
 
-### Install dependencies
+### Install dependencies and run commands
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+UV_CACHE_DIR=/tmp/uv-cache-classyfire uv run --locked --extra dev python -m pytest --version
 ```
+
+The Makefile uses the same `uv run --locked --extra dev` workflow for tests,
+linting, formatting, and type checks.
 
 ### Run tests
 

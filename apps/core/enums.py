@@ -43,12 +43,17 @@ class BatchJobStatus(models.TextChoices):
 
     State machine (see docs/state-machines.md):
       PENDING → IN_PROGRESS → COMPLETE (all items resolved)
+                            ├→ COMPLETE_WITH_ACTION_REQUIRED (user action needed)
                             └→ FAILED   (unrecoverable error)
     """
 
     PENDING = "PENDING", "Pending"
     IN_PROGRESS = "IN_PROGRESS", "In progress"
     COMPLETE = "COMPLETE", "Complete"
+    COMPLETE_WITH_ACTION_REQUIRED = (
+        "COMPLETE_WITH_ACTION_REQUIRED",
+        "Complete with action required",
+    )
     FAILED = "FAILED", "Failed"
 
 

@@ -56,6 +56,11 @@ STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
     "DELAYED": [BatchItemStatus.REMOTE_DELAYED],
 }
 
+TERMINAL_JOB_STATUSES = (
+    BatchJobStatus.COMPLETE,
+    BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED,
+)
+
 
 # ---------------------------------------------------------------------------
 # Submit page
@@ -131,6 +136,18 @@ def _has_job_access(request: HttpRequest, job: BatchJob, secret: str | None) -> 
     return bool(check_password(secret, job.secret_hash))
 
 
+def _is_terminal_job(job: BatchJob) -> bool:
+    return job.status in TERMINAL_JOB_STATUSES
+
+
+def _blocking_pending_count(job: BatchJob) -> int:
+    pending_normalization = BatchItem.objects.filter(
+        job=job,
+        status=BatchItemStatus.PENDING_NORMALIZATION,
+    ).count()
+    return job.remote_pending_count + pending_normalization
+
+
 def job_claim_view(request: HttpRequest, job_id: str, secret: str) -> HttpResponse:
     """Exchange a one-time URL secret for a secretless job-access cookie."""
     job = get_object_or_404(BatchJob, pk=job_id)
@@ -164,7 +181,8 @@ def job_detail_view(
     paginator = Paginator(items_qs, PAGE_SIZE)
     page_obj = paginator.get_page(page_number)
 
-    job_complete = job.status == BatchJobStatus.COMPLETE
+    job_complete = _is_terminal_job(job)
+    blocking_pending_count = _blocking_pending_count(job)
 
     return render(
         request,
@@ -178,6 +196,7 @@ def job_detail_view(
             "status_filter": status_filter,
             "search": search,
             "job_complete": job_complete,
+            "blocking_pending_count": blocking_pending_count,
         },
     )
 
@@ -247,7 +266,8 @@ def item_table_partial_view(
     paginator = Paginator(items_qs, PAGE_SIZE)
     page_obj = paginator.get_page(page_number)
 
-    job_complete = job.status == BatchJobStatus.COMPLETE
+    job_complete = _is_terminal_job(job)
+    blocking_pending_count = _blocking_pending_count(job)
 
     return render(
         request,
@@ -261,6 +281,7 @@ def item_table_partial_view(
             "status_filter": status_filter,
             "search": search,
             "job_complete": job_complete,
+            "blocking_pending_count": blocking_pending_count,
         },
     )
 
@@ -367,7 +388,7 @@ def stats_view(request: HttpRequest) -> HttpResponse:
     """GET /stats/ — DB status page with aggregate counts."""
     jobs_qs = BatchJob.objects.aggregate(
         total=Count("pk"),
-        complete=Count("pk", filter=Q(status=BatchJobStatus.COMPLETE)),
+        complete=Count("pk", filter=Q(status__in=TERMINAL_JOB_STATUSES)),
         in_progress=Count("pk", filter=Q(status=BatchJobStatus.IN_PROGRESS)),
         pending=Count("pk", filter=Q(status=BatchJobStatus.PENDING)),
         failed=Count("pk", filter=Q(status=BatchJobStatus.FAILED)),

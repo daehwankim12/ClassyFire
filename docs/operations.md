@@ -261,16 +261,17 @@ Monitor disk usage:
 df -h /
 ```
 
-Free space by removing old backups:
+Backup retention is applied after every backup run:
 
 ```bash
-make backup-prune
+docker compose exec web python manage.py run_backup
 ```
 
-Or run the retention policy manually:
+Expired upload secrets, completed jobs, and export cache files can be removed
+manually:
 
 ```bash
-docker compose exec web python manage.py prune_backups
+docker compose run --rm cleanup
 ```
 
 ---
@@ -307,16 +308,15 @@ docker compose exec web python manage.py admin_resume_remote
    ```bash
    git pull origin main
    docker compose pull
+   docker compose build migrate web worker
    ```
-2. Run migrations (safe to run against a running database):
+2. Force-recreate the one-shot migration service with the rebuilt image, then
+   recreate application services:
    ```bash
-   docker compose exec web python manage.py migrate
+   docker compose up --force-recreate --abort-on-container-exit migrate
+   docker compose up -d --build web worker
    ```
-3. Restart services:
-   ```bash
-   docker compose up -d --no-deps web worker
-   ```
-4. Verify: check `/stats/` and run the backup smoke test.
+3. Verify: check `/stats/` and run the backup smoke test.
 
 ---
 
@@ -344,6 +344,6 @@ when **Retry deferred** is triggered manually.
 ### Disk full
 
 1. Check disk: `df -h /`
-2. Prune old backups: `docker compose exec web python manage.py prune_backups`
-3. Remove old export files: `docker compose exec web python manage.py cleanup_exports`
+2. Run backup retention: `docker compose exec web python manage.py run_backup`
+3. Remove expired uploads and exports: `docker compose run --rm cleanup`
 4. Consider moving the backup directory to a larger volume

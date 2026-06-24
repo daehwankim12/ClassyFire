@@ -17,6 +17,11 @@ def load_compose():
         return yaml.safe_load(f)
 
 
+def read_file(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+
+
 def test_web_has_external_network():
     compose = load_compose()
     web_networks = compose["services"]["web"]["networks"]
@@ -27,6 +32,46 @@ def test_worker_has_external_network():
     compose = load_compose()
     worker_networks = compose["services"]["worker"]["networks"]
     assert "external" in worker_networks
+
+
+def test_compose_web_and_worker_wait_for_migrate():
+    compose = load_compose()
+    services = compose["services"]
+
+    assert "migrate" in services
+    assert services["migrate"]["command"] == ["python", "manage.py", "migrate", "--noinput"]
+    assert services["migrate"]["restart"] == "no"
+
+    for service_name in ["web", "worker"]:
+        depends_on = services[service_name]["depends_on"]
+        assert depends_on["db"]["condition"] == "service_healthy"
+        assert depends_on["migrate"]["condition"] == "service_completed_successfully"
+
+
+def test_documented_deploy_reruns_migrate_before_web_and_worker():
+    readme = read_file("README.md")
+    operations = read_file("docs/operations.md")
+
+    expected_commands = [
+        "docker compose build migrate web worker",
+        "docker compose up --force-recreate --abort-on-container-exit migrate",
+        "docker compose up -d --build web worker",
+    ]
+
+    for document in [readme, "\n".join(line.strip() for line in operations.splitlines())]:
+        positions = [document.find(command) for command in expected_commands]
+        assert all(position >= 0 for position in positions)
+        assert positions == sorted(positions)
+
+
+def test_dockerfile_uses_uv_frozen_runtime_install():
+    dockerfile = read_file("Dockerfile")
+
+    assert "uv==0.11.21" in dockerfile
+    assert "uv sync --frozen" in dockerfile
+    assert "--no-dev" in dockerfile
+    assert "pip install --no-cache-dir ." not in dockerfile
+    assert '".[dev]"' not in dockerfile
 
 
 def test_db_no_external_network():

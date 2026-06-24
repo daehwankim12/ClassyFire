@@ -471,9 +471,9 @@ def test_job_counters_mixed():
     assert job.invalid_count == 1
     assert job.need_structure_count == 1
     assert job.remote_pending_count == 0
-    # NEED_STRUCTURE items do NOT block COMPLETE — only remote_pending items do.
-    # This job has no in-flight remote work, so status is COMPLETE.
-    assert job.status == BatchJobStatus.COMPLETE
+    # NEED_STRUCTURE items do not block processing, but the job is not plain
+    # COMPLETE because user action is still required.
+    assert job.status == BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED
 
 
 @pytest.mark.django_db(transaction=True)
@@ -490,6 +490,211 @@ def test_job_counter_remote_pending():
     assert job.total_count == 1
     assert job.remote_pending_count == 1
     assert job.status == BatchJobStatus.IN_PROGRESS
+
+
+@pytest.mark.django_db(transaction=True)
+def test_pending_normalization_keeps_job_processing():
+    """PENDING_NORMALIZATION is blocking work, so the job is not terminal."""
+    from django.utils import timezone
+
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import recompute_job_counters
+    from apps.core.enums import BatchItemStatus, BatchJobStatus, DetectedInputType
+
+    completed_at = timezone.now()
+    job = BatchJob.objects.create(
+        secret_hash="abc123",
+        status=BatchJobStatus.COMPLETE,
+        completed_at=completed_at,
+    )
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=ASPIRIN_SMILES,
+        detected_type=DetectedInputType.SMILES,
+        status=BatchItemStatus.PENDING_NORMALIZATION,
+    )
+
+    recompute_job_counters(job.pk)
+
+    job.refresh_from_db()
+    assert job.total_count == 1
+    assert job.completed_count == 0
+    assert job.status == BatchJobStatus.IN_PROGRESS
+    assert job.completed_at is None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_need_structure_only_job_is_action_required_not_plain_complete():
+    """A job with only NEED_STRUCTURE rows is terminal but requires user action."""
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import recompute_job_counters
+    from apps.core.enums import BatchItemStatus, DetectedInputType
+
+    job = BatchJob.objects.create(secret_hash="abc123")
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=GHOST_INCHIKEY,
+        detected_type=DetectedInputType.INCHIKEY,
+        status=BatchItemStatus.NEED_STRUCTURE,
+    )
+
+    recompute_job_counters(job.pk)
+
+    job.refresh_from_db()
+    assert job.total_count == 1
+    assert job.need_structure_count == 1
+    assert job.completed_count == 0
+    assert job.status == "COMPLETE_WITH_ACTION_REQUIRED"
+    assert job.completed_at is not None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_recompute_counters_locks_job_row(monkeypatch):
+    """Counter recompute must lock the BatchJob row before deriving counters."""
+    from django.db.models import QuerySet
+
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import recompute_job_counters
+    from apps.core.enums import BatchItemStatus, DetectedInputType
+
+    job = BatchJob.objects.create(secret_hash="abc123")
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=ASPIRIN_SMILES,
+        detected_type=DetectedInputType.SMILES,
+        status=BatchItemStatus.FOUND_LIVE_CACHE,
+    )
+
+    original = QuerySet.select_for_update
+    calls: list[str] = []
+
+    def spy_select_for_update(self, *args, **kwargs):
+        if self.model is BatchJob:
+            calls.append(self.model.__name__)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", spy_select_for_update)
+
+    recompute_job_counters(job.pk)
+
+    assert calls == ["BatchJob"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_action_required_job_is_terminal_for_detail_and_partial(monkeypatch):
+    from django.test import RequestFactory
+
+    from apps.batches import views
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.core.enums import BatchItemStatus, BatchJobStatus, DetectedInputType
+
+    captured: list[dict] = []
+
+    def fake_render(_request, _template, context):
+        captured.append(context)
+        from django.http import HttpResponse
+
+        return HttpResponse("ok")
+
+    monkeypatch.setattr(views, "_has_job_access", lambda _request, _job, _secret: True)
+    monkeypatch.setattr(views, "render", fake_render)
+
+    job = BatchJob.objects.create(
+        secret_hash="abc123",
+        status=BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED,
+        total_count=1,
+        need_structure_count=1,
+    )
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=GHOST_INCHIKEY,
+        detected_type=DetectedInputType.INCHIKEY,
+        status=BatchItemStatus.NEED_STRUCTURE,
+    )
+    request = RequestFactory().get("/")
+
+    views.job_detail_view(request, str(job.pk))
+    views.item_table_partial_view(request, str(job.pk))
+
+    assert [context["job_complete"] for context in captured] == [True, True]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stats_counts_action_required_jobs_as_complete(monkeypatch):
+    from django.test import RequestFactory
+
+    from apps.batches import views
+    from apps.batches.models import BatchJob
+    from apps.core.enums import BatchJobStatus
+
+    captured: dict = {}
+
+    def fake_render(_request, _template, context):
+        captured.update(context)
+        from django.http import HttpResponse
+
+        return HttpResponse("ok")
+
+    monkeypatch.setattr(views, "render", fake_render)
+
+    BatchJob.objects.create(secret_hash="complete", status=BatchJobStatus.COMPLETE)
+    BatchJob.objects.create(
+        secret_hash="action-required",
+        status=BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED,
+    )
+
+    views.stats_view(RequestFactory().get("/stats/"))
+
+    assert captured["jobs_complete"] == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_job_detail_pending_count_includes_normalization(monkeypatch):
+    from django.test import RequestFactory
+
+    from apps.batches import views
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.core.enums import BatchItemStatus, BatchJobStatus, DetectedInputType
+
+    captured: dict = {}
+
+    def fake_render(_request, _template, context):
+        captured.update(context)
+        from django.http import HttpResponse
+
+        return HttpResponse("ok")
+
+    monkeypatch.setattr(views, "_has_job_access", lambda _request, _job, _secret: True)
+    monkeypatch.setattr(views, "render", fake_render)
+
+    job = BatchJob.objects.create(
+        secret_hash="abc123",
+        status=BatchJobStatus.IN_PROGRESS,
+        total_count=2,
+        remote_pending_count=1,
+    )
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=ASPIRIN_SMILES,
+        detected_type=DetectedInputType.SMILES,
+        status=BatchItemStatus.PENDING_NORMALIZATION,
+    )
+    BatchItem.objects.create(
+        job=job,
+        row_order=1,
+        original_input=GHOST_INCHIKEY,
+        detected_type=DetectedInputType.INCHIKEY,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+
+    views.job_detail_view(RequestFactory().get("/"), str(job.pk))
+
+    assert captured["blocking_pending_count"] == 2
 
 
 @pytest.mark.django_db(transaction=True)

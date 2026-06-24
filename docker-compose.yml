@@ -67,6 +67,28 @@ services:
       retries: 5
     # NO ports: block — db is internal-only
 
+  # ── Migrations (one-shot) ────────────────────────────────────────────────
+  migrate:
+    build: .
+    restart: "no"
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      POSTGRES_HOST: db
+    command:
+      - python
+      - manage.py
+      - migrate
+      - "--noinput"
+    volumes:
+      - static_files:/app/staticfiles
+      - media_files:/app/media
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+
   # ── Web (Gunicorn) ────────────────────────────────────────────────────────
   web:
     build: .
@@ -94,6 +116,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     expose:
       - "8000"
     # NO ports: block — accessed only through proxy
@@ -119,7 +143,32 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     # NO ports: block — background process only
+
+  # ── Cleanup (one-shot, manual profile) ───────────────────────────────────
+  cleanup:
+    build: .
+    restart: "no"
+    profiles: ["ops"]
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+      POSTGRES_HOST: db
+    command:
+      - python
+      - manage.py
+      - cleanup_expired
+    volumes:
+      - media_files:/app/media
+    networks:
+      - internal
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # ── Backup ────────────────────────────────────────────────────────────────
   backup:

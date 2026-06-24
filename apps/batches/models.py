@@ -22,7 +22,7 @@ class BatchJob(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     secret_hash = models.TextField(help_text="Hash of the per-job access secret.")
     status = models.CharField(
-        max_length=16,
+        max_length=32,
         choices=BatchJobStatus.choices,
         default=BatchJobStatus.PENDING,
         help_text="Coarse job lifecycle status.",
