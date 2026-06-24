@@ -799,7 +799,7 @@ class SecretRedactionFilter(logging.Filter):
     """
 
     QUERY_SECRET_RE = re.compile(r"([?&]secret=)[^&\s]+")
-    EXPORT_PATH_RE = re.compile(r"(/api/exports/)[^/?\\s]+")
+    EXPORT_PATH_RE = re.compile(r"(/api/exports/)[^/?\s]+")
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()

@@ -72,12 +72,17 @@ def test_sensitive_log_filter_redacts_query_and_token(caplog):
         level=logging.INFO,
         pathname=__file__,
         lineno=1,
-        msg="GET /api/jobs/abc?secret=plain-secret /api/exports/export-token",
+        # The export token deliberately contains 's' and is followed by a
+        # trailing " HTTP/1.1" — a regex that excludes the literal 's' (or that
+        # eats whitespace) would leak part of a real secrets.token_urlsafe value.
+        msg="GET /api/jobs/abc?secret=plain-secret /api/exports/s3cret-token-Xs HTTP/1.1",
         args=(),
         exc_info=None,
     )
     SecretRedactionFilter().filter(record)
     rendered = record.getMessage()
     assert "plain-secret" not in rendered
-    assert "export-token" not in rendered
+    assert "s3cret-token-Xs" not in rendered
     assert "[REDACTED]" in rendered
+    # The redaction must stop at the path boundary, not consume the HTTP version.
+    assert "HTTP/1.1" in rendered
