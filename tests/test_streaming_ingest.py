@@ -13,9 +13,11 @@ All tests run against the real DB.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import Client
+from django.test import Client, override_settings
 
 ASPIRIN_SMILES = "CC(=O)Oc1ccccc1C(=O)O"
 ASPIRIN_INCHIKEY = "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"
@@ -429,3 +431,241 @@ def test_bulk_lookup_runs_single_query_for_chunk(monkeypatch):
     # worker path.
     assert calls["bulk"] == 1
     assert calls["single"] == 0
+
+
+# ---------------------------------------------------------------------------
+# F-11: deferred-processing mode (INGEST_DEFER_HEAVY_PROCESSING=True)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+@override_settings(INGEST_DEFER_HEAVY_PROCESSING=True)
+def test_deferred_post_returns_immediately_items_pending():
+    """(a) With the flag True, the HTTP POST returns WITHOUT running heavy work:
+    items are still PENDING_NORMALIZATION and the job is not COMPLETE."""
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.core.enums import BatchItemStatus, BatchJobStatus, BatchProcessingState
+
+    client = Client()
+    resp = client.post(
+        "/api/jobs",
+        data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": "false"}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 201, resp.content
+    job = BatchJob.objects.get(pk=resp.json()["job_id"])
+
+    # HTTP did NOT block on normalization: the item is staged, not resolved.
+    item = BatchItem.objects.filter(job=job).get()
+    assert item.status == BatchItemStatus.PENDING_NORMALIZATION
+    assert item.inchikey is None
+    # Job is parked in a claimable parsing state, not yet COMPLETE.
+    assert job.processing_state == BatchProcessingState.PARSING
+    assert job.status == BatchJobStatus.PENDING
+
+
+@pytest.mark.django_db(transaction=True)
+@override_settings(INGEST_DEFER_HEAVY_PROCESSING=True)
+def test_deferred_worker_drains_to_same_result_as_sync():
+    """(b) Running the durable worker drains the deferred job to the SAME final
+    statuses + pins as the synchronous path."""
+    import datetime as dt
+    from datetime import datetime
+
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import create_job, run_pending_jobs
+    from apps.classifications.models import ClassyfireLive
+    from apps.core.enums import BatchJobStatus
+
+    ClassyfireLive.objects.create(
+        inchikey=ASPIRIN_INCHIKEY,
+        source_type="WISHART_LIVE_QUERY",
+        source_priority=100,
+        retrieved_at=datetime(2024, 6, 1, 12, 0, 0, tzinfo=dt.UTC),
+    )
+
+    # Synchronous reference (flag is ignored by create_job — it always processes).
+    ref_job, _ = create_job([{"raw": ASPIRIN_SMILES, "row_index": 0}], remote_enabled=False)
+    ref_item = BatchItem.objects.filter(job=ref_job).get()
+
+    # Deferred POST then worker drain.
+    client = Client()
+    resp = client.post(
+        "/api/jobs",
+        data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": "false"}),
+        content_type="application/json",
+    )
+    job = BatchJob.objects.get(pk=resp.json()["job_id"])
+    run_pending_jobs("drain-worker", max_jobs=10)
+    job.refresh_from_db()
+    deferred_item = BatchItem.objects.filter(job=job).get()
+
+    assert deferred_item.status == ref_item.status
+    assert deferred_item.inchikey == ref_item.inchikey == ASPIRIN_INCHIKEY
+    assert (
+        deferred_item.classification_snapshot["inchikey"]
+        == ref_item.classification_snapshot["inchikey"]
+    )
+    assert (
+        deferred_item.classification_snapshot["tier"]
+        == ref_item.classification_snapshot["tier"]
+    )
+    assert job.status == BatchJobStatus.COMPLETE
+
+
+@pytest.mark.django_db(transaction=True)
+@override_settings(INGEST_DEFER_HEAVY_PROCESSING=True)
+def test_deferred_route_does_not_materialize_whole_upload(monkeypatch):
+    """(c) The deferred route must STREAM rows into staging — it must NOT build
+    the whole upload into a list. We forbid list() over the combined iterator by
+    asserting create_job_records_streaming is used (not create_job_under_quota's
+    list path) and that items are staged from a lazy generator."""
+    from apps.batches import services
+    from apps.core import security
+
+    used = {"streaming": False, "sync_list": False}
+    orig_stream = services.create_job_records_streaming
+
+    def spy_stream(row_iter, **kwargs):
+        # Prove the argument is a lazy generator, not a materialized list.
+        import types
+
+        used["streaming"] = isinstance(row_iter, types.GeneratorType)
+        return orig_stream(row_iter, **kwargs)
+
+    def fail_sync(*_a, **_k):
+        used["sync_list"] = True
+        raise AssertionError("deferred path must not call create_job_under_quota")
+
+    monkeypatch.setattr(services, "create_job_records_streaming", spy_stream)
+    monkeypatch.setattr(security, "create_job_under_quota", fail_sync)
+
+    csv = ("smiles\n" + "\n".join([ASPIRIN_SMILES] * 50) + "\n").encode()
+    upload = SimpleUploadedFile("big.csv", csv, content_type="text/csv")
+    client = Client()
+    resp = client.post(
+        "/", {"input_file": upload, "text_input": "", "remote_enabled": "false"}
+    )
+    assert resp.status_code in (302, 303), resp.content
+    assert used["streaming"] is True, "deferred staging must consume a lazy generator"
+    assert used["sync_list"] is False
+
+
+@pytest.mark.django_db(transaction=True)
+@override_settings(INGEST_DEFER_HEAVY_PROCESSING=True, MAX_ROWS_PER_JOB=5)
+def test_deferred_row_cap_enforced_midstream():
+    """The deferred staging path enforces MAX_ROWS_PER_JOB mid-stream (413) and
+    does not persist a partial job."""
+    from apps.batches.models import BatchJob
+
+    text = "\n".join([ASPIRIN_SMILES] * 20)
+    client = Client()
+    resp = client.post(
+        "/api/jobs",
+        data=json.dumps({"text_input": text, "remote_enabled": "false"}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 413, resp.content
+    # No job persisted (rolled back).
+    assert BatchJob.objects.count() == 0
+
+
+# ---------------------------------------------------------------------------
+# F-11: TRUE crash + reclaim resume (real claim path, not state mutation)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_true_crash_and_reclaim_resumes_without_double_processing(monkeypatch):
+    """Claim a job, process+commit the FIRST chunk, then simulate a crash by
+    abandoning the run mid-job (job left in a claimable LOCAL_LOOKUP state with
+    items still PENDING_NORMALIZATION). RE-CLAIM via the real claim path and
+    assert the job completes with NO double-processing: usage counts, compounds,
+    and job counters are all correct with no duplicates."""
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import (
+        _process_chunk,
+        claim_job_for_processing,
+        create_job_records,
+        process_claimed_job,
+    )
+    from apps.compounds.models import CompoundStructure, CompoundUsage
+    from apps.core.enums import BatchItemStatus, BatchProcessingState
+
+    # 5 distinct ethanol rows (same compound) so usage count is a precise
+    # double-processing detector: each row increments usage exactly once.
+    rows = [{"raw": ETHANOL_SMILES, "row_index": i} for i in range(5)]
+    job, _ = create_job_records(rows, remote_enabled=False)
+
+    # --- Worker A claims the job and processes ONLY the first chunk, commits,
+    #     then "crashes" (returns without finishing the rest). ---
+    claimed = claim_job_for_processing("worker-A")
+    assert claimed is not None and claimed.pk == job.pk
+
+    first_chunk = list(
+        BatchItem.objects.filter(
+            job=job, status=BatchItemStatus.PENDING_NORMALIZATION
+        ).order_by("row_order")[:2]
+    )
+    BatchJob.objects.filter(pk=job.pk).update(
+        processing_state=BatchProcessingState.LOCAL_LOOKUP
+    )
+    _process_chunk(first_chunk, remote_enabled=False)
+    BatchJob.objects.filter(pk=job.pk).update(processed_through_row_order=1)
+    # CRASH: worker A dies here. The job stays LOCAL_LOOKUP (claimable), three
+    # items remain PENDING_NORMALIZATION, the lease belongs to the dead worker.
+
+    job.refresh_from_db()
+    assert job.processing_state == BatchProcessingState.LOCAL_LOOKUP
+    assert (
+        BatchItem.objects.filter(
+            job=job, status=BatchItemStatus.PENDING_NORMALIZATION
+        ).count()
+        == 3
+    )
+    usage_after_crash = CompoundUsage.objects.get(inchikey=ETHANOL_INCHIKEY)
+    assert usage_after_crash.seen_count == 2  # only the first chunk's 2 rows
+
+    # --- Worker B RE-CLAIMS via the real claim path and finishes the job. ---
+    reclaimed = claim_job_for_processing("worker-B")
+    assert reclaimed is not None and reclaimed.pk == job.pk
+    assert reclaimed.claimed_by == "worker-B"
+    assert reclaimed.claim_lease_version == claimed.claim_lease_version + 1
+    process_claimed_job(reclaimed)
+
+    # --- All five rows resolved, exactly once each. ---
+    items = list(BatchItem.objects.filter(job=job).order_by("row_order"))
+    assert all(it.status == BatchItemStatus.REMOTE_DELAYED for it in items)
+    usage = CompoundUsage.objects.get(inchikey=ETHANOL_INCHIKEY)
+    assert usage.seen_count == 5, "usage must be incremented once per row (no double)"
+    # Exactly one compound row (no duplicates from the resumed run).
+    assert CompoundStructure.objects.filter(inchikey=ETHANOL_INCHIKEY).count() == 1
+
+    job.refresh_from_db()
+    assert job.total_count == 5
+    assert job.processing_state in (
+        BatchProcessingState.COMPLETE,
+        BatchProcessingState.REMOTE_PENDING,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MINOR-1: JSON remote_enabled="" must stay truthy (only multipart treats ""→False)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db(transaction=True)
+def test_json_remote_enabled_empty_string_stays_enabled():
+    """A JSON client sending remote_enabled="" must NOT be silently flipped to
+    False (prior behavior preserved); only multipart absent-checkbox "" → False."""
+    from apps.batches.models import BatchJob
+
+    client = Client()
+    resp = client.post(
+        "/api/jobs",
+        data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": ""}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 201, resp.content
+    job = BatchJob.objects.get(pk=resp.json()["job_id"])
+    assert job.remote_enabled is True

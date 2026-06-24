@@ -87,6 +87,31 @@ _CONTENT_TYPE_FORMATS: dict[str, UploadFormat] = {
 }
 
 
+def iter_combined_rows(
+    text_rows: Iterator[dict],
+    file: IO[bytes] | None,
+    *,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> Iterator[dict]:
+    """Lazily chain text-input rows then file rows with continuous row_index.
+
+    Used by the upload routes so the DEFERRED path streams rows straight into
+    the staging insert without ever building the full list. The synchronous path
+    wraps this in ``list(...)`` for the existing quota signature.
+    """
+    next_index = 0
+    for row in text_rows:
+        yield {**row, "row_index": next_index}
+        next_index += 1
+    if file is not None:
+        for row in iter_upload_rows(
+            file, filename=filename, content_type=content_type
+        ):
+            yield {**row, "row_index": next_index}
+            next_index += 1
+
+
 def detect_upload_format(
     filename: str | None,
     content_type: str | None,

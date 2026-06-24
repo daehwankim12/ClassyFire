@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 
+from django.conf import settings
 from django.contrib.auth.hashers import check_password
 from django.core.paginator import Paginator
 from django.db.models import Count, Q, QuerySet
@@ -28,7 +29,7 @@ from apps.batches.services import (
     StructureSubmissionError,
     submit_structure_for_item,
 )
-from apps.batches.upload import iter_upload_rows
+from apps.batches.upload import iter_combined_rows
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
@@ -38,6 +39,7 @@ from apps.core.security import (
     request_has_job_access_cookie,
     require_shared_access_web,
     set_job_access_cookie,
+    stage_job_under_quota,
 )
 
 PAGE_SIZE = 100
@@ -76,11 +78,9 @@ def submit_view(request: HttpRequest) -> HttpResponse:
         remote_enabled_str = request.POST.get("remote_enabled", "")
         remote_enabled = remote_enabled_str.lower() in ("on", "true", "1", "yes")
 
-        rows = list(parse_text_input(text_input))
-
         # Handle file upload — BOUNDED STREAMING parse (F-01). The uploaded file
         # is dispatched on suffix+content-type and parsed record-by-record via
-        # iter_upload_rows; we NEVER file.read() the whole upload.
+        # iter_combined_rows; we NEVER file.read() the whole upload.
         file = request.FILES.get("input_file")
         if file:
             # Reject oversize uploads before reading content.
@@ -95,21 +95,33 @@ def submit_view(request: HttpRequest) -> HttpResponse:
                     {"error": str(exc)},
                     status=413,
                 )
-            # Re-index parsed file rows to continue after any text_input rows,
-            # preserving each parser row's provenance (external_id, raw input).
-            offset = len(rows)
-            for row in iter_upload_rows(
-                file,
-                filename=file.name,
-                content_type=getattr(file, "content_type", None),
-            ):
-                rows.append({**row, "row_index": row["row_index"] + offset})
 
-        job, plaintext_secret, quota_error = create_job_under_quota(
-            request,
-            rows,
-            remote_enabled=remote_enabled,
+        # Lazily chain text-input + file rows, re-indexed continuously and with
+        # provenance (external_id, raw input) preserved.
+        row_iter = iter_combined_rows(
+            parse_text_input(text_input),
+            file,
+            filename=file.name if file else None,
+            content_type=getattr(file, "content_type", None) if file else None,
         )
+
+        if getattr(settings, "INGEST_DEFER_HEAVY_PROCESSING", False):
+            # DEFERRED mode (F-11): STAGE items only and RETURN immediately;
+            # the durable `process_jobs` worker drains the job. The row iterator
+            # is consumed straight into the staging insert — no full list.
+            job, plaintext_secret, quota_error = stage_job_under_quota(
+                request,
+                row_iter,
+                remote_enabled=remote_enabled,
+            )
+        else:
+            # SYNCHRONOUS mode (default): process inline so results are ready on
+            # return (preserves existing immediate-result behavior).
+            job, plaintext_secret, quota_error = create_job_under_quota(
+                request,
+                list(row_iter),
+                remote_enabled=remote_enabled,
+            )
         if quota_error is not None:
             quota_payload = json.loads(quota_error.content.decode("utf-8"))
             return render(

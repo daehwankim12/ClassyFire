@@ -321,8 +321,21 @@ still `PENDING_NORMALIZATION`):
 still `PENDING_NORMALIZATION`: a crashed/restarted worker re-claims the job and
 reprocesses ONLY those items, never double-processing already-resolved rows. The
 synchronous entry point `process_job_items(job)` drives the identical pipeline
-inline (used by the upload routes and unit tests); `manage.py process_jobs`
-claims + drives jobs durably.
+inline (used by the synchronous upload mode and unit tests); `manage.py
+process_jobs` claims + drives jobs durably.
+
+**Two upload-route modes (`INGEST_DEFER_HEAVY_PROCESSING`).** The web
+`submit_view` and API `create_job_view` run in one of two modes, selected by the
+boolean setting (env `INGEST_DEFER_HEAVY_PROCESSING`, default **False**):
+
+| Mode | Setting | Route behavior |
+| --- | --- | --- |
+| Synchronous (default) | `False` | Route parses (streaming) → `create_job_under_quota` stages items AND runs `process_job_items` inline → returns with the job already resolved. Preserves the existing immediate-result contract. |
+| Deferred | `True` | Route parses (streaming) → `stage_job_under_quota` consumes the row *iterator* straight into BatchItems (no full row-list materialization) and RETURNS immediately with the job in `PARSING` and items `PENDING_NORMALIZATION`. The durable `process_jobs` worker then claims + drains it to the SAME final statuses/pins. |
+
+In deferred mode the per-job `MAX_ROWS_PER_JOB` cap is enforced **mid-stream**
+(`RowCapExceededError` → 413, transaction rolled back, no partial job); the
+daily row cap is re-checked once the true streamed count is known.
 
 ---
 

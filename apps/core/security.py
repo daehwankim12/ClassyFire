@@ -505,6 +505,81 @@ def create_job_under_quota(
     return job, plaintext_secret, None
 
 
+def stage_job_under_quota(
+    request: HttpRequest,
+    row_iter: object,
+    *,
+    remote_enabled: bool,
+) -> tuple[BatchJob | None, str, JsonResponse | None]:
+    """Stage a job WITHOUT running heavy processing (deferred ingest path, F-11).
+
+    Streams the parser ``row_iter`` straight into BatchItems via
+    ``create_job_records_streaming`` — the whole row list is never materialised —
+    leaving the job in the claimable PARSING state for the durable
+    ``process_jobs`` worker. The HTTP request returns immediately.
+
+    Quota controls that need a row count up front (max-rows, daily cap) are
+    enforced against the actual streamed count: per-job ``MAX_ROWS_PER_JOB`` is a
+    hard mid-stream cap (rolls back + 413); the daily cap is re-checked after the
+    real count is known and the job is rolled back if it would be exceeded.
+    """
+    from apps.batches import services
+    from apps.batches.models import BatchQuotaEvent
+    from apps.batches.services import RowCapExceededError
+
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+    max_rows = int(getattr(settings, "MAX_ROWS_PER_JOB", 10_000))
+    daily_cap = int(getattr(settings, "JOB_CREATE_DAILY_ROW_CAP", 100_000))
+    day_ago = timezone.now() - timedelta(days=1)
+
+    try:
+        with transaction.atomic():
+            _acquire_quota_advisory_locks(
+                BatchQuotaEvent.KIND_JOB_CREATE,
+                principal,
+                ip_address,
+            )
+            # Non-row-count controls (disk, rate, active cap) up front; the
+            # row-count-dependent caps are enforced after streaming.
+            quota_error = validate_job_create_controls(request, 0)
+            if quota_error is not None:
+                return None, "", quota_error
+
+            job, plaintext_secret, row_count = services.create_job_records_streaming(
+                row_iter,  # type: ignore[arg-type]
+                remote_enabled=remote_enabled,
+                max_rows=max_rows,
+            )
+
+            used_rows = (
+                BatchQuotaEvent.objects.filter(
+                    kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                    created_at__gte=day_ago,
+                    principal=principal,
+                ).aggregate(total=Sum("row_count"))["total"]
+                or 0
+            )
+            if used_rows + row_count > daily_cap:
+                transaction.set_rollback(True)
+                return None, "", _quota_response("Daily row quota exceeded.")
+
+            BatchQuotaEvent.objects.create(
+                kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                principal=principal,
+                ip_address=ip_address,
+                row_count=row_count,
+            )
+    except RowCapExceededError as exc:
+        return None, "", _quota_response(
+            f"Job has more than {exc.max_rows} rows; the maximum is {exc.max_rows}.",
+            status=413,
+        )
+
+    # NB: no process_job_items — the durable worker drains the PARSING job.
+    return job, plaintext_secret, None
+
+
 def record_job_create_event(request: HttpRequest, row_count: int) -> None:
     from apps.batches.models import BatchQuotaEvent
 

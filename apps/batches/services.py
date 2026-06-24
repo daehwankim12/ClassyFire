@@ -846,6 +846,44 @@ def create_job_records(
     return job, plaintext_secret
 
 
+class RowCapExceededError(ValueError):
+    """The streamed upload exceeded the per-job row cap mid-stream."""
+
+    def __init__(self, max_rows: int) -> None:
+        self.max_rows = max_rows
+        super().__init__(f"Job exceeds the maximum of {max_rows} rows.")
+
+
+def create_job_records_streaming(
+    rows: Iterable[dict],
+    *,
+    remote_enabled: bool = True,
+    max_rows: int | None = None,
+) -> tuple[BatchJob, str, int]:
+    """Create a BatchJob and STREAM-ingest its rows, returning the row count.
+
+    For the deferred (HTTP-returns-immediately) path: the parser iterator is
+    consumed lazily into bounded ``bulk_create`` chunks — the whole row list is
+    never materialised. If ``max_rows`` is given and the stream exceeds it, the
+    transaction is rolled back and :class:`RowCapExceededError` is raised so the route
+    can return 413 without persisting a partial job.
+
+    Returns ``(job, plaintext_secret, row_count)``.
+    """
+    plaintext_secret, secret_hash = _generate_secret()
+
+    with transaction.atomic():
+        job = BatchJob.objects.create(
+            secret_hash=secret_hash,
+            status=BatchJobStatus.PENDING,
+            remote_enabled=remote_enabled,
+            processing_state=BatchProcessingState.PARSING,
+        )
+        row_count = ingest_rows(job, rows, max_rows=max_rows)
+
+    return job, plaintext_secret, row_count
+
+
 def create_job(
     rows: Iterable[dict],
     *,

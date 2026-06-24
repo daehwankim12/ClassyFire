@@ -62,7 +62,7 @@ from apps.batches.services import (
     StructureSubmissionError,
     submit_structure_for_item,
 )
-from apps.batches.upload import iter_upload_rows
+from apps.batches.upload import iter_combined_rows
 from apps.core.enums import BatchItemStatus
 from apps.core.security import (
     UploadTooLargeError,
@@ -73,6 +73,7 @@ from apps.core.security import (
     require_csrf_for_cookie_auth,
     require_shared_access,
     reserve_export_create_quota,
+    stage_job_under_quota,
 )
 
 
@@ -138,12 +139,17 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
         text_input = body.get("text_input") or ""
 
     # --- remote_enabled ---
+    # In a multipart form an absent checkbox arrives as "" (or is missing
+    # entirely), so for that branch ""→False matches HTML-form semantics. For a
+    # JSON client we preserve the original behavior: only the explicit
+    # false/0/no literals disable remote (an empty string stays truthy).
     if raw_remote is None:
         remote_enabled: bool = getattr(settings, "REMOTE_ENABLED", True)
     elif isinstance(raw_remote, bool):
         remote_enabled = raw_remote
     elif isinstance(raw_remote, str):
-        remote_enabled = raw_remote.lower() not in ("false", "0", "no", "")
+        falsey = ("false", "0", "no", "") if is_multipart else ("false", "0", "no")
+        remote_enabled = raw_remote.lower() not in falsey
     else:
         remote_enabled = bool(raw_remote)
 
@@ -155,9 +161,8 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
     except UploadTooLargeError as exc:
         return JsonResponse({"error": str(exc)}, status=413)
 
-    rows = list(parse_text_input(text_input))
-
     # --- Multipart file upload: bounded streaming parse + format dispatch. ---
+    file = None
     if is_multipart:
         file = request.FILES.get("input_file")
         if file is not None:
@@ -165,19 +170,33 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
                 check_upload_size(file.size if file.size is not None else 0)
             except UploadTooLargeError as exc:
                 return JsonResponse({"error": str(exc)}, status=413)
-            offset = len(rows)
-            for row in iter_upload_rows(
-                file,
-                filename=file.name,
-                content_type=getattr(file, "content_type", None),
-            ):
-                rows.append({**row, "row_index": row["row_index"] + offset})
 
-    job, plaintext_secret, quota_error = create_job_under_quota(
-        request,
-        rows,
-        remote_enabled=remote_enabled,
+    # Lazily chain JSON/text rows + any uploaded-file rows (provenance + order
+    # preserved), re-indexed continuously.
+    row_iter = iter_combined_rows(
+        parse_text_input(text_input),
+        file,
+        filename=file.name if file else None,
+        content_type=getattr(file, "content_type", None) if file else None,
     )
+
+    if getattr(settings, "INGEST_DEFER_HEAVY_PROCESSING", False):
+        # DEFERRED mode (F-11): STAGE only and RETURN immediately; the durable
+        # `process_jobs` worker drains the job. Streamed straight into staging —
+        # no full row-list materialization.
+        job, plaintext_secret, quota_error = stage_job_under_quota(
+            request,
+            row_iter,
+            remote_enabled=remote_enabled,
+        )
+    else:
+        # SYNCHRONOUS mode (default): process inline so the job is resolved on
+        # return (preserves existing immediate-result behavior).
+        job, plaintext_secret, quota_error = create_job_under_quota(
+            request,
+            list(row_iter),
+            remote_enabled=remote_enabled,
+        )
     if quota_error is not None:
         return quota_error
 
