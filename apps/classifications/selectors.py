@@ -83,3 +83,49 @@ def get_seed_classification(inchikey: str) -> dict[str, Any] | None:
         if row is None:
             return None
         return _row_to_dict(cur, row)
+
+
+# --- Bulk variants (WHERE inchikey IN (...)) for chunked ingest (F-11) -------
+
+_LIVE_BULK_QUERY = _LIVE_QUERY.replace(
+    "WHERE cl.inchikey = %s\n    ORDER BY cl.source_priority DESC, cl.retrieved_at DESC\n    LIMIT 1",
+    "WHERE cl.inchikey = ANY(%s)\n    ORDER BY cl.inchikey, cl.source_priority DESC, cl.retrieved_at DESC",
+)
+
+_SEED_BULK_QUERY = _SEED_QUERY.replace(
+    "WHERE cs.inchikey = %s\n    LIMIT 1",
+    "WHERE cs.inchikey = ANY(%s)",
+)
+
+
+def get_live_classifications(inchikeys: list[str]) -> dict[str, dict[str, Any]]:
+    """Bulk live lookup. Returns ``{inchikey: row}`` keeping ONLY the
+    highest-priority/newest live row per inchikey (mirrors the single-row
+    ``ORDER BY source_priority DESC, retrieved_at DESC LIMIT 1`` semantics).
+    """
+    if not inchikeys:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    with connection.cursor() as cur:
+        cur.execute(_LIVE_BULK_QUERY, [list(inchikeys)])
+        cols = [d[0] for d in cur.description]
+        for row in cur.fetchall():
+            data = dict(zip(cols, row, strict=True))
+            # First row per inchikey wins (query is ordered so the winner is
+            # first within each inchikey group).
+            out.setdefault(data["inchikey"], data)
+    return out
+
+
+def get_seed_classifications(inchikeys: list[str]) -> dict[str, dict[str, Any]]:
+    """Bulk seed lookup. Returns ``{inchikey: row}`` for current-seed hits."""
+    if not inchikeys:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    with connection.cursor() as cur:
+        cur.execute(_SEED_BULK_QUERY, [list(inchikeys)])
+        cols = [d[0] for d in cur.description]
+        for row in cur.fetchall():
+            data = dict(zip(cols, row, strict=True))
+            out.setdefault(data["inchikey"], data)
+    return out

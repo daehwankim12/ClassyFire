@@ -45,7 +45,12 @@ def parse_text_input(text: str) -> Iterator[dict]:
             row_index += 1
 
 
-def ingest_rows(job: BatchJob, rows: Iterable[dict]) -> None:
+def ingest_rows(
+    job: BatchJob,
+    rows: Iterable[dict],
+    *,
+    max_rows: int | None = None,
+) -> int:
     """Bulk-insert BatchItem rows for *job* from the parser output *rows*.
 
     Items are created with status PENDING_NORMALIZATION; services.py will
@@ -58,10 +63,23 @@ def ingest_rows(job: BatchJob, rows: Iterable[dict]) -> None:
     rows:
         Iterable of dicts with at least ``raw`` and ``row_index`` keys;
         optionally ``external_id``.
+    max_rows:
+        Optional hard cap. When the streamed input would exceed it,
+        :class:`apps.batches.services.RowCapExceededError` is raised mid-stream
+        (before buffering the whole input) so the caller can reject the upload.
+
+    Returns the number of rows ingested.
     """
+    # Local import avoids a circular import at module load.
+    from apps.batches.services import RowCapExceededError
+
     chunk: list[BatchItem] = []
+    count = 0
 
     for row in rows:
+        count += 1
+        if max_rows is not None and count > max_rows:
+            raise RowCapExceededError(max_rows)
         item = BatchItem(
             job=job,
             row_order=row["row_index"],
@@ -77,3 +95,5 @@ def ingest_rows(job: BatchJob, rows: Iterable[dict]) -> None:
 
     if chunk:
         BatchItem.objects.bulk_create(chunk)
+
+    return count

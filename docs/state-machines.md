@@ -273,6 +273,70 @@ PENDING → IN_PROGRESS → COMPLETE   (all items resolved)
 `COMPLETE` and `FAILED` are terminal. The `completed_at` timestamp is set on
 entry to either terminal state.
 
+### 4b. `batch_jobs.processing_state` — durable ingest-worker machine (F-11)
+
+Enum: `BatchProcessingState` (in `apps/core/enums.py`). Column:
+`batch_jobs.processing_state`. This is a SEPARATE, fine-grained machine that the
+durable ingest worker advances; the coarse `status` above stays the
+UI/export/test-facing summary derived by `recompute_job_counters`.
+
+The worker CLAIMS a job needing processing via
+`SELECT ... FOR UPDATE SKIP LOCKED` over the *claimable* states
+(`UPLOADING`, `PARSING`, `NORMALIZING`, `LOCAL_LOOKUP`) ordered by
+`created_at, id`, flips it to `PARSING` with a fresh `claim_lease_version`
+(+ `claimed_by`/`claimed_at`), then runs the chunked, checkpointed pipeline.
+
+| State | Meaning | Claimable? |
+| --- | --- | --- |
+| `UPLOADING` | Raw upload being staged (reserved; current flow persists items in-request). | yes |
+| `PARSING` | Items persisted as `PENDING_NORMALIZATION`; awaiting the worker. | yes |
+| `NORMALIZING` | Worker normalizing rows (RDKit). | yes |
+| `LOCAL_LOOKUP` | Worker running the per-chunk bulk `WHERE inchikey IN (...)` lookup + upsert. | yes |
+| `REMOTE_PENDING` | Local processing done; remote work still outstanding. | no |
+| `ACTION_REQUIRED` | Done; only user-structure items remain. | no |
+| `COMPLETE` | All items resolved. | no |
+| `FAILED` | Unrecoverable processing error (`processing_error` records the reason). | no |
+
+```
+UPLOADING → PARSING → NORMALIZING → LOCAL_LOOKUP
+                                       ├→ REMOTE_PENDING   (remote work outstanding)
+                                       ├→ ACTION_REQUIRED  (only user-structure items remain)
+                                       └→ COMPLETE         (everything resolved)
+any → FAILED   (unrecoverable error)
+```
+
+**Coarse-status mapping** (applied by `recompute_job_counters` once no item is
+still `PENDING_NORMALIZATION`):
+
+| `processing_state` | `status` |
+| --- | --- |
+| `UPLOADING`/`PARSING`/`NORMALIZING`/`LOCAL_LOOKUP`/`REMOTE_PENDING` | `IN_PROGRESS` |
+| `ACTION_REQUIRED` | `COMPLETE_WITH_ACTION_REQUIRED` |
+| `COMPLETE` | `COMPLETE` |
+| `FAILED` | `FAILED` |
+
+**Checkpoint / resume.** Items are processed in `row_order` chunks of
+`PROCESS_CHUNK_SIZE`; each chunk commits atomically and advances the
+`processed_through_row_order` cursor. The *resume frontier* is the set of items
+still `PENDING_NORMALIZATION`: a crashed/restarted worker re-claims the job and
+reprocesses ONLY those items, never double-processing already-resolved rows. The
+synchronous entry point `process_job_items(job)` drives the identical pipeline
+inline (used by the synchronous upload mode and unit tests); `manage.py
+process_jobs` claims + drives jobs durably.
+
+**Two upload-route modes (`INGEST_DEFER_HEAVY_PROCESSING`).** The web
+`submit_view` and API `create_job_view` run in one of two modes, selected by the
+boolean setting (env `INGEST_DEFER_HEAVY_PROCESSING`, default **False**):
+
+| Mode | Setting | Route behavior |
+| --- | --- | --- |
+| Synchronous (default) | `False` | Route parses (streaming) → `create_job_under_quota` stages items AND runs `process_job_items` inline → returns with the job already resolved. Preserves the existing immediate-result contract. |
+| Deferred | `True` | Route parses (streaming) → `stage_job_under_quota` consumes the row *iterator* straight into BatchItems (no full row-list materialization) and RETURNS immediately with the job in `PARSING` and items `PENDING_NORMALIZATION`. The durable `process_jobs` worker then claims + drains it to the SAME final statuses/pins. |
+
+In deferred mode the per-job `MAX_ROWS_PER_JOB` cap is enforced **mid-stream**
+(`RowCapExceededError` → 413, transaction rolled back, no partial job); the
+daily row cap is re-checked once the true streamed count is known.
+
 ---
 
 ## 5. `classification_results` — append-only immutable event log (F-05/F-20)
