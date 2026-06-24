@@ -132,9 +132,27 @@ pg_restore \
 echo "[restore] Database restore complete."
 
 # ── Restore media archive (optional) ──────────────────────────────────────
-if [ -n "${RESTORE_MEDIA_DIR:-}" ] && [ -n "${MEDIA_FILE:-}" ]; then
+# A "media_file" of null/empty in the manifest means no media archive was
+# produced at backup time — skip cleanly.
+if [ -n "${RESTORE_MEDIA_DIR:-}" ] && [ -n "${MEDIA_FILE:-}" ] && [ "${MEDIA_FILE}" != "null" ]; then
   MEDIA_PATH="${BACKUP_DIR}/${MEDIA_FILE}"
   if [ -f "${MEDIA_PATH}" ]; then
+    # Verify the media archive checksum BEFORE extracting, mirroring the
+    # DB-dump checksum logic above. Fail loudly on mismatch.
+    EXPECTED_MEDIA_CHECKSUM=$(awk -F'"' '/"media_checksum"/{print $4; exit}' "${MANIFEST}" || true)
+    if [ -n "${EXPECTED_MEDIA_CHECKSUM}" ] && [ "${EXPECTED_MEDIA_CHECKSUM}" != "null" ]; then
+      echo "[restore] Verifying media checksum for ${MEDIA_FILE} ..."
+      ACTUAL_MEDIA_CHECKSUM=$(sha256sum "${MEDIA_PATH}" | awk '{print $1}')
+      if [ "${ACTUAL_MEDIA_CHECKSUM}" != "${EXPECTED_MEDIA_CHECKSUM}" ]; then
+        echo "[restore] ERROR: Media checksum mismatch!" >&2
+        echo "[restore]   Expected: ${EXPECTED_MEDIA_CHECKSUM}" >&2
+        echo "[restore]   Actual:   ${ACTUAL_MEDIA_CHECKSUM}" >&2
+        exit 1
+      fi
+      echo "[restore] Media checksum OK: ${ACTUAL_MEDIA_CHECKSUM}"
+    else
+      echo "[restore] WARNING: no media_checksum in manifest — extracting without verification" >&2
+    fi
     echo "[restore] Restoring media archive: ${MEDIA_FILE} -> ${RESTORE_MEDIA_DIR}"
     mkdir -p "${RESTORE_MEDIA_DIR}"
     # Restore into the *parent* of RESTORE_MEDIA_DIR so the archive's

@@ -347,6 +347,56 @@ def restore_round_trip():
             "('10.5281/test', 'seed_test.tsv.zst', 'abc123', 'COMPLETE', 1, 'tester', NOW());",
         )
 
+        # compound_usage: usage tally for the aspirin InChIKey
+        _psql(
+            SRC_DB,
+            "INSERT INTO compound_usage "
+            "(inchikey, first_seen, last_seen, seen_count, waiting_job_count) "
+            "VALUES "
+            f"('{VALID_IK_ASPIRIN}', NOW(), NOW(), 3, 1)"
+            " ON CONFLICT DO NOTHING;",
+        )
+
+        # classification_history: an archived snapshot of a superseded live row
+        _psql(
+            SRC_DB,
+            "INSERT INTO classification_history "
+            "(inchikey, source_type, source_priority, payload, retrieved_at, archived_at) "
+            "VALUES ("
+            f"  '{VALID_IK_ASPIRIN}', 'WISHART_LIVE_QUERY', 100, "
+            "  '{\"superseded\": true}', NOW(), NOW()"
+            ");",
+        )
+
+        # system_events: an operations event row
+        _psql(
+            SRC_DB,
+            "INSERT INTO system_events "
+            "(category, event_type, payload, created_at) "
+            "VALUES "
+            "('BACKUP', 'backup_complete', '{\"status\": \"ok\"}', NOW());",
+        )
+
+        # remote_queries: a submitted query, then remote_query_items linking it
+        # to the READY remote_task (exercises the provenance mapping FK chain).
+        _psql(
+            SRC_DB,
+            "INSERT INTO remote_queries "
+            "(provider, remote_query_id, payload_hash, state, submitted_at) "
+            "VALUES "
+            "('wishart', 'q-test-1', 'payloadhash123', 'SUBMITTED', NOW());",
+        )
+        _psql(
+            SRC_DB,
+            "INSERT INTO remote_query_items "
+            "(query_id, task_id, compound_id, inchikey) "
+            "SELECT "
+            "  (SELECT id FROM remote_queries WHERE remote_query_id='q-test-1'), "
+            f"  (SELECT id FROM remote_tasks WHERE inchikey='{VALID_IK_ASPIRIN}'), "
+            f"  (SELECT id FROM compound_structures WHERE inchikey='{VALID_IK_ASPIRIN}'), "
+            f"  '{VALID_IK_ASPIRIN}';",
+        )
+
         # ── Dump SRC ────────────────────────────────────────────────────────
         with tempfile.NamedTemporaryFile(
             suffix=".dump", prefix="cf_integrity_", delete=False
@@ -472,9 +522,19 @@ def _row_count(db: str, table: str) -> int:
     "system_events",
 ])
 def test_row_count_matches_src(restore_round_trip, table):
-    """Row count in DST must equal SRC for all non-seed tables."""
+    """Row count in DST must equal SRC for all non-seed tables.
+
+    Every table listed here has at least one fixture row inserted in
+    ``restore_round_trip``, so the SRC count must be > 0 — this guards
+    against a vacuous 0 == 0 assertion that would pass even if the data
+    failed to survive the round-trip.
+    """
     src = _row_count(restore_round_trip["src_db"], table)
     dst = _row_count(restore_round_trip["dst_db"], table)
+    assert src > 0, (
+        f"Test fixture inserted no rows into {table}; row-count survival "
+        "would be vacuously true"
+    )
     assert dst == src, (
         f"Row count mismatch for {table}: src={src}, dst={dst}"
     )
