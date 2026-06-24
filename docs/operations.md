@@ -241,6 +241,17 @@ The stats page provides real-time operational metrics:
 | Backup status | Timestamp of the last successful backup. |
 | Seed import history | Last N seed import runs with row counts and status. |
 
+For automation, emit a machine-readable Gate 3 metrics snapshot:
+
+```bash
+docker compose exec web python manage.py emit_metrics_snapshot --json
+```
+
+The JSON includes remote queue state counts and due-work lag, provider circuit
+and rate-bucket state, remote attempt classifications, mismatch event counts,
+export artifact totals, and disk usage.  The command uses aggregate queries only
+and is safe to run from monitoring jobs.
+
 ---
 
 ## Disk Guard
