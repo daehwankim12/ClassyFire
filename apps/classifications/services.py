@@ -7,15 +7,18 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from apps.classifications.selectors import (
-    get_live_classification,
-    get_live_classifications,
-    get_seed_classification,
-    get_seed_classifications,
-)
+from django.conf import settings
+from django.utils.module_loading import import_string
+
+from apps.classifications.backends import ClassificationLookupBackend
 from apps.core.enums import SOURCE_PRIORITY, SourceType
 
 INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
+DEFAULT_LOOKUP_BACKEND = (
+    "apps.classifications.backends.PostgresClassificationLookupBackend"
+)
+_lookup_backend: ClassificationLookupBackend | None = None
+_lookup_backend_path: str | None = None
 
 
 class LookupTier(StrEnum):
@@ -45,6 +48,34 @@ class ClassificationLookupResult:
     query_id: str | None
     tier: LookupTier
     result_id: int | None = None
+
+
+def reset_lookup_backend_cache() -> None:
+    """Clear the process-local lookup backend instance cache.
+
+    Tests and runtime config reload paths use this after changing
+    ``CLASSIFICATION_LOOKUP_BACKEND``.
+    """
+    global _lookup_backend, _lookup_backend_path
+    _lookup_backend = None
+    _lookup_backend_path = None
+
+
+def get_lookup_backend() -> ClassificationLookupBackend:
+    """Return the configured current-classification lookup backend."""
+    global _lookup_backend, _lookup_backend_path
+    backend_path = str(
+        getattr(
+            settings,
+            "CLASSIFICATION_LOOKUP_BACKEND",
+            DEFAULT_LOOKUP_BACKEND,
+        )
+    )
+    if _lookup_backend is None or _lookup_backend_path != backend_path:
+        backend_cls = import_string(backend_path)
+        _lookup_backend = backend_cls()
+        _lookup_backend_path = backend_path
+    return _lookup_backend
 
 
 def _label_snapshot(label: ChemOntLabel | None) -> dict[str, str | None] | None:
@@ -168,15 +199,7 @@ def lookup_current_classification(inchikey: str) -> ClassificationLookupResult |
     if not INCHIKEY_RE.match(inchikey):
         return None
 
-    row = get_live_classification(inchikey)
-    if row is not None:
-        return _live_row_to_result(row)
-
-    row = get_seed_classification(inchikey)
-    if row is not None:
-        return _seed_row_to_result(row)
-
-    return None
+    return get_lookup_backend().lookup_one(inchikey)
 
 
 def lookup_current_classifications(
@@ -194,15 +217,4 @@ def lookup_current_classifications(
     if not valid:
         return {}
 
-    live = get_live_classifications(valid)
-    out: dict[str, ClassificationLookupResult] = {
-        key: _live_row_to_result(row) for key, row in live.items()
-    }
-
-    seed_needed = [k for k in valid if k not in out]
-    if seed_needed:
-        seed = get_seed_classifications(seed_needed)
-        for key, row in seed.items():
-            out[key] = _seed_row_to_result(row)
-
-    return out
+    return get_lookup_backend().lookup_many(valid)
