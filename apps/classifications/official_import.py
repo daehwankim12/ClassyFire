@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -141,8 +142,12 @@ def import_official_artifact(
     records = _validate(raw)
 
     checksum = _checksum(raw)
-    storage_key = f"source-artifacts/{checksum}.json"
-    get_artifact_storage().save_bytes(storage_key, raw)
+    # Source artifacts live on their OWN volume/dir (SOURCE_ARTIFACT_DIR), NOT
+    # under EXPORT_DIR — so the artifact-aware backup (Gate 6 Task 4) archives
+    # them as a distinct "source_artifacts" namespace rather than mislabelling
+    # them as exports.
+    storage_key = f"{checksum}.json"
+    get_artifact_storage(root=settings.SOURCE_ARTIFACT_DIR).save_bytes(storage_key, raw)
 
     artifact = SourceArtifact.objects.create(
         source_type=SourceType.LAB_OFFICIAL_IMPORT,
