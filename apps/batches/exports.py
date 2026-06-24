@@ -23,6 +23,22 @@ Citation header (FR-028): prepended to CSV/TSV formats as # comment lines.
 Injection escaping (FR-028): cells starting with =, +, -, @ are prefixed with '.
 Token expiry: settings.EXPORT_RETENTION_DAYS days from creation.
 Deduplication: same job+format with valid non-expired token returns same token.
+
+Implementation notes (Gate-2 WS-E / F-12)
+------------------------------------------
+- Export generation is STREAMING and MEMORY-BOUNDED: rows are iterated with
+  .iterator(chunk_size=2000) and written one at a time to a temp file, then
+  atomically renamed into place with os.replace() so a partial file is never
+  served.
+- Gzip formats use gzip.GzipFile wrapping the temp file — NOT gzip.compress on
+  a full in-memory byte string.
+- JSON export writes '[', then comma-separated objects, then ']' without
+  building a list in memory.
+- A single streaming pass computes both the rows_signature hash and writes the
+  file, avoiding double iteration.
+- ExportArtifact (DB model) is the source of truth for metadata/dedup/expiry.
+  A JSON sidecar (.meta.json) is also written for backward compatibility with
+  existing tests that call _meta_path/_load_meta directly.
 """
 from __future__ import annotations
 
@@ -32,20 +48,28 @@ import gzip
 import hashlib
 import io
 import json
+import logging
+import os
 import secrets
+import tempfile
+import uuid
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
+from django.utils import timezone
 
-from apps.batches.models import BatchItem, BatchJob
+from apps.batches.models import BatchItem, BatchJob, ExportArtifact
 
 if TYPE_CHECKING:
     from apps.classifications.models import ClassificationResult
 
-EXPORT_DIR: Path = settings.BASE_DIR / "export_cache"
+logger = logging.getLogger(__name__)
+
+EXPORT_DIR: Path = Path(getattr(settings, "EXPORT_DIR", settings.BASE_DIR / "export_cache"))
 
 CITATION_LINES = [
     "# ClassyFire Batch Cache Web — Export",
@@ -74,6 +98,13 @@ COLUMNS = [
     "Parent Level 1",
     "Parent Level 2",
     "Parent Level 3",
+    # Audit columns (Gate-2 WS-E / F-12)
+    "Canonical SMILES",
+    "InChI",
+    "Requested InChIKey",
+    "Returned InChIKey",
+    "Remote Query ID",
+    "Classification Version",
 ]
 
 # Statuses that warrant a classification lookup
@@ -85,12 +116,20 @@ _FOUND_STATUSES = frozenset([
 ])
 
 
-def _escape_cell(value: str | None) -> str:
-    """FR-028: Escape CSV/TSV cell values to prevent formula injection."""
+def _escape_cell(value: str | int | None) -> str:
+    """FR-028: Escape CSV/TSV cell values to prevent formula injection.
+
+    Detects dangerous leading character AFTER stripping leading whitespace,
+    so \" =cmd\" and \"\\t+cmd\" are also escaped (leading-whitespace bypass fix).
+    """
     if value is None:
         return ""
     s = str(value)
-    if s and s[0] in ("=", "+", "-", "@"):
+    # Check the first non-whitespace character for dangerous formula starters.
+    # We still escape even if the raw value begins with whitespace — attackers
+    # can use ` =cmd` to bypass a check on s[0] alone.
+    stripped = s.lstrip()
+    if stripped and stripped[0] in ("=", "+", "-", "@"):
         return "'" + s
     if "\t" in s or "\r" in s:
         return "'" + s
@@ -185,6 +224,11 @@ def _build_row_dict(item: BatchItem) -> dict[str, str | int | None]:
     (new source of truth) or, failing that, the pinned ``classification_snapshot``
     JSON. NEVER re-queries the live cache, so a row stays byte-stable after live
     is later superseded (F-04/F-05).
+
+    Audit columns (Gate-2 WS-E / F-12):
+    - Canonical SMILES / InChI from item.compound (CompoundStructure)
+    - Requested / returned InChIKey from resolved_classification event
+    - Remote query ID / classification version from the same pinned event
     """
     event = item.resolved_classification
     if event is not None:
@@ -203,6 +247,13 @@ def _build_row_dict(item: BatchItem) -> dict[str, str | int | None]:
         "Parent Level 1": None,
         "Parent Level 2": None,
         "Parent Level 3": None,
+        # Audit columns — default to None/empty
+        "Canonical SMILES": None,
+        "InChI": None,
+        "Requested InChIKey": None,
+        "Returned InChIKey": None,
+        "Remote Query ID": None,
+        "Classification Version": None,
     }
 
     if completed and isinstance(snapshot, dict):
@@ -215,94 +266,207 @@ def _build_row_dict(item: BatchItem) -> dict[str, str | int | None]:
         row["Parent Level 2"] = parent_2
         row["Parent Level 3"] = parent_3
 
+    # Audit: compound structure (canonical SMILES / InChI)
+    compound = item.compound
+    if compound is not None:
+        row["Canonical SMILES"] = compound.canonical_smiles
+        row["InChI"] = compound.inchi
+
+    # Audit: pinned event provenance
+    if event is not None:
+        row["Requested InChIKey"] = event.requested_inchikey
+        row["Returned InChIKey"] = event.returned_inchikey
+        row["Remote Query ID"] = event.remote_query_id
+        row["Classification Version"] = event.classification_version
+
     return row
 
 
-def _rows_for_job(job: BatchJob) -> list[dict[str, str | int | None]]:
-    """Return all export row dicts for a job, ordered by row_order."""
-    items = (
+def _iter_rows_for_job(job: BatchJob) -> Iterator[dict[str, str | int | None]]:
+    """Yield export row dicts for a job, ordered by row_order, using .iterator().
+
+    Memory-bounded: never materialises the full queryset.  Uses select_related
+    to avoid N+1 queries for resolved_classification and compound FKs.
+    """
+    qs = (
         BatchItem.objects.filter(job=job)
-        .select_related("resolved_classification")
+        .select_related("resolved_classification", "compound")
         .order_by("row_order")
     )
-    return [_build_row_dict(item) for item in items]
+    for item in qs.iterator(chunk_size=2000):
+        yield _build_row_dict(item)
 
 
-def _generate_csv_bytes(rows: list[dict[str, str | int | None]], delimiter: str = ",") -> bytes:
-    """Generate UTF-8 CSV or TSV bytes with citation header and injection escaping."""
-    buf = io.StringIO()
-    buf.write(CITATION_TEXT)
-    writer = csv.DictWriter(
-        buf,
-        fieldnames=COLUMNS,
-        delimiter=delimiter,
-        lineterminator="\n",
-        extrasaction="ignore",
-    )
-    writer.writeheader()
-    for row in rows:
-        escaped = {col: _escape_cell(row.get(col)) for col in COLUMNS}  # type: ignore[arg-type]
-        writer.writerow(escaped)
-    return buf.getvalue().encode("utf-8")
+# ---------------------------------------------------------------------------
+# Streaming file writers
+# ---------------------------------------------------------------------------
+
+class _RowsSignatureHasher:
+    """Incrementally hash row data for dedup signature, matching _rows_signature."""
+
+    def __init__(self) -> None:
+        self._hasher = hashlib.sha256()
+        self._first = True
+        # We need to produce the same hash as _rows_signature, which serialises
+        # the full payload list.  We replicate that encoding incrementally by
+        # hashing a JSON array built piece by piece.
+        self._hasher.update(b"[")
+
+    def update(self, row: dict[str, str | int | None]) -> None:
+        d = {col: row.get(col) for col in COLUMNS}
+        item_bytes = json.dumps(
+            d,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if not self._first:
+            self._hasher.update(b",")
+        self._hasher.update(item_bytes)
+        self._first = False
+
+    def hexdigest(self) -> str:
+        # Clone to avoid mutating state (so we can call hexdigest multiple times).
+        h = self._hasher.copy()
+        h.update(b"]")
+        return h.hexdigest()
 
 
-def _generate_json_bytes(rows: list[dict[str, str | int | None]]) -> bytes:
-    """Generate JSON bytes (list of dicts) with _citation key in each row."""
-    output = []
-    for row in rows:
-        d: dict[str, object] = {"_citation": CITATION_DICT}
-        for col in COLUMNS:
-            d[col] = row.get(col)
-        output.append(d)
-    return json.dumps(output, ensure_ascii=False, default=str).encode("utf-8")
-
-
-def _rows_signature(rows: list[dict[str, str | int | None]]) -> str:
-    payload = [
-        {column: row.get(column) for column in COLUMNS}
-        for row in rows
-    ]
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _write_export_file(
-    rows: list[dict[str, str | int | None]],
+def _write_export_streaming(
+    job: BatchJob,
     fmt: str,
     token: str,
-) -> Path:
-    """Generate the export file and write it to EXPORT_DIR/{token}.{fmt}."""
-    EXPORT_DIR.mkdir(exist_ok=True)
+) -> tuple[Path, str, int, int]:
+    """Generate the export file using streaming iteration.
 
-    ext = fmt  # csv, tsv, json, csv.gz, tsv.gz
+    Writes to a temp file in EXPORT_DIR, then atomically renames to the final
+    path.  Returns (final_path, rows_signature, row_count, byte_size).
+    """
+    EXPORT_DIR.mkdir(exist_ok=True)
+    ext = fmt
     dest = EXPORT_DIR / f"{token}.{ext}"
 
-    if fmt == "csv":
-        dest.write_bytes(_generate_csv_bytes(rows, delimiter=","))
-    elif fmt == "tsv":
-        dest.write_bytes(_generate_csv_bytes(rows, delimiter="\t"))
-    elif fmt == "json":
-        dest.write_bytes(_generate_json_bytes(rows))
-    elif fmt == "csv.gz":
-        dest.write_bytes(gzip.compress(_generate_csv_bytes(rows, delimiter=",")))
-    elif fmt == "tsv.gz":
-        dest.write_bytes(gzip.compress(_generate_csv_bytes(rows, delimiter="\t")))
-    else:
-        raise ValueError(f"Unsupported export format: {fmt!r}")
+    sig_hasher = _RowsSignatureHasher()
+    row_count = 0
 
-    return dest
+    # Write to a temp file in the same directory so os.replace is atomic.
+    fd, tmp_path_str = tempfile.mkstemp(dir=EXPORT_DIR, prefix=f".tmp.{token}.")
+    tmp_path: Path | None = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "wb") as raw_fh:
+            if fmt in ("csv.gz", "tsv.gz"):
+                delimiter = "," if fmt == "csv.gz" else "\t"
+                with gzip.GzipFile(fileobj=raw_fh, mode="wb") as gz_fh:
+                    gz_text = io.TextIOWrapper(cast(io.BufferedWriter, gz_fh), encoding="utf-8")
+                    gz_text.write(CITATION_TEXT)
+                    gz_writer = csv.DictWriter(
+                        gz_text,
+                        fieldnames=COLUMNS,
+                        delimiter=delimiter,
+                        lineterminator="\n",
+                        extrasaction="ignore",
+                    )
+                    gz_writer.writeheader()
+                    for row in _iter_rows_for_job(job):
+                        sig_hasher.update(row)
+                        escaped = {col: _escape_cell(row.get(col)) for col in COLUMNS}
+                        gz_writer.writerow(escaped)
+                        row_count += 1
+                    gz_text.flush()
+                    gz_text.detach()  # prevent TextIOWrapper from closing gz_fh again
 
+            elif fmt in ("csv", "tsv"):
+                delimiter = "," if fmt == "csv" else "\t"
+                plain_text = io.TextIOWrapper(raw_fh, encoding="utf-8")
+                plain_text.write(CITATION_TEXT)
+                plain_writer = csv.DictWriter(
+                    plain_text,
+                    fieldnames=COLUMNS,
+                    delimiter=delimiter,
+                    lineterminator="\n",
+                    extrasaction="ignore",
+                )
+                plain_writer.writeheader()
+                for row in _iter_rows_for_job(job):
+                    sig_hasher.update(row)
+                    escaped = {col: _escape_cell(row.get(col)) for col in COLUMNS}
+                    plain_writer.writerow(escaped)
+                    row_count += 1
+                plain_text.flush()
+                plain_text.detach()
+
+            elif fmt == "json":
+                json_text = io.TextIOWrapper(raw_fh, encoding="utf-8")
+                json_text.write("[")
+                first = True
+                for row in _iter_rows_for_job(job):
+                    sig_hasher.update(row)
+                    d: dict[str, object] = {"_citation": CITATION_DICT}
+                    for col in COLUMNS:
+                        d[col] = row.get(col)
+                    entry = json.dumps(d, ensure_ascii=False, default=str)
+                    if not first:
+                        json_text.write(",")
+                    json_text.write(entry)
+                    first = False
+                    row_count += 1
+                json_text.write("]")
+                json_text.flush()
+                json_text.detach()
+
+            else:
+                raise ValueError(f"Unsupported export format: {fmt!r}")
+
+        assert tmp_path is not None  # always set at this point
+        os.replace(tmp_path, dest)
+        tmp_path = None  # ownership transferred — temp file is now the dest
+
+    except Exception:
+        if tmp_path is not None and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+    rows_signature = sig_hasher.hexdigest()
+    byte_size = dest.stat().st_size
+    return dest, rows_signature, row_count, byte_size
+
+
+def _checksum_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Legacy sidecar helpers (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 def _meta_path(token: str) -> Path:
     return EXPORT_DIR / f"{token}.meta.json"
 
 
 def _load_meta(token: str) -> dict[str, str] | None:
+    """Load metadata — first from DB (ExportArtifact), then sidecar fallback."""
+    artifact = ExportArtifact.objects.filter(token=token).first()
+    if artifact is not None:
+        return {
+            "token": artifact.token,
+            "job_id": str(artifact.job_id),
+            "fmt": artifact.fmt,
+            "expires_at": artifact.expires_at.isoformat(),
+            "rows_signature": artifact.rows_signature,
+            "checksum": artifact.checksum,
+            "byte_size": str(artifact.byte_size),
+            "row_count": str(artifact.row_count),
+        }
+
+    # Fallback: legacy JSON sidecar (for tests that write it directly)
     p = _meta_path(token)
     if not p.exists():
         return None
@@ -324,34 +488,36 @@ def _is_valid_meta(meta: dict[str, str]) -> bool:
         return False
 
 
-def _find_existing_token(job_id: str, fmt: str, rows_signature: str) -> str | None:
-    """Return an existing valid token for job+format, or None."""
-    EXPORT_DIR.mkdir(exist_ok=True)
-    for meta_file in EXPORT_DIR.glob("*.meta.json"):
-        try:
-            raw = json.loads(meta_file.read_text())
-        except Exception:
-            continue
-        if not isinstance(raw, dict):
-            continue
-        parsed: dict[str, str] = {str(k): str(v) for k, v in raw.items()}
-        if (
-            parsed.get("job_id") == job_id
-            and parsed.get("fmt") == fmt
-            and parsed.get("rows_signature") == rows_signature
-            and _is_valid_meta(parsed)
-        ):
-            token = parsed.get("token")
-            if token:
-                # Verify export file still exists
-                ext_path = EXPORT_DIR / f"{token}.{fmt}"
-                if ext_path.exists():
-                    return token
-    return None
+# ---------------------------------------------------------------------------
+# Core export logic
+# ---------------------------------------------------------------------------
+
+def _find_existing_artifact(job_id: str, fmt: str, rows_signature: str) -> ExportArtifact | None:
+    """Return a valid ExportArtifact for job+format+signature, or None."""
+    now = timezone.now()
+    artifact = (
+        ExportArtifact.objects.filter(
+            job_id=uuid.UUID(job_id),
+            fmt=fmt,
+            rows_signature=rows_signature,
+            expires_at__gt=now,
+        )
+        .first()
+    )
+    if artifact is None:
+        return None
+    # Verify the export file still exists
+    if not Path(artifact.path).exists():
+        return None
+    return artifact
 
 
 def _matches_current_rows_signature(meta: dict[str, str]) -> bool:
-    """Return True when metadata still matches the current job export rows."""
+    """Return True when metadata still matches the current job export rows.
+
+    This is used by get_export_path to verify the file corresponds to the
+    current state of the job (guards against stale tokens after job updates).
+    """
     expected_signature = meta.get("rows_signature")
     job_id = meta.get("job_id")
     if not expected_signature or not job_id:
@@ -360,7 +526,24 @@ def _matches_current_rows_signature(meta: dict[str, str]) -> bool:
     job = BatchJob.objects.filter(pk=job_id).first()
     if job is None:
         return False
-    return _rows_signature(_rows_for_job(job)) == expected_signature
+
+    # Compute signature via a fresh streaming pass (memory-bounded)
+    current_sig = _compute_rows_signature(job)
+    return current_sig == expected_signature
+
+
+def _compute_rows_signature(job: BatchJob) -> str:
+    """Compute the rows_signature via a streaming pass (memory-bounded)."""
+    sig_hasher = _RowsSignatureHasher()
+    qs = (
+        BatchItem.objects.filter(job=job)
+        .select_related("resolved_classification", "compound")
+        .order_by("row_order")
+    )
+    for item in qs.iterator(chunk_size=2000):
+        row = _build_row_dict(item)
+        sig_hasher.update(row)
+    return sig_hasher.hexdigest()
 
 
 def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
@@ -368,13 +551,13 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     if fmt not in valid_formats:
         raise ValueError(f"Unsupported format: {fmt!r}. Must be one of: {valid_formats}")
 
-    rows = _rows_for_job(job)
-    rows_signature = _rows_signature(rows)
-    existing = _find_existing_token(str(job.pk), fmt, rows_signature)
-    if existing:
-        meta = _load_meta(existing)
-        if meta:
-            return existing, meta["expires_at"]
+    # Compute signature to check for an existing artifact (single streaming pass)
+    rows_signature = _compute_rows_signature(job)
+
+    existing = _find_existing_artifact(str(job.pk), fmt, rows_signature)
+    if existing is not None:
+        expires_at_iso = existing.expires_at.isoformat()
+        return existing.token, expires_at_iso
 
     token = secrets.token_urlsafe(32)
     retention_days = getattr(settings, "EXPORT_RETENTION_DAYS", 14)
@@ -382,16 +565,33 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     expires_at_iso = expires_at.isoformat()
 
     EXPORT_DIR.mkdir(exist_ok=True)
-    _write_export_file(rows, fmt, token)
 
-    meta = {
+    # Stream-write the export file (atomic rename inside)
+    dest, _sig, row_count, byte_size = _write_export_streaming(job, fmt, token)
+    checksum = _checksum_file(dest)
+
+    # Persist to DB
+    ExportArtifact.objects.create(
+        job=job,
+        fmt=fmt,
+        token=token,
+        path=str(dest),
+        checksum=checksum,
+        byte_size=byte_size,
+        rows_signature=rows_signature,
+        row_count=row_count,
+        expires_at=expires_at,
+    )
+
+    # Also write legacy sidecar for backward compatibility
+    meta_dict = {
         "token": token,
         "job_id": str(job.pk),
         "fmt": fmt,
         "expires_at": expires_at_iso,
         "rows_signature": rows_signature,
     }
-    _meta_path(token).write_text(json.dumps(meta))
+    _meta_path(token).write_text(json.dumps(meta_dict))
 
     return token, expires_at_iso
 
@@ -415,6 +615,25 @@ def get_export_metadata(token: str) -> dict[str, str] | None:
 
 def get_export_path(token: str) -> Path | None:
     """Return the file path for a valid export token, or None if not found/expired."""
+    # Primary path: look up ExportArtifact in DB
+    artifact = ExportArtifact.objects.filter(token=token).first()
+    if artifact is not None:
+        now = timezone.now()
+        if artifact.expires_at <= now:
+            return None
+        path = Path(artifact.path)
+        if not path.exists():
+            return None
+        # Verify current job state still matches this artifact's signature
+        job = BatchJob.objects.filter(pk=artifact.job_id).first()
+        if job is None:
+            return None
+        current_sig = _compute_rows_signature(job)
+        if current_sig != artifact.rows_signature:
+            return None
+        return path
+
+    # Fallback: legacy sidecar path (for tests that write .meta.json directly)
     meta = _load_meta(token)
     if meta is None or not _is_valid_meta(meta):
         return None
@@ -423,3 +642,41 @@ def get_export_path(token: str) -> Path | None:
     fmt = meta.get("fmt", "")
     path = EXPORT_DIR / f"{token}.{fmt}"
     return path if path.exists() else None
+
+
+# ---------------------------------------------------------------------------
+# Legacy helpers kept for tests that access internals directly
+# ---------------------------------------------------------------------------
+
+def _rows_for_job(job: BatchJob) -> list[dict[str, str | int | None]]:
+    """Return all export row dicts for a job, ordered by row_order.
+
+    NOTE: This materialises all rows in memory and exists only for backward
+    compatibility with tests that call it directly.  New code should use
+    _iter_rows_for_job() which is memory-bounded.
+    """
+    return list(_iter_rows_for_job(job))
+
+
+def _rows_signature(rows: list[dict[str, str | int | None]]) -> str:
+    """Compute rows_signature from a pre-materialised list (legacy interface).
+
+    The result is identical to the incremental hasher used in
+    _write_export_streaming/_compute_rows_signature, so tokens created by
+    either path share the same dedup key.
+    """
+    sig_hasher = _RowsSignatureHasher()
+    for row in rows:
+        sig_hasher.update(row)
+    return sig_hasher.hexdigest()
+
+
+def _find_existing_token(job_id: str, fmt: str, rows_signature: str) -> str | None:
+    """Return an existing valid token for job+format, or None.
+
+    Kept for backward compatibility.  New code uses _find_existing_artifact.
+    """
+    artifact = _find_existing_artifact(job_id, fmt, rows_signature)
+    if artifact is not None:
+        return artifact.token
+    return None

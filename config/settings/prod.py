@@ -86,6 +86,19 @@ STORAGES = {
 }
 
 # ---------------------------------------------------------------------------
+# Export artifact storage (Gate-2 WS-E / F-12)
+#
+# In production the export_files named Docker volume is mounted at
+# /app/export_files so artifacts survive container recreation.
+# EXPORT_DIR is read by apps/batches/exports.py; the dev default is
+# BASE_DIR/export_cache which remains unchanged for local development.
+# ---------------------------------------------------------------------------
+
+from apps.core.settings import env_str as _env_str  # noqa: E402
+
+EXPORT_DIR = _env_str("EXPORT_DIR", "/app/export_files")
+
+# ---------------------------------------------------------------------------
 # Logging (minimal — full observability is Task 11)
 # ---------------------------------------------------------------------------
 
