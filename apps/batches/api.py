@@ -62,6 +62,7 @@ from apps.batches.services import (
     StructureSubmissionError,
     submit_structure_for_item,
 )
+from apps.batches.upload import iter_upload_rows
 from apps.core.enums import BatchItemStatus
 from apps.core.security import (
     UploadTooLargeError,
@@ -115,25 +116,36 @@ STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
 @require_csrf_for_cookie_auth
 @require_http_methods(["POST"])
 def create_job_view(request: HttpRequest) -> JsonResponse:
-    """POST /api/jobs — create a batch job and run local processing."""
-    try:
-        body = json.loads(request.body or b"{}")
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
+    """POST /api/jobs — create a batch job and run local processing.
+
+    Accepts EITHER a JSON body (``text_input``) OR a multipart upload with an
+    ``input_file`` field. A multipart file is parsed as a BOUNDED STREAM, format
+    dispatched on suffix+content-type (CSV/TSV/SDF/text) exactly like the web
+    submit route (F-01).
+    """
+    content_type = request.content_type or ""
+    is_multipart = content_type.startswith("multipart/form-data")
+
+    if is_multipart:
+        raw_remote = request.POST.get("remote_enabled")
+        text_input = request.POST.get("text_input") or ""
+    else:
+        try:
+            body = json.loads(request.body or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
+        raw_remote = body.get("remote_enabled")
+        text_input = body.get("text_input") or ""
 
     # --- remote_enabled ---
-    raw_remote = body.get("remote_enabled")
     if raw_remote is None:
         remote_enabled: bool = getattr(settings, "REMOTE_ENABLED", True)
     elif isinstance(raw_remote, bool):
         remote_enabled = raw_remote
     elif isinstance(raw_remote, str):
-        remote_enabled = raw_remote.lower() not in ("false", "0", "no")
+        remote_enabled = raw_remote.lower() not in ("false", "0", "no", "")
     else:
         remote_enabled = bool(raw_remote)
-
-    # --- Collect rows ---
-    text_input: str = body.get("text_input") or ""
 
     # Guard: reject payloads whose text_input exceeds MAX_UPLOAD_MB.
     # Check the encoded byte length so the limit is consistent with the file-
@@ -144,6 +156,22 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": str(exc)}, status=413)
 
     rows = list(parse_text_input(text_input))
+
+    # --- Multipart file upload: bounded streaming parse + format dispatch. ---
+    if is_multipart:
+        file = request.FILES.get("input_file")
+        if file is not None:
+            try:
+                check_upload_size(file.size if file.size is not None else 0)
+            except UploadTooLargeError as exc:
+                return JsonResponse({"error": str(exc)}, status=413)
+            offset = len(rows)
+            for row in iter_upload_rows(
+                file,
+                filename=file.name,
+                content_type=getattr(file, "content_type", None),
+            ):
+                rows.append({**row, "row_index": row["row_index"] + offset})
 
     job, plaintext_secret, quota_error = create_job_under_quota(
         request,

@@ -6,7 +6,12 @@ import uuid
 from django.db import models
 from django.db.models import Q
 
-from apps.core.enums import BatchItemStatus, BatchJobStatus, DetectedInputType
+from apps.core.enums import (
+    BatchItemStatus,
+    BatchJobStatus,
+    BatchProcessingState,
+    DetectedInputType,
+)
 
 EXPORT_FMT_CHOICES = [
     ("csv", "CSV"),
@@ -48,8 +53,59 @@ class BatchJob(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     completed_at = models.DateTimeField(null=True, blank=True)
 
+    # --- Durable ingest-worker state machine (F-11) ---
+    # Fine-grained processing state, SEPARATE from the coarse user-facing
+    # ``status``. The durable worker advances this; ``status`` stays the
+    # UI/export/test-facing summary derived in recompute_job_counters.
+    processing_state = models.CharField(
+        max_length=20,
+        choices=BatchProcessingState.choices,
+        default=BatchProcessingState.COMPLETE,
+        # A real DB-level default so a language-agnostic INSERT (or a raw
+        # restore-time INSERT) that omits the column still satisfies NOT NULL.
+        db_default=BatchProcessingState.COMPLETE,
+        help_text="Fine-grained ingest-worker processing state.",
+    )
+    # Chunk checkpoint: the highest row_order whose item has been fully
+    # normalized + looked up. A restarted worker resumes from items strictly
+    # after this cursor (and any item still PENDING_NORMALIZATION). Null means
+    # nothing processed yet.
+    processed_through_row_order = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Checkpoint cursor: highest row_order processed by the worker.",
+    )
+    processing_error = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Reason a job entered the FAILED processing state, if any.",
+    )
+    # --- Durable claim (SELECT ... FOR UPDATE SKIP LOCKED) ---
+    claimed_by = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text="Worker id currently processing this job (claim lease owner).",
+    )
+    claimed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the current worker claimed this job for processing.",
+    )
+    claim_lease_version = models.IntegerField(
+        default=0,
+        db_default=0,
+        help_text="Monotonic lease version; bumped on every (re)claim.",
+    )
+
     class Meta:
         db_table = "batch_jobs"
+        indexes = [
+            models.Index(
+                fields=["processing_state", "created_at"],
+                name="batch_job_proc_state_idx",
+            ),
+        ]
 
     def __str__(self) -> str:
         return f"job:{self.id} ({self.status})"

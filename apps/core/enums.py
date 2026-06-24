@@ -91,6 +91,59 @@ class BatchJobStatus(models.TextChoices):
     FAILED = "FAILED", "Failed"
 
 
+class BatchProcessingState(models.TextChoices):
+    """Fine-grained ingest-worker state machine for a batch job.
+
+    Lives in an explicit ``batch_jobs.processing_state`` column SEPARATE from the
+    coarse user-facing ``status`` (:class:`BatchJobStatus`). A future Go/Rust
+    worker drives the SAME column with the SAME string literals.
+
+    State machine (see docs/state-machines.md §7):
+      UPLOADING ──▶ PARSING ──▶ NORMALIZING ──▶ LOCAL_LOOKUP
+                                                   ├─▶ REMOTE_PENDING  (remote work outstanding)
+                                                   ├─▶ ACTION_REQUIRED (only user-structure items remain)
+                                                   └─▶ COMPLETE        (everything resolved)
+      any ──▶ FAILED (unrecoverable error; processing_error records the reason)
+
+    Coarse-status mapping (kept in sync by recompute_job_counters):
+      UPLOADING / PARSING / NORMALIZING / LOCAL_LOOKUP / REMOTE_PENDING → IN_PROGRESS
+      ACTION_REQUIRED → COMPLETE_WITH_ACTION_REQUIRED
+      COMPLETE        → COMPLETE
+      FAILED          → FAILED
+
+    The durable worker CLAIMS jobs for processing via ``SELECT ... FOR UPDATE
+    SKIP LOCKED`` over the states that still need work and advances them.
+    """
+
+    UPLOADING = "UPLOADING", "Uploading"
+    PARSING = "PARSING", "Parsing"
+    NORMALIZING = "NORMALIZING", "Normalizing"
+    LOCAL_LOOKUP = "LOCAL_LOOKUP", "Local lookup"
+    REMOTE_PENDING = "REMOTE_PENDING", "Remote pending"
+    ACTION_REQUIRED = "ACTION_REQUIRED", "Action required"
+    COMPLETE = "COMPLETE", "Complete"
+    FAILED = "FAILED", "Failed"
+
+    @classmethod
+    def claimable_states(cls) -> tuple[BatchProcessingState, ...]:
+        """States whose jobs still need ingest-worker processing.
+
+        A job sitting in any of these is unfinished local-processing work the
+        durable worker should claim. PARSING is included so a job whose items
+        were persisted in-request (PENDING_NORMALIZATION) but not yet normalized
+        is picked up; NORMALIZING/LOCAL_LOOKUP cover a worker that crashed
+        mid-run and must resume from its checkpoint.
+        """
+        return (cls.UPLOADING, cls.PARSING, cls.NORMALIZING, cls.LOCAL_LOOKUP)
+
+
+# Raw string values of the processing states the ingest worker may claim, handy
+# for ``state__in=...`` filters and other-language ports.
+CLAIMABLE_PROCESSING_STATES: tuple[str, ...] = tuple(
+    s.value for s in BatchProcessingState.claimable_states()
+)
+
+
 class DetectedInputType(models.TextChoices):
     """Detected shape of a single batch input row before normalization."""
 

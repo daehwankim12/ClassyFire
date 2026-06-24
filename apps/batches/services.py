@@ -53,6 +53,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from collections.abc import Iterable
+from typing import cast
 
 from django.contrib.auth.hashers import make_password
 from django.db import IntegrityError, transaction
@@ -62,15 +63,19 @@ from django.utils import timezone
 from apps.batches.ingest import ingest_rows
 from apps.batches.models import BatchItem, BatchJob
 from apps.classifications.services import (
+    ClassificationLookupResult,
     LookupTier,
     classification_lookup_snapshot,
     lookup_current_classification,
+    lookup_current_classifications,
 )
 from apps.compounds.models import CompoundStructure, CompoundUsage
-from apps.compounds.validators import normalize_row
+from apps.compounds.validators import NormalizedRow, normalize_row
 from apps.core.enums import (
+    CLAIMABLE_PROCESSING_STATES,
     BatchItemStatus,
     BatchJobStatus,
+    BatchProcessingState,
     DetectedInputType,
     TaskState,
 )
@@ -378,32 +383,61 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
     return item
 
 
-def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
+# Sentinel: caller did NOT supply a pre-fetched bulk lookup for this item, so
+# _process_item must do its own per-item DB lookup (the legacy path).
+_NO_LOOKUP_OVERRIDE = object()
+
+
+def _process_item(
+    item: BatchItem,
+    *,
+    remote_enabled: bool,
+    lookup_override: object = _NO_LOOKUP_OVERRIDE,
+    norm_override: object = _NO_LOOKUP_OVERRIDE,
+) -> BatchItemStatus:
     """Normalize + local lookup for a single item.  Returns the final status.
 
     Updates item fields (inchikey, detected_type, compound, message) in place;
     the caller is responsible for calling item.save().
+
+    ``lookup_override``: when supplied (``None`` or a
+    :class:`ClassificationLookupResult`), the per-item ``lookup_current_classification``
+    DB call is SKIPPED and this pre-fetched value is used instead. The chunked
+    worker passes the result of ONE bulk ``WHERE inchikey IN (...)`` query so
+    the N+1 disappears while the resolution semantics stay identical.
+
+    ``norm_override``: a pre-computed :class:`NormalizedRow` so the (expensive,
+    RDKit-bound) normalization is not repeated by the chunk worker. When given,
+    the caller MUST have already applied the structure-length guard; if the row
+    is over the limit it returns ``None`` here and the worker handles the
+    INVALID_INPUT transition. ``check_structure_length`` is therefore only run
+    when ``norm_override`` is the sentinel (the legacy single-item path).
     """
     item.classification_snapshot = None
     item.resolved_classification_id = None
 
-    # Step 0: Guard — reject rows whose structure string exceeds MAX_STRUCTURE_LEN.
-    # This check lives here (service layer) so it covers BOTH the UI and API paths.
-    # For an over-limit row we preserve a bounded preview of the original input
-    # (FR-004) rather than a synthetic sentinel, and record an explicit message.
-    try:
-        check_structure_length(item.original_input)
-    except RowTooLongError:
-        raw_len = len(item.original_input)
-        preview = item.original_input[:_OVERLONG_PREVIEW_CHARS]
-        item.original_input = f"{preview}…[truncated, {raw_len} chars total]"
-        item.message = (
-            f"Row exceeds maximum length ({raw_len} chars; limit {MAX_STRUCTURE_LEN})"
-        )
-        return BatchItemStatus.INVALID_INPUT
+    if norm_override is _NO_LOOKUP_OVERRIDE:
+        # Step 0: Guard — reject rows whose structure string exceeds
+        # MAX_STRUCTURE_LEN. This check lives here (service layer) so it covers
+        # BOTH the UI and API paths. For an over-limit row we preserve a bounded
+        # preview of the original input (FR-004) rather than a synthetic
+        # sentinel, and record an explicit message.
+        try:
+            check_structure_length(item.original_input)
+        except RowTooLongError:
+            raw_len = len(item.original_input)
+            preview = item.original_input[:_OVERLONG_PREVIEW_CHARS]
+            item.original_input = f"{preview}…[truncated, {raw_len} chars total]"
+            item.message = (
+                f"Row exceeds maximum length "
+                f"({raw_len} chars; limit {MAX_STRUCTURE_LEN})"
+            )
+            return BatchItemStatus.INVALID_INPUT
 
-    # Step 1: Normalize
-    norm = normalize_row(item.original_input, external_id=item.external_id)
+        # Step 1: Normalize
+        norm = normalize_row(item.original_input, external_id=item.external_id)
+    else:
+        norm = cast("NormalizedRow", norm_override)
     item.detected_type = norm.detected_type
 
     # Step 2: Handle normalization error
@@ -414,7 +448,11 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
     # Step 3: Lookup (only possible with a 27-char inchikey)
     if norm.inchikey and len(norm.inchikey) == 27:
         item.inchikey = norm.inchikey
-        result = lookup_current_classification(norm.inchikey)
+        result: ClassificationLookupResult | None
+        if lookup_override is _NO_LOOKUP_OVERRIDE:
+            result = lookup_current_classification(norm.inchikey)
+        else:
+            result = cast("ClassificationLookupResult | None", lookup_override)
         if result is not None:
             item.classification_snapshot = classification_lookup_snapshot(result)
             _pin_resolved_classification(item, item.classification_snapshot)
@@ -531,6 +569,10 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
         invalid = counts["invalid"]
         completed = counts["completed"]
 
+        pending_normalization = BatchItem.objects.filter(
+            job=job, status=BatchItemStatus.PENDING_NORMALIZATION
+        ).exists()
+
         if blocking:
             new_status = BatchJobStatus.IN_PROGRESS
             completed_at = None
@@ -541,52 +583,231 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
             new_status = BatchJobStatus.COMPLETE
             completed_at = job.completed_at or timezone.now()
 
-        BatchJob.objects.filter(pk=job.pk).update(
-            total_count=total,
-            completed_count=completed,
-            local_hit_count=local_hit,
-            seed_hit_count=seed_hit,
-            remote_pending_count=remote_pending,
-            need_structure_count=need_structure,
-            invalid_count=invalid,
-            status=new_status,
-            completed_at=completed_at,
-        )
+        update_fields: dict[str, object] = {
+            "total_count": total,
+            "completed_count": completed,
+            "local_hit_count": local_hit,
+            "seed_hit_count": seed_hit,
+            "remote_pending_count": remote_pending,
+            "need_structure_count": need_structure,
+            "invalid_count": invalid,
+            "status": new_status,
+            "completed_at": completed_at,
+        }
+
+        # Keep the fine-grained processing_state machine in sync with the coarse
+        # status, but ONLY once no PENDING_NORMALIZATION items remain — while any
+        # row is still un-normalized the durable worker owns processing_state
+        # (NORMALIZING/LOCAL_LOOKUP). Once normalization is done this maps the
+        # terminal coarse outcome onto the fine-grained terminal state so a
+        # cache-hit-only or remote-pending job reaches its resting state even
+        # when recompute is driven by fan-out / structure-resubmit rather than
+        # the ingest worker.
+        if not pending_normalization and job.processing_state != BatchProcessingState.FAILED:
+            if new_status == BatchJobStatus.IN_PROGRESS:
+                update_fields["processing_state"] = BatchProcessingState.REMOTE_PENDING
+            elif new_status == BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED:
+                update_fields["processing_state"] = BatchProcessingState.ACTION_REQUIRED
+            else:
+                update_fields["processing_state"] = BatchProcessingState.COMPLETE
+
+        BatchJob.objects.filter(pk=job.pk).update(**update_fields)
+
+
+# Number of items normalized + bulk-looked-up + committed per checkpoint chunk.
+PROCESS_CHUNK_SIZE = 1000
+
+_ITEM_UPDATE_FIELDS = [
+    "status",
+    "detected_type",
+    "inchikey",
+    "compound",
+    "message",
+    "original_input",
+    "classification_snapshot",
+    "resolved_classification",
+]
+
+
+def _process_chunk(items: list[BatchItem], *, remote_enabled: bool) -> None:
+    """Normalize + resolve a chunk of items with ONE bulk lookup (no N+1).
+
+    Two passes:
+      1. Normalize every item (RDKit; inherently per-row CPU work) and collect
+         the 27-char inchikeys that need a cache lookup.
+      2. Run a SINGLE ``WHERE inchikey IN (...)`` bulk lookup, then finish each
+         item via ``_process_item`` with the pre-fetched result injected so the
+         compound-upsert / usage / remote-task / pin semantics are IDENTICAL to
+         the legacy per-item path — only the lookup is batched.
+
+    Item rows are updated inside one transaction so the chunk commits atomically
+    (a crash mid-chunk leaves those items PENDING_NORMALIZATION → reprocessed).
+    """
+    # Pass 1: apply the structure-length guard, then normalize ONCE per item
+    # (RDKit is expensive — never normalize the same row twice, and never feed
+    # RDKit an over-limit string), collecting candidate inchikeys for the bulk
+    # lookup. ``norms[i] is None`` marks an over-limit row handled in pass 2.
+    norms: list[NormalizedRow | None] = []
+    candidate_keys: list[str] = []
+    for item in items:
+        try:
+            check_structure_length(item.original_input)
+        except RowTooLongError:
+            norms.append(None)
+            continue
+        norm = normalize_row(item.original_input, external_id=item.external_id)
+        norms.append(norm)
+        if norm.inchikey and len(norm.inchikey) == 27 and norm.error is None:
+            candidate_keys.append(norm.inchikey)
+
+    # Pass 2: ONE bulk lookup for the whole chunk (kills the per-item N+1).
+    lookups = lookup_current_classifications(candidate_keys)
+
+    with transaction.atomic():
+        for item, chunk_norm in zip(items, norms, strict=True):
+            if chunk_norm is None:
+                # Over-limit row: drive the legacy guard branch (length check
+                # re-raises, truncates original_input + sets INVALID_INPUT).
+                item.status = _process_item(item, remote_enabled=remote_enabled)
+                continue
+            override: object = _NO_LOOKUP_OVERRIDE
+            if (
+                chunk_norm.inchikey
+                and len(chunk_norm.inchikey) == 27
+                and chunk_norm.error is None
+            ):
+                override = lookups.get(chunk_norm.inchikey)
+            item.status = _process_item(
+                item,
+                remote_enabled=remote_enabled,
+                lookup_override=override,
+                norm_override=chunk_norm,
+            )
+        BatchItem.objects.bulk_update(items, _ITEM_UPDATE_FIELDS)
 
 
 def process_job_items(job: BatchJob) -> None:
     """Run local normalization + lookup for all PENDING items in *job*.
 
-    Iterates items in row_order order using a DB-side cursor (chunk_size=500)
-    so large jobs never materialise all rows in RAM (FR-008).
-    Updates each item in the DB and then updates the job counters + status
-    via the canonical recompute_job_counters().
+    Durable, chunked, restart-safe (F-11):
+
+    * Items are processed in row_order chunks of ``PROCESS_CHUNK_SIZE``. Each
+      chunk runs ONE bulk ``WHERE inchikey IN (...)`` lookup + a bulk item update
+      (no per-item N+1), committed atomically with a checkpoint advance.
+    * The checkpoint (``processed_through_row_order``) lets a crashed/restarted
+      worker RESUME: only items still ``PENDING_NORMALIZATION`` are processed, so
+      already-resolved rows are never double-processed. The resume frontier is
+      exactly the set of PENDING_NORMALIZATION items.
+    * Drives the fine-grained ``processing_state`` machine
+      (NORMALIZING → LOCAL_LOOKUP → terminal), then ``recompute_job_counters``
+      maps it onto the coarse user-facing ``status``.
+
+    This is the SYNCHRONOUS entry point unit tests drive inline; the management
+    command claims a job and calls the same path.
     """
-    qs = (
-        BatchItem.objects.filter(job=job, status=BatchItemStatus.PENDING_NORMALIZATION)
-        .order_by("row_order")
-        .iterator(chunk_size=500)
+    BatchJob.objects.filter(pk=job.pk).update(
+        processing_state=BatchProcessingState.NORMALIZING
     )
 
-    for item in qs:
-        status = _process_item(item, remote_enabled=job.remote_enabled)
-        item.status = status
-        item.save(
-            update_fields=[
-                "status",
-                "detected_type",
-                "inchikey",
-                "compound",
-                "message",
-                "original_input",
-                "classification_snapshot",
-                "resolved_classification",
-            ]
+    while True:
+        chunk = list(
+            BatchItem.objects.filter(
+                job=job, status=BatchItemStatus.PENDING_NORMALIZATION
+            )
+            .order_by("row_order")[:PROCESS_CHUNK_SIZE]
+        )
+        if not chunk:
+            break
+
+        BatchJob.objects.filter(pk=job.pk).update(
+            processing_state=BatchProcessingState.LOCAL_LOOKUP
+        )
+        _process_chunk(chunk, remote_enabled=job.remote_enabled)
+
+        # Checkpoint: advance the cursor to the highest row_order in this chunk.
+        # A restarted worker re-queries PENDING_NORMALIZATION (the true resume
+        # frontier); the cursor is the durable, language-agnostic progress marker.
+        last_row_order = chunk[-1].row_order
+        BatchJob.objects.filter(pk=job.pk).update(
+            processed_through_row_order=last_row_order
         )
 
     recompute_job_counters(job.pk)
     # Refresh in-memory
     job.refresh_from_db()
+
+
+# ---------------------------------------------------------------------------
+# Durable claim (SELECT ... FOR UPDATE SKIP LOCKED) for the ingest worker
+# ---------------------------------------------------------------------------
+
+
+def claim_job_for_processing(worker_id: str) -> BatchJob | None:
+    """Atomically claim the next job needing ingest processing (SKIP LOCKED).
+
+    Mirrors the remote queue protocol: a ``SELECT ... FOR UPDATE SKIP LOCKED``
+    over jobs in a claimable processing_state, flipping it to PARSING with a
+    fresh lease so any-language worker can drive the same column. Returns the
+    claimed job, or None when nothing needs work.
+    """
+    with transaction.atomic():
+        job = (
+            BatchJob.objects.select_for_update(skip_locked=True)
+            .filter(processing_state__in=CLAIMABLE_PROCESSING_STATES)
+            .order_by("created_at", "id")
+            .first()
+        )
+        if job is None:
+            return None
+        job.processing_state = BatchProcessingState.PARSING
+        job.claimed_by = worker_id
+        job.claimed_at = timezone.now()
+        job.claim_lease_version = job.claim_lease_version + 1
+        job.save(
+            update_fields=[
+                "processing_state",
+                "claimed_by",
+                "claimed_at",
+                "claim_lease_version",
+            ]
+        )
+        return job
+
+
+def process_claimed_job(job: BatchJob) -> None:
+    """Run the durable processing pipeline for an already-claimed job.
+
+    Idempotent + restart-safe: delegates to the checkpointed
+    :func:`process_job_items`, which only touches PENDING_NORMALIZATION items, so
+    re-running a partially-processed job never double-processes. On error the job
+    is parked in FAILED with the reason recorded; the items it already resolved
+    stay resolved.
+    """
+    try:
+        process_job_items(job)
+    except Exception as exc:
+        BatchJob.objects.filter(pk=job.pk).update(
+            processing_state=BatchProcessingState.FAILED,
+            status=BatchJobStatus.FAILED,
+            processing_error=str(exc)[:2000],
+        )
+        raise
+
+
+def run_pending_jobs(worker_id: str, *, max_jobs: int | None = None) -> int:
+    """Claim + process pending jobs until the queue is drained (or *max_jobs*).
+
+    Returns the number of jobs processed. Used by the ``process_jobs``
+    management command and by tests that want to drive the durable path.
+    """
+    processed = 0
+    while max_jobs is None or processed < max_jobs:
+        job = claim_job_for_processing(worker_id)
+        if job is None:
+            break
+        process_claimed_job(job)
+        processed += 1
+    return processed
 
 
 def create_job_records(
@@ -616,6 +837,9 @@ def create_job_records(
             secret_hash=secret_hash,
             status=BatchJobStatus.PENDING,
             remote_enabled=remote_enabled,
+            # PARSING is a claimable state: the durable worker can pick the job
+            # up if the synchronous path does not (or has not yet) processed it.
+            processing_state=BatchProcessingState.PARSING,
         )
         ingest_rows(job, rows)
 

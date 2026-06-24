@@ -7,7 +7,12 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from apps.classifications.selectors import get_live_classification, get_seed_classification
+from apps.classifications.selectors import (
+    get_live_classification,
+    get_live_classifications,
+    get_seed_classification,
+    get_seed_classifications,
+)
 from apps.core.enums import SOURCE_PRIORITY, SourceType
 
 INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
@@ -110,6 +115,48 @@ def _label(row: dict[str, Any], prefix: str) -> ChemOntLabel | None:
     return ChemOntLabel(chemont_id=cid, name=name)
 
 
+def _live_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
+    return ClassificationLookupResult(
+        inchikey=row["inchikey"],
+        kingdom=_label(row, "kingdom"),
+        superclass=_label(row, "superclass"),
+        class_=_label(row, "class"),
+        subclass=_label(row, "subclass"),
+        direct_parent=_label(row, "direct_parent"),
+        source_type=row["source_type"],
+        source_priority=row["source_priority"],
+        source_ref=row.get("source_ref"),
+        classification_version=row.get("classification_version"),
+        retrieved_at=row.get("retrieved_at"),
+        query_id=row.get("remote_query_id"),
+        tier=LookupTier.LIVE,
+        result_id=row.get("result_id"),
+    )
+
+
+def _seed_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
+    return ClassificationLookupResult(
+        inchikey=row["inchikey"],
+        kingdom=_label(row, "kingdom"),
+        superclass=_label(row, "superclass"),
+        class_=_label(row, "class"),
+        subclass=_label(row, "subclass"),
+        direct_parent=_label(row, "direct_parent"),
+        # Seed rows are served as the historical-aggregate tier; surface its
+        # canonical priority and the seed source id as provenance so callers
+        # (and a future Go/Rust reader) can audit where the result came from.
+        source_type=SourceType.HISTORICAL_AGGREGATE.value,
+        source_priority=SOURCE_PRIORITY[SourceType.HISTORICAL_AGGREGATE],
+        source_ref=(
+            str(row["seed_source_id"]) if row.get("seed_source_id") is not None else None
+        ),
+        classification_version=row.get("seed_version"),
+        retrieved_at=None,
+        query_id=None,
+        tier=LookupTier.SEED,
+    )
+
+
 def lookup_current_classification(inchikey: str) -> ClassificationLookupResult | None:
     """Look up classification for an exact 27-char InChIKey.
 
@@ -123,44 +170,39 @@ def lookup_current_classification(inchikey: str) -> ClassificationLookupResult |
 
     row = get_live_classification(inchikey)
     if row is not None:
-        return ClassificationLookupResult(
-            inchikey=row["inchikey"],
-            kingdom=_label(row, "kingdom"),
-            superclass=_label(row, "superclass"),
-            class_=_label(row, "class"),
-            subclass=_label(row, "subclass"),
-            direct_parent=_label(row, "direct_parent"),
-            source_type=row["source_type"],
-            source_priority=row["source_priority"],
-            source_ref=row.get("source_ref"),
-            classification_version=row.get("classification_version"),
-            retrieved_at=row.get("retrieved_at"),
-            query_id=row.get("remote_query_id"),
-            tier=LookupTier.LIVE,
-            result_id=row.get("result_id"),
-        )
+        return _live_row_to_result(row)
 
     row = get_seed_classification(inchikey)
     if row is not None:
-        return ClassificationLookupResult(
-            inchikey=row["inchikey"],
-            kingdom=_label(row, "kingdom"),
-            superclass=_label(row, "superclass"),
-            class_=_label(row, "class"),
-            subclass=_label(row, "subclass"),
-            direct_parent=_label(row, "direct_parent"),
-            # Seed rows are served as the historical-aggregate tier; surface its
-            # canonical priority and the seed source id as provenance so callers
-            # (and a future Go/Rust reader) can audit where the result came from.
-            source_type=SourceType.HISTORICAL_AGGREGATE.value,
-            source_priority=SOURCE_PRIORITY[SourceType.HISTORICAL_AGGREGATE],
-            source_ref=(
-                str(row["seed_source_id"]) if row.get("seed_source_id") is not None else None
-            ),
-            classification_version=row.get("seed_version"),
-            retrieved_at=None,
-            query_id=None,
-            tier=LookupTier.SEED,
-        )
+        return _seed_row_to_result(row)
 
     return None
+
+
+def lookup_current_classifications(
+    inchikeys: list[str],
+) -> dict[str, ClassificationLookupResult]:
+    """Bulk equivalent of :func:`lookup_current_classification`.
+
+    Runs ONE ``WHERE inchikey IN (...)`` live query and ONE seed query (instead
+    of the per-item N+1), then applies the SAME live-precedence rule per key:
+    a live hit wins; otherwise the seed hit (if any) is used. Invalid / non-27
+    keys are skipped. The returned dict has identical ``ClassificationLookupResult``
+    values to calling the single-key function per inchikey.
+    """
+    valid = [k for k in dict.fromkeys(inchikeys) if INCHIKEY_RE.match(k)]
+    if not valid:
+        return {}
+
+    live = get_live_classifications(valid)
+    out: dict[str, ClassificationLookupResult] = {
+        key: _live_row_to_result(row) for key, row in live.items()
+    }
+
+    seed_needed = [k for k in valid if k not in out]
+    if seed_needed:
+        seed = get_seed_classifications(seed_needed)
+        for key, row in seed.items():
+            out[key] = _seed_row_to_result(row)
+
+    return out

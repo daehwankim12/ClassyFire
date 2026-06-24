@@ -28,6 +28,7 @@ from apps.batches.services import (
     StructureSubmissionError,
     submit_structure_for_item,
 )
+from apps.batches.upload import iter_upload_rows
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
@@ -77,7 +78,9 @@ def submit_view(request: HttpRequest) -> HttpResponse:
 
         rows = list(parse_text_input(text_input))
 
-        # Handle file upload
+        # Handle file upload — BOUNDED STREAMING parse (F-01). The uploaded file
+        # is dispatched on suffix+content-type and parsed record-by-record via
+        # iter_upload_rows; we NEVER file.read() the whole upload.
         file = request.FILES.get("input_file")
         if file:
             # Reject oversize uploads before reading content.
@@ -92,11 +95,14 @@ def submit_view(request: HttpRequest) -> HttpResponse:
                     {"error": str(exc)},
                     status=413,
                 )
-            file_text = file.read().decode("utf-8", errors="replace")
-            file_rows = list(parse_text_input(file_text))
-            # Re-index to continue after text_input rows
+            # Re-index parsed file rows to continue after any text_input rows,
+            # preserving each parser row's provenance (external_id, raw input).
             offset = len(rows)
-            for row in file_rows:
+            for row in iter_upload_rows(
+                file,
+                filename=file.name,
+                content_type=getattr(file, "content_type", None),
+            ):
                 rows.append({**row, "row_index": row["row_index"] + offset})
 
         job, plaintext_secret, quota_error = create_job_under_quota(
