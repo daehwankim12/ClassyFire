@@ -66,14 +66,14 @@ def test_submit_to_export_flow_via_test_client():
     secret = payload["result_secret"]
 
     # --- 2. Poll job status ---
-    resp = client.get(f"/api/jobs/{job_id}", {"secret": secret})
+    resp = client.get(f"/api/jobs/{job_id}", HTTP_X_JOB_SECRET=secret)
     assert resp.status_code == 200
     status_data = resp.json()
     assert status_data["id"] == job_id
     assert "total_count" in status_data
 
     # --- 3. List items ---
-    resp = client.get(f"/api/jobs/{job_id}/items", {"secret": secret})
+    resp = client.get(f"/api/jobs/{job_id}/items", HTTP_X_JOB_SECRET=secret)
     assert resp.status_code == 200
     items_data = resp.json()
     assert "results" in items_data
@@ -178,8 +178,8 @@ def test_items_pagination_via_test_client():
 
     client = Client()
     resp = client.get(
-        f"/api/jobs/{job.pk}/items",
-        {"secret": secret, "page": 1, "page_size": 10},
+        f"/api/jobs/{job.pk}/items?page=1&page_size=10",
+        HTTP_X_JOB_SECRET=secret,
     )
     assert resp.status_code == 200
     data = resp.json()

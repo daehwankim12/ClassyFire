@@ -82,18 +82,20 @@ def _job_secret(request: HttpRequest, body: dict[str, object] | None = None) -> 
 
     1. ``X-Job-Secret`` request header — keeps the secret out of URLs/query
        strings and therefore out of access logs (preferred for API clients).
-    2. ``body["secret"]`` — accepted for backwards-compat POST/JSON callers.
-    3. ``?secret=`` query parameter — preserved for the shareable-link use case
-       (§9.2: result URLs embed the secret so recipients can open them directly).
+    2. ``body["secret"]`` — accepted for POST/JSON callers.
+    3. ``?secret=`` query parameter — REJECTED; raises ValueError so the caller
+       can return HTTP 400 directing the client to use the header form.
     """
     header_secret = request.headers.get("X-Job-Secret", "")
     if header_secret:
         return header_secret
     if body is not None:
-        body_secret = str(body.get("secret") or "")
-        if body_secret:
-            return body_secret
-    return request.GET.get("secret", "")
+        return str(body.get("secret") or "")
+    if request.GET.get("secret"):
+        raise ValueError(
+            "Use X-Job-Secret header or JSON body secret; query secrets are not accepted."
+        )
+    return ""
 
 
 # Status groups for items filter
@@ -209,9 +211,16 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
 @require_shared_access
 @require_http_methods(["GET"])
 def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
-    """GET /api/jobs/{id}?secret=<plaintext> — return job status JSON."""
+    """GET /api/jobs/{id} — return job status JSON.
+
+    Secret must be supplied via the X-Job-Secret header; query-string secrets
+    are no longer accepted and return HTTP 400.
+    """
     job = get_object_or_404(BatchJob, pk=job_id)
-    secret = _job_secret(request)
+    try:
+        secret = _job_secret(request)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
     if secret:
         if not check_password(secret, job.secret_hash):
             return JsonResponse({"error": "Invalid secret."}, status=403)
@@ -240,9 +249,16 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
 @require_shared_access
 @require_http_methods(["GET"])
 def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
-    """GET /api/jobs/{id}/items — paginated + filtered items JSON."""
+    """GET /api/jobs/{id}/items — paginated + filtered items JSON.
+
+    Secret must be supplied via the X-Job-Secret header; query-string secrets
+    are no longer accepted and return HTTP 400.
+    """
     job = get_object_or_404(BatchJob, pk=job_id)
-    secret = _job_secret(request)
+    try:
+        secret = _job_secret(request)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
     if secret:
         if not check_password(secret, job.secret_hash):
             return JsonResponse({"error": "Invalid secret."}, status=403)

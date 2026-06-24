@@ -75,6 +75,15 @@
         }
     }
 
+    # ── Skip logging for requests that contain secrets in URL ────────────────
+    # Reject residual ?secret= query params at the proxy layer — these should
+    # now return HTTP 400 from Django, but we also skip logging the URL so the
+    # plaintext secret never appears in Caddy access logs.
+    @apiQuerySecret expression `{query.secret} != ""`
+    log_skip @apiQuerySecret
+    @apiExportToken path_regexp api_export_token ^/api/exports/[^/]+/?$
+    log_skip @apiExportToken
+
     # ── Logging ──────────────────────────────────────────────────────────────
     log {
         output stdout

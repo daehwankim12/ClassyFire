@@ -105,8 +105,16 @@ EXPORT_DIR = _env_str("EXPORT_DIR", "/app/export_files")
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": {
+        "redact_secrets": {
+            "()": "apps.core.security.SecretRedactionFilter",
+        },
+    },
     "handlers": {
-        "console": {"class": "logging.StreamHandler"},
+        "console": {
+            "class": "logging.StreamHandler",
+            "filters": ["redact_secrets"],
+        },
     },
     "root": {
         "handlers": ["console"],

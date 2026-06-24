@@ -328,7 +328,8 @@ class TestResultUrlSecret:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, _secret = create_job(rows, remote_enabled=False)
         client = Client()
-        response = client.get(f"/api/jobs/{job.pk}?secret=wrongsecret")
+        # Pass wrong secret via header (query-string secrets now return 400)
+        response = client.get(f"/api/jobs/{job.pk}", HTTP_X_JOB_SECRET="wrongsecret")
         # dev-open: auth gate passes, then per-job secret check gives 403
         assert response.status_code == 403
 
@@ -415,7 +416,8 @@ class TestResultUrlSecret:
 
         claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
         assert claim_response.status_code == 303
-        response = client.get(f"/api/jobs/{job.pk}", {"secret": "wrong"})
+        # Pass wrong secret via header (query-string secrets now return 400)
+        response = client.get(f"/api/jobs/{job.pk}", HTTP_X_JOB_SECRET="wrong")
 
         assert response.status_code == 403
 
@@ -1095,9 +1097,11 @@ class TestReferrerPolicy:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
+        # Use X-Job-Secret header (query-string secrets now return 400)
         response = client.get(
-            f"/api/jobs/{job.pk}?secret={secret}",
+            f"/api/jobs/{job.pk}",
             HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+            HTTP_X_JOB_SECRET=secret,
         )
         assert response.status_code == 200
         assert response.headers.get("Referrer-Policy") == "no-referrer", (
@@ -1111,9 +1115,8 @@ class TestReferrerPolicy:
 
 
 class TestXJobSecretHeader:
-    """The API must accept the per-job secret via the X-Job-Secret request
-    header in addition to ?secret= and body["secret"], allowing API clients
-    to keep the secret out of URLs and access logs."""
+    """The API accepts the per-job secret via the X-Job-Secret request header
+    or body["secret"]; ?secret= query params are rejected with HTTP 400."""
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
@@ -1179,8 +1182,9 @@ class TestXJobSecretHeader:
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
-    def test_query_secret_still_works(self) -> None:
-        """Backwards compat: ?secret= continues to work for shareable links."""
+    def test_query_secret_rejected_with_400(self) -> None:
+        """Query-string secrets are no longer accepted; API returns 400 with
+        a message directing the caller to use the X-Job-Secret header."""
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
@@ -1188,9 +1192,10 @@ class TestXJobSecretHeader:
             f"/api/jobs/{job.pk}?secret={secret}",
             HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
         )
-        assert response.status_code == 200, (
-            f"Expected 200 with ?secret= query param, got {response.status_code}"
+        assert response.status_code == 400, (
+            f"Expected 400 for ?secret= query param, got {response.status_code}"
         )
+        assert "X-Job-Secret" in response.json()["error"]
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
