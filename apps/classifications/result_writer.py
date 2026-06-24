@@ -40,26 +40,21 @@ class WriteOutcome:
 def _resolve_node_id(slot: ChemOntSlot | None) -> int | None:
     """Resolve a ChemOnt slot to its numeric_id FK, or None if unknown.
 
-    Matches by chemont_id (the stable textual key) first, then by name. A
-    missing/unknown node yields None rather than failing the whole write — the
-    raw_json always retains the full provenance.
+    Matches only by chemont_id, the stable textual key. A missing/unknown node
+    yields None rather than falling back to non-unique display names; raw_json
+    and labels always retain the full upstream provenance.
     """
     if slot is None:
         return None
     from apps.chemont.models import ChemOntNode
 
-    if slot.chemont_id:
-        node = ChemOntNode.objects.filter(chemont_id=slot.chemont_id).values_list(
-            "numeric_id", flat=True
-        ).first()
-        if node is not None:
-            return int(node)
-    if slot.name:
-        node = ChemOntNode.objects.filter(name=slot.name).values_list(
-            "numeric_id", flat=True
-        ).first()
-        if node is not None:
-            return int(node)
+    if not slot.chemont_id:
+        return None
+    node = ChemOntNode.objects.filter(chemont_id=slot.chemont_id).values_list(
+        "numeric_id", flat=True
+    ).first()
+    if node is not None:
+        return int(node)
     return None
 
 
@@ -117,6 +112,19 @@ def write_live_result(
 
     Returns a :class:`WriteOutcome` describing whether the write was applied.
     """
+    if norm.inchikey != inchikey:
+        live_id = (
+            ClassyfireLive.objects.filter(inchikey=inchikey)
+            .values_list("id", flat=True)
+            .first()
+        )
+        return WriteOutcome(
+            applied=False,
+            live_id=int(live_id) if live_id is not None else None,
+            archived_history=False,
+            reason="result key mismatch",
+        )
+
     priority = SOURCE_PRIORITY[source_type]
     retrieved_at = retrieved_at or timezone.now()
 

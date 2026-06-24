@@ -610,6 +610,22 @@ def test_result_key_mismatch_no_auto_apply():
     assert item.status == BatchItemStatus.RESULT_KEY_MISMATCH
 
 
+def test_result_writer_rejects_returned_key_mismatch():
+    from apps.classifications.result_writer import write_live_result
+    from apps.remote.mock import parse_wishart_payload
+
+    outcome = write_live_result(
+        IK_A,
+        parse_wishart_payload(build_raw(IK_B)),
+        source_type=SourceType.WISHART_LIVE_ENTITY,
+    )
+
+    assert outcome.applied is False
+    assert outcome.reason == "result key mismatch"
+    assert not ClassyfireLive.objects.filter(inchikey=IK_A).exists()
+    assert not ClassyfireLive.objects.filter(inchikey=IK_B).exists()
+
+
 # ---------------------------------------------------------------------------
 # fan-out across jobs + counters
 # ---------------------------------------------------------------------------
@@ -633,6 +649,146 @@ def test_fan_out_updates_all_waiting_items_across_jobs():
     assert job1.completed_count == 2
     assert job1.remote_pending_count == 0
     assert job1.status == BatchJobStatus.COMPLETE
+
+
+def test_every_resolution_path_pins_classification_snapshot():
+    from apps.chemont.models import ChemOntNode
+    from apps.classifications.models import ClassyfireSeed
+
+    live_node = ChemOntNode.objects.create(
+        numeric_id=9100,
+        chemont_id="CHEMONT:0009100",
+        name="Live pinned kingdom",
+        ontology_version="2.1",
+    )
+    seed_node = ChemOntNode.objects.create(
+        numeric_id=9101,
+        chemont_id="CHEMONT:0009101",
+        name="Seed pinned kingdom",
+        ontology_version="2.1",
+    )
+    ClassyfireLive.objects.create(
+        inchikey=IK_A,
+        source_type=SourceType.WISHART_LIVE_QUERY,
+        source_priority=100,
+        retrieved_at=dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.UTC),
+        kingdom_id=live_node.numeric_id,
+    )
+    ClassyfireSeed.objects.create(
+        inchikey=IK_B,
+        inchikey14=IK_B[:14],
+        seed_source_id=1,
+        seed_version="fixture",
+        kingdom_id=seed_node.numeric_id,
+    )
+
+    local_job, _secret = create_job(
+        [
+            {"raw": IK_A, "row_index": 0},
+            {"raw": IK_B, "row_index": 1},
+        ],
+        remote_enabled=True,
+    )
+    live_item = local_job.items.get(row_order=0)
+    seed_item = local_job.items.get(row_order=1)
+    assert live_item.status == BatchItemStatus.FOUND_LIVE_CACHE
+    assert live_item.classification_snapshot is not None
+    assert live_item.classification_snapshot["inchikey"] == IK_A
+    assert live_item.classification_snapshot["tier"] == "LIVE"
+    assert live_item.classification_snapshot["source_type"] == (
+        SourceType.WISHART_LIVE_QUERY
+    )
+    assert live_item.classification_snapshot["kingdom"]["name"] == (
+        "Live pinned kingdom"
+    )
+    assert seed_item.status == BatchItemStatus.FOUND_SEED_CACHE
+    assert seed_item.classification_snapshot is not None
+    assert seed_item.classification_snapshot["inchikey"] == IK_B
+    assert seed_item.classification_snapshot["tier"] == "SEED"
+    assert seed_item.classification_snapshot["kingdom"]["name"] == (
+        "Seed pinned kingdom"
+    )
+
+    entity_job = _job()
+    _item(entity_job, IK_C, 0)
+    queue.enqueue_task(IK_C)
+    entity_worker = _worker(MockProvider(entities={IK_C: build_raw(IK_C)}))
+    assert entity_worker.tick() is True
+    entity_item = BatchItem.objects.get(job=entity_job, inchikey=IK_C)
+    assert entity_item.status == BatchItemStatus.FOUND_WISHART_ENTITY
+    assert entity_item.classification_snapshot is not None
+    assert entity_item.classification_snapshot["inchikey"] == IK_C
+    assert entity_item.classification_snapshot["tier"] == "LIVE"
+    assert entity_item.classification_snapshot["source_type"] == (
+        SourceType.WISHART_LIVE_ENTITY
+    )
+    assert entity_item.classification_snapshot["kingdom"]["name"] == (
+        "Organic compounds"
+    )
+
+    query_key = "CCCCCCCCCCCCCC-DDDDDDDDDD-N"
+    query_job = _job()
+    query_compound = _compound(query_key)
+    _item(query_job, query_key, 0, compound=query_compound)
+    queue.enqueue_task(query_key, compound_id=query_compound.id)
+    query_worker = _worker(
+        MockProvider(
+            submit_query_ids=["q-snapshot"],
+            poll_script={"q-snapshot": [build_query_response([build_raw(query_key)])]},
+        )
+    )
+    assert query_worker.tick() is True
+    RemoteTask.objects.filter(inchikey=query_key).update(next_run_at=timezone.now())
+    assert query_worker.tick() is True
+    query_item = BatchItem.objects.get(job=query_job, inchikey=query_key)
+    assert query_item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
+    assert query_item.classification_snapshot is not None
+    assert query_item.classification_snapshot["inchikey"] == query_key
+    assert query_item.classification_snapshot["tier"] == "LIVE"
+    assert query_item.classification_snapshot["source_type"] == (
+        SourceType.WISHART_LIVE_QUERY
+    )
+    assert query_item.classification_snapshot["query_id"] == "q-snapshot"
+
+    structure_job, structure_secret = create_job(
+        [{"raw": ETHANOL_INCHIKEY, "row_index": 0}],
+        remote_enabled=True,
+    )
+    structure_item = structure_job.items.get()
+    structure_worker = _worker(MockProvider(submit_query_ids=["q-structure-snapshot"]))
+    assert structure_worker.tick() is True
+    structure_item.refresh_from_db()
+    assert structure_item.status == BatchItemStatus.NEED_STRUCTURE
+
+    client = Client()
+    response = client.post(
+        f"/api/items/{structure_item.pk}/structure",
+        data=json.dumps({"structure": ETHANOL_SMILES, "secret": structure_secret}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+
+    assert structure_worker.tick() is True
+    structure_task = RemoteTask.objects.get(
+        inchikey=ETHANOL_INCHIKEY,
+        state=TaskState.POLL_WAIT,
+    )
+    structure_worker.provider.poll_script["q-structure-snapshot"] = [
+        build_query_response([build_raw(ETHANOL_INCHIKEY)])
+    ]
+    RemoteTask.objects.filter(pk=structure_task.pk).update(next_run_at=timezone.now())
+    assert structure_worker.tick() is True
+    structure_item.refresh_from_db()
+    assert structure_item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
+    assert structure_item.classification_snapshot is not None
+    assert structure_item.classification_snapshot["inchikey"] == ETHANOL_INCHIKEY
+    assert structure_item.classification_snapshot["tier"] == "LIVE"
+    assert structure_item.classification_snapshot["source_type"] == (
+        SourceType.WISHART_LIVE_QUERY
+    )
+    assert structure_item.classification_snapshot["query_id"] == (
+        "q-structure-snapshot"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +889,44 @@ def test_equal_priority_older_result_does_not_overwrite_newer_live():
     assert live.classification_version == "newer"
     assert live.retrieved_at == newer
     assert ClassificationHistory.objects.filter(inchikey=IK_A).count() == 0
+
+
+def test_chemont_name_collision_does_not_link_wrong_node():
+    from apps.chemont.models import ChemOntNode
+    from apps.classifications.result_writer import write_live_result
+    from apps.remote.provider import ChemOntSlot, NormalizedClassification
+
+    ChemOntNode.objects.create(
+        numeric_id=9200,
+        chemont_id="CHEMONT:0009200",
+        name="Ambiguous ChemOnt label",
+        ontology_version="2.1",
+    )
+    ChemOntNode.objects.create(
+        numeric_id=9201,
+        chemont_id="CHEMONT:0009201",
+        name="Ambiguous ChemOnt label",
+        ontology_version="2.1",
+    )
+    norm = NormalizedClassification(
+        inchikey=IK_A,
+        kingdom=ChemOntSlot(chemont_id=None, name="Ambiguous ChemOnt label"),
+        superclass=None,
+        class_=None,
+        subclass=None,
+        direct_parent=None,
+        raw_json={"inchikey": IK_A},
+    )
+
+    outcome = write_live_result(
+        IK_A,
+        norm,
+        source_type=SourceType.WISHART_LIVE_ENTITY,
+    )
+
+    assert outcome.applied is True
+    live = ClassyfireLive.objects.get(inchikey=IK_A)
+    assert live.kingdom_id is None
 
 
 def test_concurrent_create_race_falls_back_to_update(monkeypatch):

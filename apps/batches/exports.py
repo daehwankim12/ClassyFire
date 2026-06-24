@@ -29,6 +29,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import gzip
+import hashlib
 import io
 import json
 import secrets
@@ -228,10 +229,27 @@ def _generate_json_bytes(rows: list[dict[str, str | int | None]]) -> bytes:
     return json.dumps(output, ensure_ascii=False, default=str).encode("utf-8")
 
 
-def _write_export_file(job: BatchJob, fmt: str, token: str) -> Path:
+def _rows_signature(rows: list[dict[str, str | int | None]]) -> str:
+    payload = [
+        {column: row.get(column) for column in COLUMNS}
+        for row in rows
+    ]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_export_file(
+    rows: list[dict[str, str | int | None]],
+    fmt: str,
+    token: str,
+) -> Path:
     """Generate the export file and write it to EXPORT_DIR/{token}.{fmt}."""
     EXPORT_DIR.mkdir(exist_ok=True)
-    rows = _rows_for_job(job)
 
     ext = fmt  # csv, tsv, json, csv.gz, tsv.gz
     dest = EXPORT_DIR / f"{token}.{ext}"
@@ -278,7 +296,7 @@ def _is_valid_meta(meta: dict[str, str]) -> bool:
         return False
 
 
-def _find_existing_token(job_id: str, fmt: str) -> str | None:
+def _find_existing_token(job_id: str, fmt: str, rows_signature: str) -> str | None:
     """Return an existing valid token for job+format, or None."""
     EXPORT_DIR.mkdir(exist_ok=True)
     for meta_file in EXPORT_DIR.glob("*.meta.json"):
@@ -289,7 +307,12 @@ def _find_existing_token(job_id: str, fmt: str) -> str | None:
         if not isinstance(raw, dict):
             continue
         parsed: dict[str, str] = {str(k): str(v) for k, v in raw.items()}
-        if parsed.get("job_id") == job_id and parsed.get("fmt") == fmt and _is_valid_meta(parsed):
+        if (
+            parsed.get("job_id") == job_id
+            and parsed.get("fmt") == fmt
+            and parsed.get("rows_signature") == rows_signature
+            and _is_valid_meta(parsed)
+        ):
             token = parsed.get("token")
             if token:
                 # Verify export file still exists
@@ -304,7 +327,9 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     if fmt not in valid_formats:
         raise ValueError(f"Unsupported format: {fmt!r}. Must be one of: {valid_formats}")
 
-    existing = _find_existing_token(str(job.pk), fmt)
+    rows = _rows_for_job(job)
+    rows_signature = _rows_signature(rows)
+    existing = _find_existing_token(str(job.pk), fmt, rows_signature)
     if existing:
         meta = _load_meta(existing)
         if meta:
@@ -316,13 +341,14 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     expires_at_iso = expires_at.isoformat()
 
     EXPORT_DIR.mkdir(exist_ok=True)
-    _write_export_file(job, fmt, token)
+    _write_export_file(rows, fmt, token)
 
     meta = {
         "token": token,
         "job_id": str(job.pk),
         "fmt": fmt,
         "expires_at": expires_at_iso,
+        "rows_signature": rows_signature,
     }
     _meta_path(token).write_text(json.dumps(meta))
 

@@ -110,6 +110,24 @@ def _get_export_bytes(client: Client, job_id: str, secret: str, fmt: str) -> byt
     return dl_resp.content
 
 
+def _create_export_token(client: Client, job_id: str, secret: str, fmt: str) -> str:
+    resp = client.post(
+        f"/api/jobs/{job_id}/exports",
+        data=json.dumps({"format": fmt, "secret": secret}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 201, f"Export creation failed: {resp.status_code} {resp.content}"
+    return str(resp.json()["token"])
+
+
+def _download_export_bytes(client: Client, token: str) -> bytes:
+    dl_resp = client.get(f"/api/exports/{token}")
+    assert dl_resp.status_code == 200, f"Download failed: {dl_resp.status_code}"
+    if hasattr(dl_resp, "streaming_content"):
+        return b"".join(dl_resp.streaming_content)
+    return dl_resp.content
+
+
 # ---------------------------------------------------------------------------
 # 1. CSV export has correct columns
 # ---------------------------------------------------------------------------
@@ -168,12 +186,15 @@ def test_csv_export_requested_classyfy_row_shape():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_export_uses_pinned_classification_after_live_cache_changes():
+def test_batch_item_and_export_keep_original_classification_after_live_supersede():
     original = _make_chemont(1100, "Original kingdom")
     replacement = _make_chemont(1101, "Replacement kingdom")
     _make_live(ASPIRIN_INCHIKEY, kingdom_id=original.numeric_id, version="v1")
 
     job, secret = _create_simple_job()
+    item = job.items.get()
+    assert item.classification_snapshot is not None
+    assert item.classification_snapshot["kingdom"]["name"] == "Original kingdom"
 
     from apps.classifications.models import ClassyfireLive
 
@@ -190,6 +211,63 @@ def test_export_uses_pinned_classification_after_live_cache_changes():
 
     assert row["ClassyFy Status"] == "Completed"
     assert row["Kingdom"] == "Original kingdom"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_name_only_live_label_remains_visible_without_chemont_fk():
+    from apps.chemont.models import ChemOntNode
+    from apps.classifications.models import ClassyfireLive
+    from apps.classifications.result_writer import write_live_result
+    from apps.classifications.services import snapshot_current_classification
+    from apps.core.enums import SourceType
+    from apps.remote.provider import ChemOntSlot, NormalizedClassification
+
+    ChemOntNode.objects.create(
+        numeric_id=1200,
+        chemont_id="CHEMONT:0001200",
+        name="Upstream name-only kingdom",
+        ontology_version="2.1",
+    )
+    norm = NormalizedClassification(
+        inchikey=ASPIRIN_INCHIKEY,
+        kingdom=ChemOntSlot(chemont_id=None, name="Upstream name-only kingdom"),
+        superclass=None,
+        class_=None,
+        subclass=None,
+        direct_parent=None,
+        raw_json={"inchikey": ASPIRIN_INCHIKEY},
+    )
+
+    outcome = write_live_result(
+        ASPIRIN_INCHIKEY,
+        norm,
+        source_type=SourceType.WISHART_LIVE_ENTITY,
+    )
+
+    assert outcome.applied is True
+    live = ClassyfireLive.objects.get(inchikey=ASPIRIN_INCHIKEY)
+    assert live.kingdom_id is None
+
+    snapshot = snapshot_current_classification(ASPIRIN_INCHIKEY)
+    assert snapshot is not None
+    assert snapshot["kingdom"] == {
+        "chemont_id": None,
+        "name": "Upstream name-only kingdom",
+    }
+
+    job, secret = _create_simple_job()
+    item = job.items.get()
+    assert item.classification_snapshot is not None
+    assert item.classification_snapshot["kingdom"]["name"] == (
+        "Upstream name-only kingdom"
+    )
+
+    client = Client()
+    raw = _get_export_bytes(client, str(job.pk), secret, "csv")
+    text = raw.decode("utf-8")
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    row = next(csv.DictReader(lines))
+    assert row["Kingdom"] == "Upstream name-only kingdom"
 
 
 # ---------------------------------------------------------------------------
@@ -432,3 +510,49 @@ def test_export_deduplication():
     token1 = resp1.json()["token"]
     token2 = resp2.json()["token"]
     assert token1 == token2, "Same job+format should return the same token (dedup)"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_export_reuse_invalidates_after_job_items_resolve():
+    from apps.batches.models import BatchItem
+    from apps.batches.services import create_job_records, recompute_job_counters
+    from apps.classifications.services import snapshot_current_classification
+    from apps.core.enums import BatchItemStatus
+
+    kingdom = _make_chemont(1300, "Fresh completed kingdom")
+    _make_live(ASPIRIN_INCHIKEY, kingdom_id=kingdom.numeric_id)
+    rows = list(parse_text_input(ASPIRIN_SMILES))
+    job, secret = create_job_records(rows, remote_enabled=False)
+    item = job.items.get()
+    item.inchikey = ASPIRIN_INCHIKEY
+    item.status = BatchItemStatus.PENDING_CLASSIFICATION
+    item.save(update_fields=["inchikey", "status"])
+    recompute_job_counters(job.pk)
+
+    client = Client()
+    stale_token = _create_export_token(client, str(job.pk), secret, "csv")
+    stale_text = _download_export_bytes(client, stale_token).decode("utf-8")
+    stale_rows = list(
+        csv.DictReader(
+            [line for line in stale_text.splitlines() if not line.startswith("#")]
+        )
+    )
+    assert stale_rows[0]["ClassyFy Status"] == "Failed"
+
+    BatchItem.objects.filter(pk=item.pk).update(
+        status=BatchItemStatus.FOUND_LIVE_CACHE,
+        classification_snapshot=snapshot_current_classification(ASPIRIN_INCHIKEY),
+    )
+    recompute_job_counters(job.pk)
+
+    fresh_token = _create_export_token(client, str(job.pk), secret, "csv")
+    fresh_text = _download_export_bytes(client, fresh_token).decode("utf-8")
+    fresh_rows = list(
+        csv.DictReader(
+            [line for line in fresh_text.splitlines() if not line.startswith("#")]
+        )
+    )
+
+    assert fresh_token != stale_token
+    assert fresh_rows[0]["ClassyFy Status"] == "Completed"
+    assert fresh_rows[0]["Kingdom"] == "Fresh completed kingdom"

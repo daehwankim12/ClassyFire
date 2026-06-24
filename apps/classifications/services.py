@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -77,11 +78,33 @@ def snapshot_current_classification(inchikey: str) -> dict[str, Any] | None:
     return classification_lookup_snapshot(result)
 
 
+def _stored_label(row: dict[str, Any], prefix: str) -> ChemOntLabel | None:
+    stored_labels = row.get("labels")
+    if isinstance(stored_labels, str):
+        try:
+            stored_labels = json.loads(stored_labels)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(stored_labels, dict):
+        return None
+    stored = stored_labels.get(prefix)
+    if not isinstance(stored, dict):
+        return None
+    stored_cid = stored.get("chemont_id")
+    stored_name = stored.get("name")
+    if stored_cid is None and stored_name is None:
+        return None
+    return ChemOntLabel(
+        chemont_id=str(stored_cid) if stored_cid is not None else None,
+        name=str(stored_name) if stored_name is not None else None,
+    )
+
+
 def _label(row: dict[str, Any], prefix: str) -> ChemOntLabel | None:
     cid = row.get(f"{prefix}_chemont_id")
     name = row.get(f"{prefix}_name")
     if cid is None and name is None:
-        return None
+        return _stored_label(row, prefix)
     return ChemOntLabel(chemont_id=cid, name=name)
 
 
