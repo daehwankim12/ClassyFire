@@ -261,17 +261,19 @@ tracks whether processing is outstanding, complete, or has failed.
 | `PENDING` | Created; items not yet normalized or processed. | no |
 | `IN_PROGRESS` | Normalization / lookup / remote work is ongoing. | no |
 | `COMPLETE` | All items have reached a terminal `BatchItemStatus`. | yes |
+| `COMPLETE_WITH_ACTION_REQUIRED` | All items reached a terminal status, but at least one requires user action (e.g. `NEED_STRUCTURE`). | yes |
 | `FAILED` | Unrecoverable error; job cannot proceed. | yes |
 
 ### Allowed transitions
 
 ```
-PENDING → IN_PROGRESS → COMPLETE   (all items resolved)
-                      └→ FAILED    (unrecoverable error)
+PENDING → IN_PROGRESS → COMPLETE                      (all items resolved)
+                      ├→ COMPLETE_WITH_ACTION_REQUIRED (user-action items remain)
+                      └→ FAILED                        (unrecoverable error)
 ```
 
-`COMPLETE` and `FAILED` are terminal. The `completed_at` timestamp is set on
-entry to either terminal state.
+`COMPLETE`, `COMPLETE_WITH_ACTION_REQUIRED`, and `FAILED` are terminal. The
+`completed_at` timestamp is set on entry to any terminal state.
 
 ### 4b. `batch_jobs.processing_state` — durable ingest-worker machine (F-11)
 

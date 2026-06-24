@@ -398,6 +398,12 @@ def test_bulk_chunk_matches_per_item_statuses_and_pins(monkeypatch):
                 ref.classification_snapshot["tier"]
                 == bulk.classification_snapshot["tier"]
             )
+        # WS-A FK pin: resolved_classification_id must agree between paths.
+        assert ref.resolved_classification_id == bulk.resolved_classification_id, (
+            f"row {ref.row_order} resolved_classification_id mismatch: "
+            f"per-item={ref.resolved_classification_id!r}, "
+            f"bulk={bulk.resolved_classification_id!r}"
+        )
 
 
 @pytest.mark.django_db(transaction=True)

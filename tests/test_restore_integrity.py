@@ -397,6 +397,93 @@ def restore_round_trip():
             f"  '{VALID_IK_ASPIRIN}';",
         )
 
+        # ── Gate-2 new tables ───────────────────────────────────────────────
+
+        # source_artifacts: one artifact record (checksum must be 64-char hex;
+        # imported_at has no DB default despite auto_now_add=True in Django)
+        _psql(
+            SRC_DB,
+            "INSERT INTO source_artifacts "
+            "(source_type, name, checksum, byte_size, imported_at) "
+            "VALUES ("
+            "  'LAB_OFFICIAL_IMPORT', 'test_artifact.json', "
+            "  'a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4', "
+            "  1024, NOW()"
+            ");",
+        )
+
+        # classification_results: one immutable result event (raw_checksum must be
+        # 64-char hex, requested_inchikey must be 27-char; created_at has no DB default)
+        _psql(
+            SRC_DB,
+            f"INSERT INTO classification_results "
+            "(requested_inchikey, kind, source_type, source_priority, "
+            " raw_checksum, retrieved_at, created_at) "
+            "VALUES ("
+            f"  '{VALID_IK_ASPIRIN}', 'APPLIED', 'WISHART_LIVE_QUERY', 100, "
+            "  'b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4f5a6b1c2d3e4f5a6b1c2', "
+            "  NOW(), NOW()"
+            ");",
+        )
+
+        # export_artifacts: one export artifact linked to the existing batch job
+        # (created_at has no DB default despite auto_now_add=True in Django)
+        _psql(
+            SRC_DB,
+            "INSERT INTO export_artifacts "
+            "(job_id, fmt, token, path, checksum, byte_size, "
+            " rows_signature, row_count, created_at, expires_at) "
+            "SELECT "
+            "  id, 'csv', 'test-export-token-abc123', '/tmp/export_test.csv', "
+            "  'c2d3e4f5a6b7c2d3e4f5a6b7c2d3e4f5a6b7c2d3e4f5a6b7c2d3e4f5a6b7c2d3', "
+            "  512, "
+            "  'd3e4f5a6b7c8d3e4f5a6b7c8d3e4f5a6b7c8d3e4f5a6b7c8d3e4f5a6b7c8d3e4', "
+            "  1, NOW(), NOW() + INTERVAL '1 day' "
+            "FROM batch_jobs ORDER BY created_at DESC LIMIT 1;",
+        )
+
+        # remote_submissions: one submission outbox record (request_payload is NOT NULL
+        # JSONB; reconcile_attempts, created_at, updated_at have no DB defaults)
+        _psql(
+            SRC_DB,
+            "INSERT INTO remote_submissions "
+            "(provider, payload_hash, state, request_payload, "
+            " reconcile_attempts, created_at, updated_at) "
+            "VALUES ("
+            "  'wishart', "
+            "  'e4f5a6b7c8d9e4f5a6b7c8d9e4f5a6b7c8d9e4f5a6b7c8d9e4f5a6b7c8d9e4f5', "
+            "  'SUBMITTED', '{\"inchikeys\": [\"" + VALID_IK_ASPIRIN + "\"]}', "
+            "  0, NOW(), NOW()"
+            ");",
+        )
+
+        # remote_attempts: one attempt audit log row (created_at has no DB default)
+        _psql(
+            SRC_DB,
+            "INSERT INTO remote_attempts "
+            "(provider, operation, classification, created_at) "
+            "VALUES ('wishart', 'SUBMIT', 'SUCCESS', NOW());",
+        )
+
+        # remote_rate_buckets: one token bucket row (updated_at has no DB default)
+        _psql(
+            SRC_DB,
+            "INSERT INTO remote_rate_buckets "
+            "(provider, bucket, capacity, tokens, refill_rate_per_sec, updated_at) "
+            "VALUES ('wishart', 'submit', 10, 10.0, 0.5, NOW()) "
+            "ON CONFLICT DO NOTHING;",
+        )
+
+        # remote_circuits: one circuit breaker row (state/consecutive_failures/updated_at
+        # have no DB defaults despite Django Python-level defaults)
+        _psql(
+            SRC_DB,
+            "INSERT INTO remote_circuits "
+            "(provider, state, consecutive_failures, updated_at) "
+            "VALUES ('wishart', 'CLOSED', 0, NOW()) "
+            "ON CONFLICT DO NOTHING;",
+        )
+
         # ── Dump SRC ────────────────────────────────────────────────────────
         with tempfile.NamedTemporaryFile(
             suffix=".dump", prefix="cf_integrity_", delete=False
@@ -520,6 +607,14 @@ def _row_count(db: str, table: str) -> int:
     "classification_history",
     "seed_imports",
     "system_events",
+    # Gate-2 new tables
+    "classification_results",
+    "source_artifacts",
+    "export_artifacts",
+    "remote_submissions",
+    "remote_attempts",
+    "remote_rate_buckets",
+    "remote_circuits",
 ])
 def test_row_count_matches_src(restore_round_trip, table):
     """Row count in DST must equal SRC for all non-seed tables.
