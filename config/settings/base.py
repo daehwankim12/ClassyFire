@@ -190,11 +190,12 @@ EXPORT_RETENTION_DAYS: int = env_int("EXPORT_RETENTION_DAYS", 14)
 EXPORT_ARTIFACT_STORAGE_BACKEND: str = env_str("EXPORT_ARTIFACT_STORAGE_BACKEND", "local")
 DISK_UPLOAD_PAUSE_PERCENT: int = env_int("DISK_UPLOAD_PAUSE_PERCENT", 85)
 MAX_ROWS_PER_JOB: int = env_int("MAX_ROWS_PER_JOB", 10_000)
-# F-11: when True the upload routes STAGE BatchItems (PENDING_NORMALIZATION) and
-# RETURN immediately, leaving all normalization/lookup/upsert/task-create to the
-# durable `process_jobs` worker. When False (default) the routes run the
-# synchronous in-request pipeline so existing immediate-result tests stay green.
-INGEST_DEFER_HEAVY_PROCESSING: bool = env_bool("INGEST_DEFER_HEAVY_PROCESSING", False)
+# F-11: when True (default) the upload routes STAGE BatchItems
+# (PENDING_NORMALIZATION) and RETURN immediately with 202, leaving all
+# normalization/lookup/upsert/task-create to the durable `process_jobs` worker.
+# Set to False only in tests or diagnostics that need the synchronous in-request
+# pipeline.
+INGEST_DEFER_HEAVY_PROCESSING: bool = env_bool("INGEST_DEFER_HEAVY_PROCESSING", True)
 JOB_CREATE_RATE_LIMIT_PER_MINUTE: int = env_int("JOB_CREATE_RATE_LIMIT_PER_MINUTE", 30)
 JOB_CREATE_DAILY_ROW_CAP: int = env_int("JOB_CREATE_DAILY_ROW_CAP", 100_000)
 ACTIVE_JOB_CAP: int = env_int("ACTIVE_JOB_CAP", 20)

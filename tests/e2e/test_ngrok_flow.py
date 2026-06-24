@@ -60,7 +60,7 @@ def test_submit_to_export_flow_via_test_client():
         "/api/jobs",
         {"text_input": ASPIRIN_SMILES, "remote_enabled": False},
     )
-    assert resp.status_code == 201, resp.content
+    assert resp.status_code == 202, resp.content
     payload = resp.json()
     job_id = payload["job_id"]
     secret = payload["result_secret"]

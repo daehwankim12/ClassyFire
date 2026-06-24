@@ -53,9 +53,10 @@ $$$$
 
 @pytest.mark.django_db(transaction=True)
 def test_web_submit_csv_upload_dispatch_and_provenance():
-    """POST a CSV to the web submit route → rows created with SMILES detected
-    type + external_id provenance preserved."""
+    """POST a CSV to the web submit route → rows staged with correct provenance;
+    after worker drains, detected_type and inchikey are resolved."""
     from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import run_pending_jobs
     from apps.core.enums import DetectedInputType
 
     csv = (
@@ -75,11 +76,17 @@ def test_web_submit_csv_upload_dispatch_and_provenance():
     job = BatchJob.objects.latest("created_at")
     items = list(BatchItem.objects.filter(job=job).order_by("row_order"))
     assert len(items) == 2
+    # Provenance (original_input + external_id) is set at staging time.
     assert items[0].original_input == ASPIRIN_SMILES
     assert items[0].external_id == "ASP-1"
+    assert items[1].external_id == "CAF-2"
+
+    # Run the durable worker to complete normalization + lookup.
+    run_pending_jobs("test-worker", max_jobs=10)
+
+    items = list(BatchItem.objects.filter(job=job).order_by("row_order"))
     assert items[0].detected_type == DetectedInputType.SMILES
     assert items[0].inchikey == ASPIRIN_INCHIKEY
-    assert items[1].external_id == "CAF-2"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -127,8 +134,9 @@ def test_web_submit_sdf_upload_dispatch_and_external_id():
 
 @pytest.mark.django_db(transaction=True)
 def test_api_multipart_csv_upload_dispatch():
-    """The API route also accepts a multipart CSV upload and dispatches it."""
+    """The API route also accepts a multipart CSV upload and dispatches it (202 staged)."""
     from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import run_pending_jobs
 
     csv = f"smiles,id\n{ASPIRIN_SMILES},API-1\n".encode()
     upload = SimpleUploadedFile("input.csv", csv, content_type="text/csv")
@@ -137,11 +145,14 @@ def test_api_multipart_csv_upload_dispatch():
         "/api/jobs",
         {"input_file": upload, "remote_enabled": "false"},
     )
-    assert resp.status_code == 201, resp.content
+    assert resp.status_code == 202, resp.content
     data = resp.json()
     job = BatchJob.objects.get(pk=data["job_id"])
     item = BatchItem.objects.filter(job=job).get()
     assert item.external_id == "API-1"
+    # inchikey is resolved by the worker, not the HTTP request.
+    run_pending_jobs("test-worker", max_jobs=10)
+    item.refresh_from_db()
     assert item.inchikey == ASPIRIN_INCHIKEY
 
 
@@ -445,9 +456,8 @@ def test_bulk_lookup_runs_single_query_for_chunk(monkeypatch):
 
 
 @pytest.mark.django_db(transaction=True)
-@override_settings(INGEST_DEFER_HEAVY_PROCESSING=True)
 def test_deferred_post_returns_immediately_items_pending():
-    """(a) With the flag True, the HTTP POST returns WITHOUT running heavy work:
+    """(a) The HTTP POST always returns 202 WITHOUT running heavy work:
     items are still PENDING_NORMALIZATION and the job is not COMPLETE."""
     from apps.batches.models import BatchItem, BatchJob
     from apps.core.enums import BatchItemStatus, BatchJobStatus, BatchProcessingState
@@ -458,7 +468,7 @@ def test_deferred_post_returns_immediately_items_pending():
         data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": "false"}),
         content_type="application/json",
     )
-    assert resp.status_code == 201, resp.content
+    assert resp.status_code == 202, resp.content
     job = BatchJob.objects.get(pk=resp.json()["job_id"])
 
     # HTTP did NOT block on normalization: the item is staged, not resolved.
@@ -672,6 +682,6 @@ def test_json_remote_enabled_empty_string_stays_enabled():
         data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": ""}),
         content_type="application/json",
     )
-    assert resp.status_code == 201, resp.content
+    assert resp.status_code == 202, resp.content
     job = BatchJob.objects.get(pk=resp.json()["job_id"])
     assert job.remote_enabled is True
