@@ -251,16 +251,12 @@ class RemoteWorker:
             if not self._key_matches(task.inchikey, norm.inchikey):
                 self._handle_key_mismatch(task)
                 return
-            write_live_result(
-                task.inchikey,
-                norm,
-                source_type=SourceType.WISHART_LIVE_ENTITY,
-                retrieved_at=timezone.now(),
+            self._apply_result_with_fence(
+                task,
+                query=None,
+                norm=norm,
+                final_status=BatchItemStatus.FOUND_WISHART_ENTITY,
             )
-            fanout.fan_out_result(
-                task.inchikey, BatchItemStatus.FOUND_WISHART_ENTITY
-            )
-            queue.finish_task(task)
             return
 
         # MISS: submit a structure query if we have a structure, else NEED_STRUCTURE.
@@ -872,17 +868,72 @@ class RemoteWorker:
         if not self._key_matches(task.inchikey, norm.inchikey):
             self._handle_key_mismatch(task)
             return
-        write_live_result(
-            task.inchikey,
-            norm,
-            source_type=SourceType.WISHART_LIVE_QUERY,
-            remote_query_id=query.remote_query_id,
-            retrieved_at=timezone.now(),
+        self._apply_result_with_fence(
+            task,
+            query=query,
+            norm=norm,
+            final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
         )
-        fanout.fan_out_result(
-            task.inchikey, BatchItemStatus.COMPLETE_AFTER_WISHART
+
+    # -- fenced result application (F-07) ----------------------------------
+
+    def _apply_result_with_fence(
+        self,
+        task: RemoteTask,
+        *,
+        query: RemoteQuery | None,
+        norm: NormalizedClassification,
+        final_status: BatchItemStatus,
+    ) -> None:
+        """Apply a successful result under ONE lease-fenced transaction (F-07).
+
+        The lease guard runs FIRST: :func:`queue.lock_owned_task` row-locks the
+        task and re-asserts this worker still owns the lease before ANY side
+        effect. A stale worker (whose lease was stolen after a crash/stale-lock
+        recovery) raises :class:`LeaseLost` here and writes NOTHING — no
+        ClassificationResult event, no fan-out, no transition. Only an owning
+        worker reaches the write/fan-out/DONE, and all three commit atomically
+        with the lease check, so the result is applied exactly once.
+        """
+        with transaction.atomic():
+            locked = queue.lock_owned_task(task)
+            write_live_result(
+                locked.inchikey,
+                norm,
+                source_type=(
+                    SourceType.WISHART_LIVE_QUERY
+                    if query is not None
+                    else SourceType.WISHART_LIVE_ENTITY
+                ),
+                remote_query_id=query.remote_query_id if query is not None else None,
+                retrieved_at=query.submitted_at if query is not None else timezone.now(),
+            )
+            fanout.fan_out_result(locked.inchikey, final_status)
+            queue.transition_locked(
+                locked, TaskState.DONE, lock_owner=None, locked_at=None
+            )
+
+    def apply_fenced_result_for_test(
+        self, task: RemoteTask, norm: NormalizedClassification, *, remote_query_id: str
+    ) -> None:
+        """Test-only hook: drive the fenced query-result apply for ``task``.
+
+        Mirrors the query-resolved path: obtains (or creates) the RemoteQuery for
+        ``remote_query_id`` exactly as the real poll path links it, then calls
+        :meth:`_apply_result_with_fence`. Named ``for_test`` so it is obviously a
+        harness entry point and never wired into production flow.
+        """
+        query, _ = RemoteQuery.objects.get_or_create(
+            provider=PROVIDER,
+            remote_query_id=remote_query_id,
+            defaults={"payload_hash": f"test:{remote_query_id}"},
         )
-        queue.finish_task(task)
+        self._apply_result_with_fence(
+            task,
+            query=query,
+            norm=norm,
+            final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
+        )
 
     # -- helpers -----------------------------------------------------------
 

@@ -290,6 +290,52 @@ def transition(task: RemoteTask, state: TaskState, **fields: object) -> None:
         setattr(task, key, value)
 
 
+def lock_owned_task(task: RemoteTask) -> RemoteTask:
+    """Row-lock ``task`` and assert this worker still owns its lease (F-07).
+
+    ``SELECT ... FOR UPDATE`` the row, then verify its
+    ``(lease_version, lease_token, lock_owner)`` still match the in-memory
+    ``task`` the caller holds. If the lease was stolen/reclaimed (a fresh worker
+    claimed it after stale-lock recovery) the triple no longer matches and we
+    raise :class:`LeaseLost` BEFORE the caller commits any side effect.
+
+    MUST be called inside a ``transaction.atomic()`` so the returned row stays
+    locked for the duration of the fenced work; the lock + ownership check make a
+    subsequent :func:`transition_locked` on the returned instance race-free.
+    """
+    locked = RemoteTask.objects.select_for_update().get(pk=task.pk)
+    if (
+        locked.lease_version != task.lease_version
+        or locked.lease_token != task.lease_token
+        or locked.lock_owner != task.lock_owner
+    ):
+        raise LeaseLost(task.pk)
+    return locked
+
+
+def transition_locked(
+    locked: RemoteTask, state: TaskState, **fields: object
+) -> None:
+    """Transition an ALREADY-LOCKED, ownership-verified row (no second guard).
+
+    Unlike :func:`transition`, this does NOT re-run the lease-conditional UPDATE:
+    the caller has already row-locked ``locked`` and verified ownership via
+    :func:`lock_owned_task` within the SAME ``transaction.atomic()``, so no other
+    worker can mutate the row until this transaction commits. A plain
+    ``UPDATE ... WHERE pk=...`` is therefore correct. The in-memory ``locked`` is
+    mutated to match the written values.
+
+    PRECONDITION: ``locked`` was returned by :func:`lock_owned_task` in the
+    enclosing atomic block (row-locked + lease verified).
+    """
+    update_values: dict[str, object] = {"state": state, "updated_at": timezone.now()}
+    update_values.update(fields)
+    RemoteTask.objects.filter(pk=locked.pk).update(**update_values)
+    locked.state = state
+    for key, value in fields.items():
+        setattr(locked, key, value)
+
+
 def claim_extra(task: RemoteTask, worker_id: str) -> None:
     """Claim a select_for_update'd extra into LOCKED with a fresh lease (F-07).
 
