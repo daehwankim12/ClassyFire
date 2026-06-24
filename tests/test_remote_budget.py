@@ -122,3 +122,41 @@ def test_fair_claim_does_not_hide_principal_behind_first_50_tasks():
     assert claimed_1.pk == first_a.pk
     assert claimed_2 is not None
     assert claimed_2.pk == first_b.pk
+
+
+@pytest.mark.django_db(transaction=True)
+def test_fair_claim_locks_principal_state_rows_before_task_update():
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from apps.core.enums import TaskState
+    from apps.remote import queue
+    from apps.remote.models import RemoteTask
+
+    RemoteTask.objects.create(
+        inchikey=IK_A,
+        principal="principal-a",
+        state=TaskState.READY,
+    )
+    RemoteTask.objects.create(
+        inchikey=IK_B,
+        principal="principal-b",
+        state=TaskState.READY,
+    )
+
+    with CaptureQueriesContext(connection) as captured:
+        claimed = queue.claim_task("worker-1")
+
+    assert claimed is not None
+    queries = [query["sql"] for query in captured.captured_queries]
+    state_lock_index = next(
+        index
+        for index, sql in enumerate(queries)
+        if '"remote_principal_states"' in sql and "FOR UPDATE" in sql
+    )
+    task_update_index = next(
+        index
+        for index, sql in enumerate(queries)
+        if sql.startswith('UPDATE "remote_tasks"')
+    )
+    assert state_lock_index < task_update_index

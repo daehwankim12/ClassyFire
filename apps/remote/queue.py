@@ -156,9 +156,16 @@ def claim_task(
             .values_list("principal", flat=True)
             .distinct()
         )
+        for principal in principals:
+            RemotePrincipalState.objects.get_or_create(
+                principal=principal,
+                defaults={"last_claimed_at": None, "claim_count": 0},
+            )
         states = {
             state.principal: state
-            for state in RemotePrincipalState.objects.filter(principal__in=principals)
+            for state in RemotePrincipalState.objects.select_for_update()
+            .filter(principal__in=principals)
+            .order_by("principal")
         }
 
         def principal_fairness_key(principal: str) -> tuple[bool, object, str]:
@@ -200,11 +207,7 @@ def claim_task(
                 "updated_at",
             ]
         )
-        principal_state, _created = RemotePrincipalState.objects.get_or_create(
-            principal=task.principal,
-            defaults={"last_claimed_at": None, "claim_count": 0},
-        )
-        RemotePrincipalState.objects.filter(pk=principal_state.pk).update(
+        RemotePrincipalState.objects.filter(pk=states[task.principal].pk).update(
             last_claimed_at=now,
             claim_count=F("claim_count") + 1,
         )

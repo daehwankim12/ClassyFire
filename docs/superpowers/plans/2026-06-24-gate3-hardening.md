@@ -1,6 +1,6 @@
 # Gate 3 Hardening Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]` / `- [x]`) syntax for tracking.
 
 **Goal:** Add Gate 3 hardening seams for lookup backend replacement, operations metrics, artifact storage, provider contract validation, remote budget fairness, signed audit logs, and load-test evidence.
 
@@ -41,7 +41,7 @@
 - Modify: `apps/classifications/services.py`
 - Test: `tests/test_lookup_backend.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests proving:
 - `lookup_current_classification()` delegates to a configured backend.
@@ -56,19 +56,19 @@ POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=55432 POSTGRES_TEST_DB=cf_test_w
 
 Expected: fails because `apps.classifications.backends` does not exist or services do not delegate.
 
-- [ ] **Step 2: Implement backend protocol**
+- [x] **Step 2: Implement backend protocol**
 
 Create `ClassificationLookupBackend` with `lookup_one(inchikey)` and `lookup_many(inchikeys)`. Implement `PostgresClassificationLookupBackend` by moving the current SQL/selectors orchestration behind the interface.
 
-- [ ] **Step 3: Route service calls**
+- [x] **Step 3: Route service calls**
 
 Add `get_lookup_backend()` in `services.py`, defaulting to PostgreSQL. Keep public dataclass/result types stable.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run the focused lookup tests, then `tests/test_classification_lookup.py` and `tests/test_batch_ingest.py`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit message: `feat: add classification lookup backend seam`.
 
@@ -80,7 +80,7 @@ Commit message: `feat: add classification lookup backend seam`.
 - Modify: `docs/operations.md`
 - Test: `tests/test_gate3_metrics.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests proving the snapshot includes:
 - remote queue counts by state and lag seconds for due work;
@@ -91,19 +91,19 @@ Add tests proving the snapshot includes:
 
 Expected: fails because `collect_metrics_snapshot()` and command are missing.
 
-- [ ] **Step 2: Implement metrics collector**
+- [x] **Step 2: Implement metrics collector**
 
 Use aggregate queries only; do not iterate full tables. Return a plain dataclass with `to_dict()`.
 
-- [ ] **Step 3: Implement command**
+- [x] **Step 3: Implement command**
 
 `python manage.py emit_metrics_snapshot --json` writes one JSON document to stdout.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run `tests/test_gate3_metrics.py tests/test_operations.py`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit message: `feat: add gate3 metrics snapshots`.
 
@@ -115,7 +115,7 @@ Commit message: `feat: add gate3 metrics snapshots`.
 - Modify: `config/settings/base.py`
 - Test: `tests/test_artifact_storage.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests proving:
 - exports are saved/read through `ArtifactStorage`;
@@ -124,19 +124,19 @@ Add tests proving:
 
 Expected: fails because storage seam is absent.
 
-- [ ] **Step 2: Implement storage protocol**
+- [x] **Step 2: Implement storage protocol**
 
 Create `ArtifactStorage` protocol with `open_write_atomic(name)`, `open_read(name)`, `exists(name)`, `delete(name)`, and `path_for_local_read(name)`.
 
-- [ ] **Step 3: Wire exports**
+- [x] **Step 3: Wire exports**
 
 Keep `EXPORT_DIR` local default. Existing `FileResponse` path behavior remains unchanged for local storage.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run `tests/test_artifact_storage.py tests/test_exports.py`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Commit message: `feat: add artifact storage seam`.
 
@@ -187,7 +187,7 @@ Commit message: `feat: validate remote provider contracts`.
 - Test: `tests/test_remote_budget.py`
 - Test: `tests/test_audit_signing.py`
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 Add tests proving:
 - a principal daily remote budget can reject new remote work without dropping the batch item;
@@ -196,23 +196,23 @@ Add tests proving:
 
 Expected: fails because budget and signed audit helpers are absent.
 
-- [ ] **Step 2: Add DB model/migration**
+- [x] **Step 2: Add DB model/migration**
 
 Add `RemoteBudgetLedger` rows for reservations and `AuditSignature` rows linked to `SystemEvent`.
 
-- [ ] **Step 3: Implement reservation and fair priority**
+- [x] **Step 3: Implement reservation and fair priority**
 
 Default budget is permissive so existing tests keep passing. When configured, reserve one unit per new remote task candidate and mark excess rows `REMOTE_DELAYED` with a clear message.
 
-- [ ] **Step 4: Sign audit events**
+- [x] **Step 4: Sign audit events**
 
 Use HMAC-SHA256 with `DJANGO_SECRET_KEY` or `AUDIT_SIGNING_KEY`; store key id and payload digest.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run `tests/test_remote_budget.py tests/test_audit_signing.py tests/test_batch_ingest.py tests/test_remote_queue.py`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 Commit message: `feat: add remote budget fairness and audit signing`.
 
@@ -246,13 +246,13 @@ Commit message: `test: add gate3 load probe`.
 
 ## Final Verification
 
-- [ ] Run full real-Postgres suite:
+- [x] Run full real-Postgres suite:
 
 ```bash
 POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=55432 POSTGRES_TEST_DB=cf_test_wt12 POSTGRES_TEST_USER=classyfire POSTGRES_TEST_PASSWORD=classyfire UV_CACHE_DIR=/tmp/uv-cache-classyfire make test-postgres PYTEST_ARGS='--create-db -q'
 ```
 
-- [ ] Run static checks:
+- [x] Run static checks:
 
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache-classyfire uv run --locked --extra dev ruff check .
@@ -260,7 +260,7 @@ UV_CACHE_DIR=/tmp/uv-cache-classyfire uv run --locked --extra dev mypy apps conf
 UV_CACHE_DIR=/tmp/uv-cache-classyfire uv run --locked --extra dev python manage.py makemigrations --check --dry-run
 ```
 
-- [ ] Validate compose:
+- [x] Validate compose:
 
 ```bash
 cp .env.example .env
@@ -268,7 +268,7 @@ docker compose config >/tmp/classyfire-gate3-compose-config.out
 rm .env
 ```
 
-- [ ] Final review:
+- [x] Final review:
   - Confirm all Gate 3 bullets in `docs/superpowers/plans/2026-06-24-classyfire-hardening.md` are implemented or explicitly documented as manual evidence.
   - Confirm no public API contract regression.
   - Confirm worktree is clean except intended commits.
