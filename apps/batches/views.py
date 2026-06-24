@@ -4,13 +4,15 @@ Routes
 ------
 GET  /                              — Submit page
 POST /                              — Process submission, redirect to job page
-GET  /jobs/{uuid}/{secret}/         — Job detail page
-GET  /jobs/{uuid}/{secret}/items    — HTMX partial: items table
-GET  /items/{id}/{secret}/structure — Structure-completion form
-POST /items/{id}/{secret}/structure — Process structure submission
+GET  /jobs/{uuid}/{secret}/         — Legacy link exchange, then redirect
+GET  /jobs/{uuid}/{secret}/items    — Legacy link exchange, then redirect
+GET  /items/{id}/{secret}/structure — Legacy link exchange, then redirect
+POST /items/{id}/{secret}/structure — Process success or redirect errors
 GET  /stats/                        — DB status page
 """
 from __future__ import annotations
+
+import json
 
 from django.contrib.auth.hashers import check_password
 from django.core.paginator import Paginator
@@ -24,7 +26,6 @@ from apps.batches.services import (
     StructureKeyMismatchError,
     StructureSubmissionConflictError,
     StructureSubmissionError,
-    create_job,
     submit_structure_for_item,
 )
 from apps.compounds.models import CompoundStructure
@@ -32,7 +33,10 @@ from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
     UploadTooLargeError,
     check_upload_size,
+    create_job_under_quota,
+    request_has_job_access_cookie,
     require_shared_access_web,
+    set_job_access_cookie,
 )
 
 PAGE_SIZE = 100
@@ -90,11 +94,28 @@ def submit_view(request: HttpRequest) -> HttpResponse:
             for row in file_rows:
                 rows.append({**row, "row_index": row["row_index"] + offset})
 
-        # Note: over-limit rows are handled inside the service layer (_process_item)
-        # so both UI and API paths are covered consistently — no per-view sentinel
-        # injection needed here.
-        job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)
-        return redirect(f"/jobs/{job.pk}/{plaintext_secret}/")
+        job, plaintext_secret, quota_error = create_job_under_quota(
+            request,
+            rows,
+            remote_enabled=remote_enabled,
+        )
+        if quota_error is not None:
+            quota_payload = json.loads(quota_error.content.decode("utf-8"))
+            return render(
+                request,
+                "batches/submit.html",
+                {"error": quota_payload["error"]},
+                status=quota_error.status_code,
+            )
+
+        if job is None:
+            return render(
+                request,
+                "batches/submit.html",
+                {"error": "Job creation failed."},
+                status=500,
+            )
+        return redirect(f"/jobs/{job.pk}/claim/{plaintext_secret}/")
 
     return render(request, "batches/submit.html")
 
@@ -104,10 +125,35 @@ def submit_view(request: HttpRequest) -> HttpResponse:
 # ---------------------------------------------------------------------------
 
 
-def job_detail_view(request: HttpRequest, job_id: str, secret: str) -> HttpResponse:
-    """GET /jobs/{uuid}/{secret}/ — Job detail with paginated results table."""
+def _has_job_access(request: HttpRequest, job: BatchJob, secret: str | None) -> bool:
+    if secret is None:
+        return request_has_job_access_cookie(request, job.pk)
+    return bool(check_password(secret, job.secret_hash))
+
+
+def job_claim_view(request: HttpRequest, job_id: str, secret: str) -> HttpResponse:
+    """Exchange a one-time URL secret for a secretless job-access cookie."""
     job = get_object_or_404(BatchJob, pk=job_id)
     if not check_password(secret, job.secret_hash):
+        return HttpResponseForbidden("Invalid secret.")
+
+    response = HttpResponse(status=303)
+    response["Location"] = f"/jobs/{job.pk}/"
+    set_job_access_cookie(response, request, job.pk)
+    return response
+
+
+def job_detail_view(
+    request: HttpRequest,
+    job_id: str,
+    secret: str | None = None,
+) -> HttpResponse:
+    """GET /jobs/{uuid}/ or /jobs/{uuid}/{secret}/ — Job detail page."""
+    job = get_object_or_404(BatchJob, pk=job_id)
+    if secret is not None:
+        return _exchange_legacy_job_secret(request, job, secret)
+
+    if not _has_job_access(request, job, secret):
         return HttpResponseForbidden("Invalid secret.")
 
     status_filter = request.GET.get("status_filter", "")
@@ -126,6 +172,7 @@ def job_detail_view(request: HttpRequest, job_id: str, secret: str) -> HttpRespo
         {
             "job": job,
             "secret": secret,
+            "secretless": secret is None,
             "items": page_obj,
             "page_obj": page_obj,
             "status_filter": status_filter,
@@ -135,10 +182,58 @@ def job_detail_view(request: HttpRequest, job_id: str, secret: str) -> HttpRespo
     )
 
 
-def item_table_partial_view(request: HttpRequest, job_id: str, secret: str) -> HttpResponse:
-    """GET /jobs/{uuid}/{secret}/items — HTMX partial returning only the items table."""
-    job = get_object_or_404(BatchJob, pk=job_id)
+def _exchange_legacy_job_secret(
+    request: HttpRequest,
+    job: BatchJob,
+    secret: str,
+) -> HttpResponse:
+    """Exchange legacy secret-bearing job URLs without rendering the secret."""
     if not check_password(secret, job.secret_hash):
+        return HttpResponseForbidden("Invalid secret.")
+
+    response = HttpResponse(status=303)
+    response["Location"] = f"/jobs/{job.pk}/"
+    set_job_access_cookie(response, request, job.pk)
+    return response
+
+
+def _redirect_with_job_access_cookie(
+    request: HttpRequest,
+    job: BatchJob,
+    location: str,
+    *,
+    status: int = 303,
+) -> HttpResponse:
+    response = HttpResponse(status=status)
+    response["Location"] = location
+    set_job_access_cookie(response, request, job.pk)
+    return response
+
+
+def _append_query_string(request: HttpRequest, location: str) -> str:
+    query_string = request.META.get("QUERY_STRING", "")
+    if not query_string:
+        return location
+    return f"{location}?{query_string}"
+
+
+def item_table_partial_view(
+    request: HttpRequest,
+    job_id: str,
+    secret: str | None = None,
+) -> HttpResponse:
+    """GET /jobs/{uuid}/items or /jobs/{uuid}/{secret}/items — HTMX partial."""
+    job = get_object_or_404(BatchJob, pk=job_id)
+    if secret is not None:
+        if not check_password(secret, job.secret_hash):
+            return HttpResponseForbidden("Invalid secret.")
+        return _redirect_with_job_access_cookie(
+            request,
+            job,
+            _append_query_string(request, f"/jobs/{job.pk}/items"),
+        )
+
+    if not _has_job_access(request, job, secret):
         return HttpResponseForbidden("Invalid secret.")
 
     # Refresh job from DB before rendering
@@ -160,6 +255,7 @@ def item_table_partial_view(request: HttpRequest, job_id: str, secret: str) -> H
         {
             "job": job,
             "secret": secret,
+            "secretless": secret is None,
             "items": page_obj,
             "page_obj": page_obj,
             "status_filter": status_filter,
@@ -189,12 +285,27 @@ def _filter_items(job: BatchJob, status_filter: str, search: str) -> QuerySet:
 # ---------------------------------------------------------------------------
 
 
-def structure_form_view(request: HttpRequest, item_id: int, secret: str) -> HttpResponse:
-    """GET/POST /items/{id}/{secret}/structure — Submit a structure for a NEED_STRUCTURE item."""
+def structure_form_view(
+    request: HttpRequest,
+    item_id: int,
+    secret: str | None = None,
+) -> HttpResponse:
+    """GET/POST structure form, authorized by job cookie or legacy secret path."""
     item = get_object_or_404(BatchItem, pk=item_id)
     job = item.job
+    legacy_secret = secret
 
-    if not check_password(secret, job.secret_hash):
+    if legacy_secret is not None:
+        if not check_password(legacy_secret, job.secret_hash):
+            return HttpResponseForbidden("Invalid secret.")
+        if request.method == "GET":
+            return _redirect_with_job_access_cookie(
+                request,
+                job,
+                f"/items/{item.pk}/structure",
+            )
+        secret = None
+    elif not _has_job_access(request, job, secret):
         return HttpResponseForbidden("Invalid secret.")
 
     error: str | None = None
@@ -221,7 +332,17 @@ def structure_form_view(request: HttpRequest, item_id: int, secret: str) -> Http
             except StructureSubmissionError as exc:
                 error = str(exc)
             else:
-                return redirect(f"/jobs/{job.pk}/{secret}/")
+                response: HttpResponse = redirect(f"/jobs/{job.pk}/")
+                if legacy_secret is not None:
+                    set_job_access_cookie(response, request, job.pk)
+                return response
+
+    if legacy_secret is not None:
+        return _redirect_with_job_access_cookie(
+            request,
+            job,
+            f"/items/{item.pk}/structure",
+        )
 
     return render(
         request,
@@ -229,6 +350,7 @@ def structure_form_view(request: HttpRequest, item_id: int, secret: str) -> Http
         {
             "item": item,
             "secret": secret,
+            "secretless": secret is None,
             "error": error,
             "submitted_structure": submitted_structure,
         },

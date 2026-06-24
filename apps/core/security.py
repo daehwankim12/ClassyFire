@@ -17,10 +17,9 @@ validated against it via constant-time check_password.  When it is NOT set
 (dev-open mode), the gate passes all requests — this allows existing tests and
 local development to function without configuration.
 
-CSRF note: the /api/ endpoints use @csrf_exempt because bearer-token auth
-provides a complete compensating control (no ambient cookie authority is
-trusted).  Any browser-session POST that is NOT bearer-token protected (e.g.
-the submit form at /) retains normal Django CSRF protection.
+CSRF note: API POST endpoints preserve bearer-token ergonomics, but ambient
+browser credentials (shared sessions or job-access cookies) must pass Django
+CSRF checks.
 
 PROD mode: if ACCESS_MODE="strict" or SHARED_ACCESS_PASSWORD_HASH is non-empty
 in prod.py (enforced via env_required), the gate will deny all unauthenticated
@@ -29,16 +28,30 @@ requests.
 from __future__ import annotations
 
 import functools
+import hashlib
 import io
 import logging
+import shutil
 import zipfile
 from collections.abc import Callable
+from datetime import timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
-from django.http import HttpRequest, JsonResponse
+from django.core import signing
+from django.core.cache import cache
+from django.db import connection, transaction
+from django.db.models import Sum
+from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.middleware.csrf import CsrfViewMiddleware
+from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from apps.batches.models import BatchJob
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -47,6 +60,10 @@ logger = logging.getLogger(__name__)
 MAX_STRUCTURE_LEN: int = 100_000  # bytes per structure string
 MAX_SDF_PROPERTY_LEN: int = 10_000  # bytes per SDF property value
 MAX_DECOMPRESSION_RATIO: float = 100.0  # reject if expanded > N x compressed
+
+SHARED_ACCESS_SESSION_KEY = "shared_access_authenticated"
+JOB_ACCESS_COOKIE_PREFIX = "cf_job_access_"
+JOB_ACCESS_COOKIE_SALT = "classyfire-job-access"
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +99,25 @@ def _check_bearer(request: HttpRequest) -> bool:
     return bool(check_password(token, stored_hash))
 
 
-def _is_authenticated(request: HttpRequest) -> bool:
+def _has_token_credential(request: HttpRequest) -> bool:
+    auth_header = request.headers.get("Authorization", "")
+    return auth_header.startswith("Bearer ") or bool(
+        request.headers.get("X-Shared-Access-Token", "")
+    )
+
+
+def _is_authenticated(request: HttpRequest, job_id: str | None = None) -> bool:
     """Return True if the request carries valid credentials."""
     if _is_dev_open():
         return True
 
+    if job_id is not None and request_has_job_access_cookie(request, job_id):
+        return True
+
     if _check_bearer(request):
+        return True
+
+    if request.session.get(SHARED_ACCESS_SESSION_KEY) is True:
         return True
 
     if hasattr(request, "user") and request.user.is_authenticated:
@@ -106,12 +136,30 @@ def require_shared_access(view_func: Callable) -> Callable:
     """
     @functools.wraps(view_func)
     def wrapper(request: HttpRequest, *args, **kwargs):
-        if not _is_authenticated(request):
+        if not _is_authenticated(request, kwargs.get("job_id")):
             return JsonResponse(
                 {"error": "Authentication required."},
                 status=401,
                 headers={"WWW-Authenticate": 'Bearer realm="ClassyFire"'},
             )
+        return view_func(request, *args, **kwargs)
+
+    return wrapper
+
+
+def require_csrf_for_cookie_auth(view_func: Callable) -> Callable:
+    """Require CSRF only for unsafe requests using ambient browser credentials."""
+    @functools.wraps(view_func)
+    def wrapper(request: HttpRequest, *args, **kwargs):
+        if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+            return view_func(request, *args, **kwargs)
+        if _is_dev_open() or _check_bearer(request):
+            return view_func(request, *args, **kwargs)
+
+        csrf = CsrfViewMiddleware(lambda _request: HttpResponse())
+        rejection = csrf.process_view(request, lambda _request: HttpResponse(), (), {})
+        if rejection is not None:
+            return rejection
         return view_func(request, *args, **kwargs)
 
     return wrapper
@@ -128,19 +176,362 @@ def require_shared_access_web(view_func: Callable) -> Callable:
     In dev-open mode (SHARED_ACCESS_PASSWORD_HASH unset), all requests pass.
     In secure mode, a valid Bearer token, session login, or
     X-Shared-Access-Token header is required; unauthenticated browser requests
-    receive a plain-text 403 so no JSON parser is needed on the client side.
+    are redirected to the shared-access login form.
     """
-    from django.http import HttpResponseForbidden  # local import to avoid circular
+    from django.shortcuts import redirect  # local import to avoid circular
+    from django.urls import reverse
 
     @functools.wraps(view_func)
     def wrapper(request: HttpRequest, *args, **kwargs):
-        if not _is_authenticated(request):
-            return HttpResponseForbidden(
-                "Access denied. A valid shared-access credential is required."
-            )
+        if not _is_authenticated(request, kwargs.get("job_id")):
+            access_url = reverse("shared_access")
+            return redirect(f"{access_url}?next={request.get_full_path()}")
         return view_func(request, *args, **kwargs)
 
     return wrapper
+
+
+def authenticate_shared_password(request: HttpRequest, password: str) -> bool:
+    """Persist a browser shared-access session when *password* matches."""
+    stored_hash = _get_shared_hash()
+    if not stored_hash or not check_password(password, stored_hash):
+        return False
+    if request.session.session_key is None:
+        request.session.create()
+    else:
+        request.session.cycle_key()
+    request.session[SHARED_ACCESS_SESSION_KEY] = True
+    clear_shared_access_login_failures(request)
+    return True
+
+
+def request_has_shared_access(request: HttpRequest, job_id: object | None = None) -> bool:
+    """Return True when request carries app-level or job-cookie credentials."""
+    return _is_authenticated(request, str(job_id) if job_id is not None else None)
+
+
+def _shared_access_login_failure_key(request: HttpRequest) -> str:
+    ip_digest = hashlib.sha256(_client_ip(request).encode("utf-8")).hexdigest()
+    return f"classyfire:shared-access-login-failures:{ip_digest}"
+
+
+def is_shared_access_login_throttled(request: HttpRequest) -> bool:
+    """Return True when repeated failed shared-password attempts hit the cap."""
+    limit = int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_LIMIT", 5))
+    if limit < 0:
+        return False
+    return int(cache.get(_shared_access_login_failure_key(request), 0) or 0) >= limit
+
+
+def record_shared_access_login_failure(request: HttpRequest) -> None:
+    limit = int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_LIMIT", 5))
+    if limit < 0:
+        return
+    key = _shared_access_login_failure_key(request)
+    window = int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS", 300))
+    count = int(cache.get(key, 0) or 0) + 1
+    cache.set(key, count, timeout=max(1, window))
+
+
+def clear_shared_access_login_failures(request: HttpRequest) -> None:
+    cache.delete(_shared_access_login_failure_key(request))
+
+
+# ---------------------------------------------------------------------------
+# Per-job access cookies
+# ---------------------------------------------------------------------------
+
+
+def job_access_cookie_name(job_id: object) -> str:
+    normalized = str(job_id).replace("-", "")
+    return f"{JOB_ACCESS_COOKIE_PREFIX}{normalized}"
+
+
+def _job_cookie_max_age_seconds() -> int:
+    days = int(getattr(settings, "JOB_ACCESS_COOKIE_DAYS", 14))
+    return max(1, days) * 24 * 60 * 60
+
+
+def _job_access_signer() -> signing.TimestampSigner:
+    return signing.TimestampSigner(salt=JOB_ACCESS_COOKIE_SALT)
+
+
+def set_job_access_cookie(response: HttpResponse, request: HttpRequest, job_id: object) -> None:
+    """Set an HttpOnly SameSite=Lax cookie proving access to one job."""
+    secure = bool(getattr(settings, "SESSION_COOKIE_SECURE", False) or request.is_secure())
+    response.set_cookie(
+        job_access_cookie_name(job_id),
+        _job_access_signer().sign(str(job_id)),
+        max_age=_job_cookie_max_age_seconds(),
+        httponly=True,
+        secure=secure,
+        samesite="Lax",
+    )
+
+
+def request_has_job_access_cookie(request: HttpRequest, job_id: object) -> bool:
+    value = request.COOKIES.get(job_access_cookie_name(job_id), "")
+    if not value:
+        return False
+    try:
+        unsigned = _job_access_signer().unsign(
+            value,
+            max_age=_job_cookie_max_age_seconds(),
+        )
+    except signing.BadSignature:
+        return False
+    return unsigned == str(job_id)
+
+
+# ---------------------------------------------------------------------------
+# Job creation and export quotas
+# ---------------------------------------------------------------------------
+
+
+def _client_ip(request: HttpRequest) -> str:
+    forwarded_for = str(request.META.get("HTTP_X_FORWARDED_FOR", ""))
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return str(request.META.get("REMOTE_ADDR", "") or "0.0.0.0")
+
+
+def _principal(request: HttpRequest) -> str:
+    if hasattr(request, "user") and request.user.is_authenticated:
+        return f"user:{request.user.pk}"
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        digest = hashlib.sha256(auth_header.encode("utf-8")).hexdigest()[:32]
+        return f"bearer:{digest}"
+    shared_header = request.headers.get("X-Shared-Access-Token", "")
+    if shared_header:
+        digest = hashlib.sha256(shared_header.encode("utf-8")).hexdigest()[:32]
+        return f"shared-token:{digest}"
+    if hasattr(request, "session") and request.session.get(SHARED_ACCESS_SESSION_KEY) is True:
+        session_key = request.session.session_key or "unsaved"
+        digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+        return f"session:{digest}"
+    ip_digest = hashlib.sha256(_client_ip(request).encode("utf-8")).hexdigest()[:32]
+    return f"ip:{ip_digest}"
+
+
+def _quota_response(message: str, status: int = 429) -> JsonResponse:
+    return JsonResponse({"error": message}, status=status)
+
+
+def quota_advisory_lock_keys(kind: str, principal: str, ip_address: str) -> tuple[int, int]:
+    """Return stable signed 32-bit keys for PostgreSQL advisory locks."""
+    digest = hashlib.sha256(f"{kind}\0{principal}\0{ip_address}".encode()).digest()
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:8], "big", signed=True),
+    )
+
+
+def _acquire_quota_advisory_lock(kind: str, principal: str, ip_address: str) -> None:
+    key_1, key_2 = quota_advisory_lock_keys(kind, principal, ip_address)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s, %s)", [key_1, key_2])
+
+
+def _acquire_quota_advisory_locks(kind: str, principal: str, ip_address: str) -> None:
+    _acquire_quota_advisory_lock(kind, f"principal:{principal}", "")
+    _acquire_quota_advisory_lock(kind, "", f"ip:{ip_address}")
+    _acquire_quota_advisory_lock(kind, "global", "active")
+
+
+def _disk_usage_percent(path: Path) -> float:
+    usage = shutil.disk_usage(path)
+    if usage.total <= 0:
+        return 0.0
+    return ((usage.total - usage.free) / usage.total) * 100
+
+
+def validate_job_create_controls(request: HttpRequest, row_count: int) -> JsonResponse | None:
+    """Return a rejection response when job creation would exceed limits."""
+    pause_percent = int(getattr(settings, "DISK_UPLOAD_PAUSE_PERCENT", 85))
+    if _disk_usage_percent(Path(settings.BASE_DIR)) >= pause_percent:
+        return _quota_response(
+            "New job creation is paused because disk usage is above the configured limit.",
+            status=503,
+        )
+
+    max_rows = int(getattr(settings, "MAX_ROWS_PER_JOB", 10_000))
+    if row_count > max_rows:
+        return _quota_response(
+            f"Job has {row_count} rows; the maximum is {max_rows}.",
+            status=413,
+        )
+
+    from apps.batches.models import BatchJob, BatchQuotaEvent
+    from apps.core.enums import BatchJobStatus
+
+    now = timezone.now()
+    minute_ago = now - timedelta(minutes=1)
+    day_ago = now - timedelta(days=1)
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+
+    per_minute = int(getattr(settings, "JOB_CREATE_RATE_LIMIT_PER_MINUTE", 30))
+    if per_minute >= 0:
+        recent = BatchQuotaEvent.objects.filter(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            created_at__gte=minute_ago,
+        ).filter(principal=principal)
+        recent_by_ip = BatchQuotaEvent.objects.filter(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            created_at__gte=minute_ago,
+            ip_address=ip_address,
+        )
+        if recent.count() >= per_minute or recent_by_ip.count() >= per_minute:
+            return _quota_response("Job creation rate limit exceeded.")
+
+    daily_cap = int(getattr(settings, "JOB_CREATE_DAILY_ROW_CAP", 100_000))
+    used_rows = (
+        BatchQuotaEvent.objects.filter(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            created_at__gte=day_ago,
+        )
+        .filter(principal=principal)
+        .aggregate(total=Sum("row_count"))["total"]
+        or 0
+    )
+    if used_rows + row_count > daily_cap:
+        return _quota_response("Daily row quota exceeded.")
+
+    active_cap = int(getattr(settings, "ACTIVE_JOB_CAP", 20))
+    active_count = BatchJob.objects.filter(
+        status__in=[BatchJobStatus.PENDING, BatchJobStatus.IN_PROGRESS]
+    ).count()
+    if active_count >= active_cap:
+        return _quota_response("Active job limit exceeded.")
+
+    return None
+
+
+def reserve_job_create_quota(request: HttpRequest, row_count: int) -> JsonResponse | None:
+    from apps.batches.models import BatchQuotaEvent
+
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+    with transaction.atomic():
+        _acquire_quota_advisory_locks(
+            BatchQuotaEvent.KIND_JOB_CREATE,
+            principal,
+            ip_address,
+        )
+        quota_error = validate_job_create_controls(request, row_count)
+        if quota_error is not None:
+            return quota_error
+        BatchQuotaEvent.objects.create(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            principal=principal,
+            ip_address=ip_address,
+            row_count=row_count,
+        )
+    return None
+
+
+def create_job_under_quota(
+    request: HttpRequest,
+    rows: list[dict[str, object]],
+    *,
+    remote_enabled: bool,
+) -> tuple[BatchJob | None, str, JsonResponse | None]:
+    """Create a job while holding quota locks through the active-job insert."""
+    from apps.batches import services
+    from apps.batches.models import BatchQuotaEvent
+
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+    with transaction.atomic():
+        _acquire_quota_advisory_locks(
+            BatchQuotaEvent.KIND_JOB_CREATE,
+            principal,
+            ip_address,
+        )
+        quota_error = validate_job_create_controls(request, len(rows))
+        if quota_error is not None:
+            return None, "", quota_error
+
+        job, plaintext_secret = services.create_job_records(
+            rows,
+            remote_enabled=remote_enabled,
+        )
+        BatchQuotaEvent.objects.create(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            principal=principal,
+            ip_address=ip_address,
+            row_count=len(rows),
+        )
+
+    services.process_job_items(job)
+    return job, plaintext_secret, None
+
+
+def record_job_create_event(request: HttpRequest, row_count: int) -> None:
+    from apps.batches.models import BatchQuotaEvent
+
+    BatchQuotaEvent.objects.create(
+        kind=BatchQuotaEvent.KIND_JOB_CREATE,
+        principal=_principal(request),
+        ip_address=_client_ip(request),
+        row_count=row_count,
+    )
+
+
+def validate_export_create_controls(request: HttpRequest) -> JsonResponse | None:
+    from apps.batches.models import BatchQuotaEvent
+
+    limit = int(getattr(settings, "EXPORT_CREATE_RATE_LIMIT_PER_MINUTE", 10))
+    now = timezone.now()
+    minute_ago = now - timedelta(minutes=1)
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+    recent_by_principal = BatchQuotaEvent.objects.filter(
+        kind=BatchQuotaEvent.KIND_EXPORT_CREATE,
+        principal=principal,
+        created_at__gte=minute_ago,
+    ).count()
+    recent_by_ip = BatchQuotaEvent.objects.filter(
+        kind=BatchQuotaEvent.KIND_EXPORT_CREATE,
+        ip_address=ip_address,
+        created_at__gte=minute_ago,
+    ).count()
+    if limit >= 0 and (recent_by_principal >= limit or recent_by_ip >= limit):
+        return _quota_response("Export rate limit exceeded.")
+    return None
+
+
+def reserve_export_create_quota(request: HttpRequest) -> JsonResponse | None:
+    from apps.batches.models import BatchQuotaEvent
+
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+    with transaction.atomic():
+        _acquire_quota_advisory_locks(
+            BatchQuotaEvent.KIND_EXPORT_CREATE,
+            principal,
+            ip_address,
+        )
+        quota_error = validate_export_create_controls(request)
+        if quota_error is not None:
+            return quota_error
+        BatchQuotaEvent.objects.create(
+            kind=BatchQuotaEvent.KIND_EXPORT_CREATE,
+            principal=principal,
+            ip_address=ip_address,
+        )
+    return None
+
+
+def record_export_create_event(request: HttpRequest) -> None:
+    from apps.batches.models import BatchQuotaEvent
+
+    BatchQuotaEvent.objects.create(
+        kind=BatchQuotaEvent.KIND_EXPORT_CREATE,
+        principal=_principal(request),
+        ip_address=_client_ip(request),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,9 @@
 
 <h2>Export</h2>
 <form method="post" action="/api/jobs/{{ job.id }}/exports" id="export-form">
+  {% if secret %}
   <input type="hidden" name="secret" value="{{ secret }}">
+  {% endif %}
   <select name="format">
     <option value="csv">CSV</option>
     <option value="tsv">TSV</option>
@@ -57,7 +59,11 @@
 <h2>Results</h2>
 <div id="job-items-table"
      data-job-complete="{{ job_complete|lower }}"
+     {% if secretless %}
+     hx-get="/jobs/{{ job.id }}/items?{{ request.GET.urlencode }}"
+     {% else %}
      hx-get="/jobs/{{ job.id }}/{{ secret }}/items?{{ request.GET.urlencode }}"
+     {% endif %}
      hx-trigger="poll"
      hx-swap="outerHTML">
   {% include "batches/item_table.html" %}
@@ -67,13 +73,17 @@
 function doExport() {
   var form = document.getElementById('export-form');
   var fmt = form.querySelector('select[name="format"]').value;
-  var secret = form.querySelector('input[name="secret"]').value;
+  var secretInput = form.querySelector('input[name="secret"]');
   var statusEl = document.getElementById('export-status');
+  var payload = {format: fmt};
+  if (secretInput) {
+    payload.secret = secretInput.value;
+  }
   statusEl.textContent = 'Creating export...';
   fetch('/api/jobs/{{ job.id }}/exports', {
     method: 'POST',
     headers: {'Content-Type': 'application/json', 'X-CSRFToken': '{{ csrf_token }}'},
-    body: JSON.stringify({format: fmt, secret: secret})
+    body: JSON.stringify(payload)
   }).then(function(r){ return r.json(); }).then(function(data){
     if (data.token) {
       var link = document.createElement('a');

@@ -49,18 +49,30 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from apps.batches.exports import create_export, get_export_path
+from apps.batches.exports import (
+    create_export_for_authorized_job,
+    get_export_metadata,
+    get_export_path,
+)
 from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import (
     StructureKeyMismatchError,
     StructureSubmissionConflictError,
     StructureSubmissionError,
-    create_job,
     submit_structure_for_item,
 )
 from apps.core.enums import BatchItemStatus
-from apps.core.security import UploadTooLargeError, check_upload_size, require_shared_access
+from apps.core.security import (
+    UploadTooLargeError,
+    check_upload_size,
+    create_job_under_quota,
+    request_has_job_access_cookie,
+    request_has_shared_access,
+    require_csrf_for_cookie_auth,
+    require_shared_access,
+    reserve_export_create_quota,
+)
 
 
 def _job_secret(request: HttpRequest, body: dict[str, object] | None = None) -> str:
@@ -98,8 +110,9 @@ STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
 }
 
 
-@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@csrf_exempt
 @require_shared_access
+@require_csrf_for_cookie_auth
 @require_http_methods(["POST"])
 def create_job_view(request: HttpRequest) -> JsonResponse:
     """POST /api/jobs — create a batch job and run local processing."""
@@ -132,8 +145,16 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
 
     rows = list(parse_text_input(text_input))
 
-    # Create the job and run local processing
-    job, plaintext_secret = create_job(rows, remote_enabled=remote_enabled)
+    job, plaintext_secret, quota_error = create_job_under_quota(
+        request,
+        rows,
+        remote_enabled=remote_enabled,
+    )
+    if quota_error is not None:
+        return quota_error
+
+    if job is None:
+        return JsonResponse({"error": "Job creation failed."}, status=500)
 
     return JsonResponse(
         {"job_id": str(job.pk), "result_secret": plaintext_secret},
@@ -141,14 +162,17 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
     )
 
 
-@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@csrf_exempt
 @require_shared_access
 @require_http_methods(["GET"])
 def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """GET /api/jobs/{id}?secret=<plaintext> — return job status JSON."""
     job = get_object_or_404(BatchJob, pk=job_id)
     secret = _job_secret(request)
-    if not check_password(secret, job.secret_hash):
+    if secret:
+        if not check_password(secret, job.secret_hash):
+            return JsonResponse({"error": "Invalid secret."}, status=403)
+    elif not request_has_job_access_cookie(request, job.pk):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
     return JsonResponse(
@@ -169,14 +193,17 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     )
 
 
-@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@csrf_exempt
 @require_shared_access
 @require_http_methods(["GET"])
 def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """GET /api/jobs/{id}/items — paginated + filtered items JSON."""
     job = get_object_or_404(BatchJob, pk=job_id)
     secret = _job_secret(request)
-    if not check_password(secret, job.secret_hash):
+    if secret:
+        if not check_password(secret, job.secret_hash):
+            return JsonResponse({"error": "Invalid secret."}, status=403)
+    elif not request_has_job_access_cookie(request, job.pk):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
     status_filter = request.GET.get("status_filter", "")
@@ -222,13 +249,20 @@ def job_items_view(request: HttpRequest, job_id: str) -> JsonResponse:
     )
 
 
-@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
-@require_shared_access
+@csrf_exempt
+@require_csrf_for_cookie_auth
 @require_http_methods(["POST"])
 def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     """POST /api/items/{id}/structure — submit a structure for a NEED_STRUCTURE item."""
     item = get_object_or_404(BatchItem, pk=item_id)
     job = item.job
+
+    if not request_has_shared_access(request, job.pk):
+        return JsonResponse(
+            {"error": "Authentication required."},
+            status=401,
+            headers={"WWW-Authenticate": 'Bearer realm="ClassyFire"'},
+        )
 
     try:
         body = json.loads(request.body or b"{}")
@@ -236,7 +270,10 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
         return JsonResponse({"error": f"Invalid JSON: {exc}"}, status=400)
 
     secret = _job_secret(request, body)
-    if not check_password(secret, job.secret_hash):
+    if secret:
+        if not check_password(secret, job.secret_hash):
+            return JsonResponse({"error": "Invalid secret."}, status=403)
+    elif not request_has_job_access_cookie(request, job.pk):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
     structure = body.get("structure", "").strip()
@@ -266,8 +303,9 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     return JsonResponse({"status": item.status})
 
 
-@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
+@csrf_exempt
 @require_shared_access
+@require_csrf_for_cookie_auth
 @require_http_methods(["POST"])
 def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
     """POST /api/jobs/{id}/exports — create or reuse an export."""
@@ -285,7 +323,20 @@ def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
         return JsonResponse({"error": "format is required"}, status=400)
 
     try:
-        token, expires_at = create_export(job, fmt, secret)
+        if secret:
+            if not check_password(secret, job.secret_hash):
+                return JsonResponse({"error": "Invalid secret."}, status=403)
+            quota_error = reserve_export_create_quota(request)
+            if quota_error is not None:
+                return quota_error
+            token, expires_at = create_export_for_authorized_job(job, str(fmt))
+        elif request_has_job_access_cookie(request, job.pk):
+            quota_error = reserve_export_create_quota(request)
+            if quota_error is not None:
+                return quota_error
+            token, expires_at = create_export_for_authorized_job(job, str(fmt))
+        else:
+            return JsonResponse({"error": "Invalid secret."}, status=403)
     except PermissionError:
         return JsonResponse({"error": "Invalid secret."}, status=403)
     except ValueError as exc:
@@ -294,11 +345,21 @@ def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
     return JsonResponse({"token": token, "expires_at": expires_at}, status=201)
 
 
-@csrf_exempt  # CSRF N/A: token-only; require_shared_access provides compensating control
-@require_shared_access
 @require_http_methods(["GET"])
-def download_export_view(request: HttpRequest, token: str) -> FileResponse | HttpResponseNotFound:
+def download_export_view(
+    request: HttpRequest,
+    token: str,
+) -> FileResponse | HttpResponseNotFound | JsonResponse:
     """GET /api/exports/{token} — download an export by token."""
+    meta = get_export_metadata(token)
+    job_id = meta.get("job_id") if meta is not None else None
+    if not request_has_shared_access(request, job_id):
+        return JsonResponse(
+            {"error": "Authentication required."},
+            status=401,
+            headers={"WWW-Authenticate": 'Bearer realm="ClassyFire"'},
+        )
+
     path = get_export_path(token)
     if path is None:
         return HttpResponseNotFound("Export not found or expired.")

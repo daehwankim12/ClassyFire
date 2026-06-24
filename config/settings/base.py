@@ -138,6 +138,12 @@ NGROK_DOMAIN: str = env_str("NGROK_DOMAIN", "")
 # ---------------------------------------------------------------------------
 
 SHARED_ACCESS_PASSWORD_HASH: str = env_str("SHARED_ACCESS_PASSWORD_HASH", "")
+SHARED_ACCESS_LOGIN_FAILURE_LIMIT: int = env_int(
+    "SHARED_ACCESS_LOGIN_FAILURE_LIMIT", 5
+)
+SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS: int = env_int(
+    "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS", 300
+)
 
 # ---------------------------------------------------------------------------
 # Seeding
@@ -171,6 +177,12 @@ UPLOAD_RETENTION_DAYS: int = env_int("UPLOAD_RETENTION_DAYS", 30)
 JOB_RETENTION_DAYS: int = env_int("JOB_RETENTION_DAYS", 90)
 EXPORT_RETENTION_DAYS: int = env_int("EXPORT_RETENTION_DAYS", 14)
 DISK_UPLOAD_PAUSE_PERCENT: int = env_int("DISK_UPLOAD_PAUSE_PERCENT", 85)
+MAX_ROWS_PER_JOB: int = env_int("MAX_ROWS_PER_JOB", 10_000)
+JOB_CREATE_RATE_LIMIT_PER_MINUTE: int = env_int("JOB_CREATE_RATE_LIMIT_PER_MINUTE", 30)
+JOB_CREATE_DAILY_ROW_CAP: int = env_int("JOB_CREATE_DAILY_ROW_CAP", 100_000)
+ACTIVE_JOB_CAP: int = env_int("ACTIVE_JOB_CAP", 20)
+EXPORT_CREATE_RATE_LIMIT_PER_MINUTE: int = env_int("EXPORT_CREATE_RATE_LIMIT_PER_MINUTE", 10)
+JOB_ACCESS_COOKIE_DAYS: int = env_int("JOB_ACCESS_COOKIE_DAYS", 14)
 
 # ---------------------------------------------------------------------------
 # Referrer policy (defence-in-depth: URL path embeds a per-job secret)

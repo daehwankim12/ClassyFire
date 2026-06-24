@@ -6,6 +6,12 @@ create_export(job, fmt, secret) -> (token, expires_at)
     Create (or reuse) an export file for the given job and format.
     Validates secret. Returns a URL-safe token and expiry datetime.
 
+create_export_for_authorized_job(job, fmt) -> (token, expires_at)
+    Create (or reuse) an export after the caller has already authorized job access.
+
+get_export_metadata(token) -> dict | None
+    Return export metadata for auth decisions, or None.
+
 get_export_path(token) -> Path | None
     Return the file path for a valid, non-expired export token, or None.
 
@@ -293,43 +299,17 @@ def _find_existing_token(job_id: str, fmt: str) -> str | None:
     return None
 
 
-def create_export(job: BatchJob, fmt: str, plaintext_secret: str) -> tuple[str, str]:
-    """Create or reuse an export for *job* in *fmt*.
-
-    Parameters
-    ----------
-    job:
-        The BatchJob to export.
-    fmt:
-        One of: csv, tsv, json, csv.gz, tsv.gz.
-    plaintext_secret:
-        The plaintext job secret for authentication.
-
-    Returns
-    -------
-    (token, expires_at_iso)
-        Token is URL-safe and can be used to retrieve the file.
-
-    Raises
-    ------
-    PermissionError if secret doesn't match.
-    ValueError if fmt is unsupported.
-    """
-    if not check_password(plaintext_secret, job.secret_hash):
-        raise PermissionError("Invalid secret")
-
+def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     valid_formats = {"csv", "tsv", "json", "csv.gz", "tsv.gz"}
     if fmt not in valid_formats:
         raise ValueError(f"Unsupported format: {fmt!r}. Must be one of: {valid_formats}")
 
-    # Dedup: reuse existing valid token if available
     existing = _find_existing_token(str(job.pk), fmt)
     if existing:
         meta = _load_meta(existing)
         if meta:
             return existing, meta["expires_at"]
 
-    # Create new export
     token = secrets.token_urlsafe(32)
     retention_days = getattr(settings, "EXPORT_RETENTION_DAYS", 14)
     expires_at = datetime.now(tz=dt.UTC) + timedelta(days=retention_days)
@@ -347,6 +327,23 @@ def create_export(job: BatchJob, fmt: str, plaintext_secret: str) -> tuple[str, 
     _meta_path(token).write_text(json.dumps(meta))
 
     return token, expires_at_iso
+
+
+def create_export(job: BatchJob, fmt: str, plaintext_secret: str) -> tuple[str, str]:
+    """Create or reuse an export after validating the plaintext job secret."""
+    if not check_password(plaintext_secret, job.secret_hash):
+        raise PermissionError("Invalid secret")
+    return _create_or_reuse_export(job, fmt)
+
+
+def create_export_for_authorized_job(job: BatchJob, fmt: str) -> tuple[str, str]:
+    """Create or reuse an export when the caller already proved job access."""
+    return _create_or_reuse_export(job, fmt)
+
+
+def get_export_metadata(token: str) -> dict[str, str] | None:
+    """Return parsed export metadata for auth checks, or None."""
+    return _load_meta(token)
 
 
 def get_export_path(token: str) -> Path | None:

@@ -24,7 +24,11 @@
       <td>{{ item.message|default:'' }}</td>
       <td>
         {% if item.status == 'NEED_STRUCTURE' %}
+        {% if secretless %}
+        <a href="/items/{{ item.pk }}/structure">Add structure</a>
+        {% else %}
         <a href="/items/{{ item.pk }}/{{ secret }}/structure">Add structure</a>
+        {% endif %}
         {% endif %}
       </td>
     </tr>

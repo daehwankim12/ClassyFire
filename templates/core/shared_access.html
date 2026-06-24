@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+
+{% block title %}Access — ClassyFire{% endblock %}
+
+{% block content %}
+<h1>Shared Access</h1>
+
+{% if error %}
+<div class="error">
+  <strong>Error:</strong> {{ error }}
+</div>
+{% endif %}
+
+<form method="post">
+  {% csrf_token %}
+  <input type="hidden" name="next" value="{{ next }}">
+  <label for="password">Shared password:</label>
+  <input type="password" id="password" name="password" autocomplete="current-password" required>
+  <button type="submit">Continue</button>
+</form>
+{% endblock %}
