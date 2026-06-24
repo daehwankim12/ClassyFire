@@ -8,6 +8,7 @@ be deleted by cleanup.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -829,3 +830,101 @@ def test_cleanup_removes_expired_exports_and_uploads(tmp_path, monkeypatch, sett
     assert fresh_export.exists()
     assert fresh_meta.exists()
     assert BatchJob.objects.filter(pk=upload_job.pk).exists()
+
+
+def test_cleanup_export_metadata_cannot_delete_path_traversal_payload(
+    tmp_path, monkeypatch, settings
+):
+    from apps.operations.cleanup import cleanup_expired
+
+    export_dir = tmp_path / "export_cache"
+    export_dir.mkdir()
+    outside_payload = tmp_path / "escape.csv"
+    outside_payload.write_text("do not delete")
+    monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
+    settings.EXPORT_RETENTION_DAYS = 14
+
+    (export_dir / "evil.meta.json").write_text(
+        json.dumps(
+            {
+                "token": "../escape",
+                "job_id": "job-1",
+                "fmt": "csv",
+                "expires_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            }
+        )
+    )
+
+    cleanup_expired(actor="test")
+
+    assert outside_payload.exists()
+
+
+def test_cleanup_export_metadata_unsupported_fmt_does_not_delete_payload(
+    tmp_path, monkeypatch, settings
+):
+    from apps.operations.cleanup import cleanup_expired
+
+    export_dir = tmp_path / "export_cache"
+    export_dir.mkdir()
+    monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
+    settings.EXPORT_RETENTION_DAYS = 14
+
+    unsupported_payload = export_dir / "old-token.html"
+    unsupported_payload.write_text("not an export payload")
+    (export_dir / "old-token.meta.json").write_text(
+        json.dumps(
+            {
+                "token": "old-token",
+                "job_id": "job-1",
+                "fmt": "html",
+                "expires_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            }
+        )
+    )
+
+    cleanup_expired(actor="test")
+
+    assert unsupported_payload.exists()
+
+
+def test_cleanup_orphan_exports_only_deletes_known_payload_files(
+    tmp_path, monkeypatch, settings
+):
+    from apps.operations.cleanup import cleanup_expired
+
+    export_dir = tmp_path / "export_cache"
+    export_dir.mkdir()
+    monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
+    settings.EXPORT_RETENTION_DAYS = 14
+
+    old = (datetime.now(UTC) - timedelta(days=20)).timestamp()
+    orphan_payload = export_dir / "orphan-token.csv"
+    unrelated_file = export_dir / "notes.txt"
+    unrelated_dir = export_dir / "old-dir.csv"
+    orphan_payload.write_text("delete")
+    unrelated_file.write_text("keep")
+    unrelated_dir.mkdir()
+    os.utime(orphan_payload, (old, old))
+    os.utime(unrelated_file, (old, old))
+    os.utime(unrelated_dir, (old, old))
+
+    cleanup_expired(actor="test")
+
+    assert not orphan_payload.exists()
+    assert unrelated_file.exists()
+    assert unrelated_dir.exists()
+
+
+def test_cleanup_deletes_old_action_required_jobs_by_completed_at():
+    from apps.batches.models import BatchJob
+    from apps.core.enums import BatchJobStatus
+    from apps.operations.cleanup import cleanup_expired
+
+    job = _batch_job(status=BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED)
+    old_completed_at = dj_timezone.now() - timedelta(days=95)
+    BatchJob.objects.filter(pk=job.pk).update(completed_at=old_completed_at)
+
+    cleanup_expired(actor="test")
+
+    assert not BatchJob.objects.filter(pk=job.pk).exists()

@@ -223,7 +223,8 @@ git pull origin main
 # Pull updated images
 docker compose pull
 
-# Recreate app containers; web/worker wait for the one-shot migrate service
+# Rerun migrations, then recreate app containers
+docker compose up -d --force-recreate migrate
 docker compose up -d web worker
 ```
 

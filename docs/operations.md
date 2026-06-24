@@ -309,9 +309,10 @@ docker compose exec web python manage.py admin_resume_remote
    git pull origin main
    docker compose pull
    ```
-2. Recreate services. The `web` and `worker` services wait for the one-shot
-   `migrate` service, so schema migrations run before application startup:
+2. Force-recreate the one-shot migration service, then recreate application
+   services:
    ```bash
+   docker compose up -d --force-recreate migrate
    docker compose up -d web worker
    ```
 3. Verify: check `/stats/` and run the backup smoke test.

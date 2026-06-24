@@ -17,6 +17,11 @@ def load_compose():
         return yaml.safe_load(f)
 
 
+def read_file(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+
+
 def test_web_has_external_network():
     compose = load_compose()
     web_networks = compose["services"]["web"]["networks"]
@@ -41,6 +46,28 @@ def test_compose_web_and_worker_wait_for_migrate():
         depends_on = services[service_name]["depends_on"]
         assert depends_on["db"]["condition"] == "service_healthy"
         assert depends_on["migrate"]["condition"] == "service_completed_successfully"
+
+
+def test_documented_deploy_reruns_migrate_before_web_and_worker():
+    readme = read_file("README.md")
+    operations = read_file("docs/operations.md")
+
+    expected = (
+        "docker compose up -d --force-recreate migrate\n"
+        "docker compose up -d web worker"
+    )
+    assert expected in readme
+    assert expected in "\n".join(line.strip() for line in operations.splitlines())
+
+
+def test_dockerfile_uses_uv_frozen_runtime_install():
+    dockerfile = read_file("Dockerfile")
+
+    assert "uv==0.11.21" in dockerfile
+    assert "uv sync --frozen" in dockerfile
+    assert "--no-dev" in dockerfile
+    assert "pip install --no-cache-dir ." not in dockerfile
+    assert '".[dev]"' not in dockerfile
 
 
 def test_db_no_external_network():
