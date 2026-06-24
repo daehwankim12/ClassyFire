@@ -26,10 +26,23 @@ from apps.core.enums import (
     TaskState,
 )
 from apps.remote import queue
-from apps.remote.circuit import CircuitBreaker, CircuitState
+from apps.remote.circuit import (
+    CircuitBreaker,
+    CircuitState,
+    DbCircuitBreaker,
+)
 from apps.remote.mock import MockProvider, build_query_response, build_raw
-from apps.remote.models import RemoteQuery, RemoteQueryItem, RemoteTask
-from apps.remote.rate_limit import RateLimiter
+from apps.remote.models import (
+    RemoteAttempt,
+    RemoteCircuit,
+    RemoteQuery,
+    RemoteQueryItem,
+    RemoteRateBucket,
+    RemoteSubmission,
+    RemoteTask,
+)
+from apps.remote.queue import LeaseLost
+from apps.remote.rate_limit import DbRateLimiter, RateLimiter
 from apps.remote.worker import RemoteWorker
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -1249,3 +1262,479 @@ def test_subsequent_success_after_remote_delayed_completes_item():
         f"REMOTE_DELAYED item must be resolved to FOUND_WISHART_ENTITY on success, "
         f"got {item.status}"
     )
+
+
+# ---------------------------------------------------------------------------
+# F-06: transactional submission outbox + idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_submit_writes_outbox_intent_and_links_query():
+    job = _job()
+    comp = _compound(IK_A)
+    _item(job, IK_A, 0, compound=comp)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    provider = MockProvider(submit_query_ids=["q-outbox"])
+    _worker(provider).tick()
+
+    # Exactly one submission outbox row, SUBMITTED, linked to the RemoteQuery.
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == "SUBMITTED"
+    assert submission.payload_hash and len(submission.payload_hash) == 64
+    assert submission.remote_query_id == "q-outbox"
+    query = RemoteQuery.objects.get(remote_query_id="q-outbox")
+    assert submission.query_id == query.id
+    # request payload persisted as JSONB for audit.
+    assert submission.request_payload["query_type"] == "STRUCTURE"
+
+
+def test_crash_after_post_before_commit_does_not_double_submit(monkeypatch):
+    # ACCEPTANCE (F-06): a crash AFTER the provider POST but BEFORE the local
+    # commit must NOT cause a second POST on the next worker tick.
+    job = _job()
+    comp = _compound(IK_A)
+    _item(job, IK_A, 0, compound=comp)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    provider = MockProvider(submit_query_ids=["q-crash"])
+    worker = _worker(provider)
+
+    # Force a crash in the post-submit commit (after the network POST returned),
+    # simulating a worker death between the POST and the local commit. The
+    # PENDING intent has already been committed in its own atomic block.
+    import apps.remote.worker as worker_mod
+
+    real_create = worker_mod.RemoteQuery.objects.create
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated crash after POST, before commit")
+
+    monkeypatch.setattr(worker_mod.RemoteQuery.objects, "create", boom)
+
+    with pytest.raises(RuntimeError):
+        worker.tick()
+
+    # The POST happened exactly once; a PENDING intent survived the crash.
+    assert len(provider.submit_calls) == 1
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == "PENDING"
+
+    # Restore create; the task is reclaimable. Reset it to READY (the crash left
+    # it RUNNING) to mimic stale-lock recovery re-queuing it.
+    monkeypatch.setattr(worker_mod.RemoteQuery.objects, "create", real_create)
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY,
+        lock_owner=None,
+        locked_at=None,
+        lease_token=None,
+        next_run_at=None,
+    )
+
+    # Next tick: the worker rebuilds the SAME payload, finds the PENDING intent,
+    # and reconciles WITHOUT a second POST.
+    worker.tick()
+    assert len(provider.submit_calls) == 1, "must NOT POST a second time"
+
+
+def test_in_doubt_pending_ages_out_and_allows_exactly_one_repost(settings):
+    # IMPORTANT-1: an in-doubt PENDING intent must not hold the key forever. After
+    # the reconcile cap it ages out to FAILED (freeing the key), enabling EXACTLY
+    # ONE genuine re-POST — and NO second POST before the key is freed.
+    settings.REMOTE_SUBMISSION_RECONCILE_MAX = 2
+    settings.REMOTE_SUBMISSION_TTL_SECONDS = 999999  # cap, not TTL, triggers here
+
+    comp = _compound(IK_A)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    provider = MockProvider(submit_query_ids=["q-doubt"])
+    worker = _worker(provider)
+
+    # Simulate the in-doubt window: a committed PENDING intent with no query, for
+    # the exact payload the worker will build for IK_A.
+    structures = [(IK_A, comp.canonical_smiles)]
+    payload = worker._canonical_payload(structures)
+    payload_hash = worker._payload_hash(payload)
+    RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash=payload_hash,
+        state="PENDING",
+        request_payload=payload,
+    )
+
+    # Reconcile attempts up to the cap: NO re-POST while the key is live.
+    for i in range(settings.REMOTE_SUBMISSION_RECONCILE_MAX):
+        RemoteTask.objects.filter(inchikey=IK_A).update(
+            state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+        )
+        worker.tick()
+        assert provider.submit_calls == [], f"must not re-POST on reconcile {i + 1}"
+        assert RemoteSubmission.objects.get().state == "PENDING"
+
+    # One more reconcile exceeds the cap -> ages the intent out to FAILED.
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+    )
+    worker.tick()
+    assert RemoteSubmission.objects.filter(state="FAILED").count() == 1
+    assert provider.submit_calls == [], "aging tick itself must not re-POST"
+
+    # NOW the key is free: the next tick performs exactly ONE genuine re-POST.
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+    )
+    worker.tick()
+    assert len(provider.submit_calls) == 1, "exactly one re-POST after key freed"
+    # A fresh live SUBMITTED intent now exists alongside the aged-out FAILED one.
+    assert RemoteSubmission.objects.filter(state="SUBMITTED").count() == 1
+    assert RemoteSubmission.objects.filter(state="FAILED").count() == 1
+
+
+def test_in_doubt_pending_ages_out_by_ttl(settings):
+    # Aging also triggers on TTL (not just the reconcile cap).
+    settings.REMOTE_SUBMISSION_RECONCILE_MAX = 999
+    settings.REMOTE_SUBMISSION_TTL_SECONDS = 60
+
+    comp = _compound(IK_A)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+    worker = _worker(MockProvider(submit_query_ids=["q-ttl"]))
+
+    structures = [(IK_A, comp.canonical_smiles)]
+    payload = worker._canonical_payload(structures)
+    sub = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash=worker._payload_hash(payload),
+        state="PENDING",
+        request_payload=payload,
+    )
+    # Backdate creation beyond the TTL.
+    RemoteSubmission.objects.filter(pk=sub.pk).update(
+        created_at=timezone.now() - dt.timedelta(seconds=120)
+    )
+
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY, next_run_at=None
+    )
+    worker.tick()
+    sub.refresh_from_db()
+    assert sub.state == "FAILED"
+
+
+def test_mid_batch_lease_lost_preserves_query_id_and_reclaims_member(
+    settings, monkeypatch
+):
+    # IMPORTANT-2: if a member's POLL_WAIT transition is fenced out (LeaseLost)
+    # AFTER the POST, the durable query/submission must survive (remote_query_id
+    # not lost) and the skipped member must remain re-claimable.
+    settings.REMOTE_BATCH_SIZE = 2
+    comp_a = _compound(IK_A)
+    comp_b = _compound(IK_B)
+    queue.enqueue_task(IK_A, compound_id=comp_a.id, priority=10)
+    queue.enqueue_task(IK_B, compound_id=comp_b.id)
+
+    provider = MockProvider(submit_query_ids=["q-durable"])
+    worker = _worker(provider)
+
+    import apps.remote.worker as worker_mod
+
+    real_transition = worker_mod.queue.transition
+
+    def steal_b_lease(member, state, **fields):
+        # Simulate a concurrent reclaim of IK_B between the POST and its park:
+        # bump its lease_version so the fenced transition matches 0 rows.
+        if member.inchikey == IK_B:
+            RemoteTask.objects.filter(pk=member.pk).update(
+                lease_version=member.lease_version + 5
+            )
+        return real_transition(member, state, **fields)
+
+    monkeypatch.setattr(worker_mod.queue, "transition", steal_b_lease)
+
+    worker.tick()  # entity MISS for IK_A + batch submit (A primary, B extra)
+
+    # The POST happened once and the remote_query_id is DURABLE.
+    assert len(provider.submit_calls) == 1
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == "SUBMITTED"
+    assert submission.remote_query_id == "q-durable"
+    query = RemoteQuery.objects.get(remote_query_id="q-durable")
+    # Both members' query items were durably linked (results not lost).
+    assert query.items.count() == 2
+
+    # IK_A parked normally; IK_B's park was fenced out — it is NOT in POLL_WAIT
+    # but remains re-claimable (its durable query link lets the next owner poll).
+    task_a = RemoteTask.objects.get(inchikey=IK_A)
+    assert task_a.state == TaskState.POLL_WAIT
+    task_b = RemoteTask.objects.get(inchikey=IK_B)
+    assert task_b.state != TaskState.DONE  # not stranded as resolved
+    # A fresh claim can still pick IK_B up (e.g. after reactivation).
+    RemoteTask.objects.filter(inchikey=IK_B).update(
+        state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+    )
+    assert queue.claim_task("new-owner") is not None
+
+
+# ---------------------------------------------------------------------------
+# F-06: operator reconcile command
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_submissions_command_lists_in_doubt(capsys):
+    from django.core.management import call_command
+
+    RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="a" * 64,
+        state="PENDING",
+        request_payload={"x": 1},
+    )
+    RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="b" * 64,
+        state="SUBMITTED",
+        request_payload={"x": 2},
+    )
+
+    call_command("reconcile_submissions")
+    out = capsys.readouterr().out
+    assert "In-doubt PENDING submissions (1)" in out
+    assert "aaaaaaaaaaaa" in out
+    assert "bbbbbbbbbbbb" not in out  # SUBMITTED is not in-doubt
+
+
+def test_reconcile_submissions_command_force_fail_frees_key():
+    from django.core.management import call_command
+
+    sub = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="c" * 64,
+        state="PENDING",
+        request_payload={"x": 3},
+    )
+    call_command("reconcile_submissions", "--fail", str(sub.pk))
+    sub.refresh_from_db()
+    assert sub.state == "FAILED"
+
+
+def test_submit_retryable_failure_frees_idempotency_key():
+    # A retryable submit failure flips the intent to FAILED so the key can be
+    # reused by a later retry (no permanent block).
+    job = _job()
+    comp = _compound(IK_A)
+    _item(job, IK_A, 0, compound=comp)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    provider = MockProvider(submit_retryable=True)
+    _worker(provider).tick()
+
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == "FAILED"
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.RETRY_WAIT
+
+
+# ---------------------------------------------------------------------------
+# F-07: lease token + version fencing
+# ---------------------------------------------------------------------------
+
+
+def test_claim_issues_lease_token_and_bumps_version():
+    queue.enqueue_task(IK_A)
+    task = queue.claim_task("w1")
+    assert task is not None
+    assert task.lease_token is not None
+    assert task.lease_version == 1
+
+
+def test_stale_worker_cannot_overwrite_after_reclaim():
+    # ACCEPTANCE (F-07): a stale worker whose lease expired and was reclaimed by
+    # another worker cannot write its late result over the new owner's state.
+    queue.enqueue_task(IK_A)
+    stale = queue.claim_task("stale")  # version 1, tokenA
+    assert stale is not None
+    assert stale.lease_version == 1
+
+    # Lease expires; recovery reclaims it (bumps version, clears token).
+    RemoteTask.objects.filter(id=stale.id).update(
+        locked_at=timezone.now() - dt.timedelta(hours=1)
+    )
+    recovered = queue.recover_stale_locks(lease_seconds=60)
+    assert recovered == 1
+
+    # A new owner claims it: version 3 (recover bumped to 2, claim to 3), tokenB.
+    fresh = queue.claim_task("fresh")
+    assert fresh is not None
+    assert fresh.id == stale.id
+    assert fresh.lease_version > stale.lease_version
+
+    # The STALE worker's late write (using its old in-memory version/token) is
+    # fenced: 0 rows match -> LeaseLost, and the row is NOT overwritten.
+    with pytest.raises(LeaseLost):
+        queue.finish_task(stale)
+
+    new_owner_state = RemoteTask.objects.get(id=stale.id)
+    assert new_owner_state.state == TaskState.LOCKED
+    assert new_owner_state.lock_owner == "fresh"
+
+
+def test_reactivate_due_tasks_bumps_lease_version():
+    task = queue.enqueue_task(IK_A)
+    assert task is not None
+    RemoteTask.objects.filter(id=task.id).update(
+        state=TaskState.RETRY_WAIT,
+        next_run_at=timezone.now() - dt.timedelta(seconds=1),
+        lease_token=task.lease_token,
+        lease_version=4,
+    )
+    queue.reactivate_due_tasks()
+    task.refresh_from_db()
+    assert task.state == TaskState.READY
+    assert task.lease_version == 5
+    assert task.lease_token is None
+
+
+# ---------------------------------------------------------------------------
+# F-08: shared DB-backed global rate limiter
+# ---------------------------------------------------------------------------
+
+
+def test_db_token_bucket_shared_across_two_limiters():
+    # ACCEPTANCE (F-08): with the global bucket set to rate R, two worker
+    # instances together never exceed R. Two independent DbRateLimiter objects
+    # (simulating two processes) draw from ONE shared row.
+    settings_rate = 3
+    lim_a = DbRateLimiter(entity_per_min=settings_rate, submit_per_min=0,
+                          entity_capacity=settings_rate)
+    lim_b = DbRateLimiter(entity_per_min=settings_rate, submit_per_min=0,
+                          entity_capacity=settings_rate)
+
+    allowed = 0
+    # Alternate the two "processes"; total grants must be capped at capacity (3)
+    # since refill over the few milliseconds of the loop is negligible.
+    for i in range(20):
+        bucket = lim_a.entity if i % 2 == 0 else lim_b.entity
+        if bucket.allow():
+            allowed += 1
+    assert allowed == settings_rate, f"two limiters exceeded global rate: {allowed}"
+    # Exactly one shared bucket row exists.
+    assert RemoteRateBucket.objects.filter(bucket="entity").count() == 1
+
+
+def test_db_bucket_penalize_parks_until_deadline():
+    lim = DbRateLimiter(entity_per_min=100, submit_per_min=0, entity_capacity=100)
+    assert lim.entity.allow() is True
+    lim.entity.penalize(600.0)  # server Retry-After
+    # Now blocked despite ample tokens.
+    assert lim.entity.allow() is False
+    row = RemoteRateBucket.objects.get(bucket="entity")
+    assert row.blocked_until is not None
+    delta = (row.blocked_until - timezone.now()).total_seconds()
+    assert 590 < delta < 610
+
+
+# ---------------------------------------------------------------------------
+# F-08: shared DB-backed circuit breaker + single half-open probe
+# ---------------------------------------------------------------------------
+
+
+def test_db_circuit_shared_opens_after_threshold():
+    breaker = DbCircuitBreaker(failure_threshold=3, reset_timeout=999)
+    for _ in range(3):
+        breaker.record_failure()
+    assert breaker.state == CircuitState.OPEN
+    row = RemoteCircuit.objects.get()
+    assert row.state == CircuitState.OPEN
+    assert row.consecutive_failures >= 3
+
+
+def test_db_circuit_half_open_single_probe():
+    # ACCEPTANCE (F-08): only ONE half-open probe is issued when the circuit is
+    # OPEN -> HALF_OPEN. Two breakers (two processes) share one row; exactly one
+    # wins the probe (allow() True), the other still sees OPEN.
+    a = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
+    b = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
+    a.record_failure()  # OPEN; reset_timeout=0 -> immediately eligible
+
+    winners = [a.allow(), b.allow()]
+    assert winners.count(True) == 1, f"exactly one probe must win, got {winners}"
+    # The winner is HALF_OPEN; a success closes the shared circuit.
+    a.record_success()
+    assert DbCircuitBreaker().state == CircuitState.CLOSED
+
+
+def test_db_circuit_state_reports_open_until_probe_won():
+    # MINOR-2: state reports the TRUE persisted state — OPEN until a probe is
+    # actually claimed via allow(), not merely because cooldown elapsed.
+    breaker = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
+    breaker.record_failure()  # OPEN (cooldown already elapsed, reset_timeout=0)
+    assert breaker.state == CircuitState.OPEN, "no probe claimed yet -> OPEN"
+    assert breaker.cooldown_elapsed() is True
+    assert breaker.allow() is True  # this worker wins + claims the probe
+    assert breaker.state == CircuitState.HALF_OPEN  # now truly half-open
+
+
+def test_db_circuit_half_open_failure_reopens():
+    breaker = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
+    breaker.record_failure()  # OPEN
+    assert breaker.allow() is True  # claim the probe -> HALF_OPEN
+    assert breaker.state == CircuitState.HALF_OPEN
+    breaker.record_failure()  # probe fails -> re-OPEN
+    row = RemoteCircuit.objects.get()
+    assert row.state == CircuitState.OPEN
+    # MINOR-3: consecutive_failures is set consistently (>= threshold) on reopen.
+    assert row.consecutive_failures >= breaker.failure_threshold
+
+
+def test_worker_uses_db_circuit_and_defers_when_open():
+    # The worker's default DB circuit gates remote calls: an OPEN shared circuit
+    # defers the task and makes no remote call.
+    DbCircuitBreaker(failure_threshold=1, reset_timeout=999).record_failure()
+    queue.enqueue_task(IK_A)
+    provider = MockProvider(entities={IK_A: build_raw(IK_A)})
+    # Use the DB circuit (default) + a permissive DB rate limiter.
+    worker = RemoteWorker(
+        provider,
+        worker_id="w-db",
+        rate_limiter=DbRateLimiter(entity_per_min=1000, submit_per_min=1000),
+    )
+    worker.tick()
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.DEFERRED
+    assert provider.entity_calls == []
+
+
+# ---------------------------------------------------------------------------
+# F-10: per-attempt raw payload audit
+# ---------------------------------------------------------------------------
+
+
+def test_per_attempt_raw_payload_recorded_for_submit_and_poll():
+    job = _job()
+    comp = _compound(IK_A)
+    _item(job, IK_A, 0, compound=comp)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    raw = build_raw(IK_A)
+    provider = MockProvider(
+        submit_query_ids=["q-audit"],
+        poll_script={"q-audit": ["RUNNING", raw]},
+    )
+    worker = _worker(provider)
+    worker.tick()  # entity MISS + submit
+    RemoteTask.objects.filter(inchikey=IK_A).update(next_run_at=timezone.now())
+    worker.tick()  # poll RUNNING
+    RemoteTask.objects.filter(inchikey=IK_A).update(next_run_at=timezone.now())
+    worker.tick()  # poll COMPLETE
+
+    classes = list(
+        RemoteAttempt.objects.order_by("id").values_list(
+            "operation", "classification"
+        )
+    )
+    # A submit SUCCESS + a poll RUNNING + a poll COMPLETE were all recorded.
+    assert ("SUBMIT", "SUCCESS") in classes
+    assert ("POLL", "RUNNING") in classes
+    assert ("POLL", "COMPLETE") in classes
+    # The COMPLETE attempt carries its raw payload.
+    complete = RemoteAttempt.objects.get(operation="POLL", classification="COMPLETE")
+    assert complete.raw_payload is not None

@@ -180,6 +180,8 @@ UPDATE remote_task t
    SET state = 'LOCKED',
        lock_owner = %(worker_id)s,
        locked_at = now(),
+       lease_token = gen_random_uuid(),       -- fencing token (F-07)
+       lease_version = lease_version + 1,      -- monotonic fencing version
        updated_at = now()
   FROM claimed
  WHERE t.id = claimed.id
@@ -190,10 +192,28 @@ RETURNING t.*;
   each other; each row is handed to exactly one worker.
 - The `remote_task_claim_idx` on `(state, priority, next_run_at)` backs the
   selection.
+- **Lease token + version fencing (F-07):** every claim issues a fresh
+  `lease_token` (uuid) and bumps the monotonic `lease_version`. EVERY subsequent
+  state transition for that task MUST be conditional on BOTH:
+
+  ```sql
+  UPDATE remote_task
+     SET state = %(next_state)s, ...
+   WHERE id = %(pk)s
+     AND lease_version = %(version)s
+     AND lease_token   = %(token)s;   -- 0 rows updated ⇒ lease lost
+  ```
+
+  If 0 rows are updated the lease was stolen/expired and reclaimed by another
+  worker; the late writer raises `LeaseLost` and aborts WITHOUT overwriting the
+  new owner's state.
 - **Lease expiry / crash recovery:** a sweeper resets stuck rows whose
   `locked_at` is older than the lease (e.g. `LOCKED`/`RUNNING` with
   `locked_at < now() - lease`) back to `READY`, clearing `lock_owner`/
-  `locked_at`. This makes claims crash-safe without external coordination.
+  `locked_at`/`lease_token` and **bumping `lease_version`** so the dead holder's
+  fenced writes can no longer match. `reactivate_due_tasks` does the same on
+  `RETRY_WAIT`/`DEFERRED`/`POLL_WAIT` → `READY`. This makes claims crash-safe
+  without external coordination.
 - **Backoff/defer:** set `state='RETRY_WAIT'`/`'DEFERRED'` (or `'POLL_WAIT'`)
   and `next_run_at = now() + backoff`; the row only becomes claimable again
   once it is `READY` and `next_run_at` has elapsed.
@@ -266,3 +286,85 @@ entry to either terminal state.
   (`INCHIKEY/INCHI/SMILES/SDF/UNKNOWN`).
 - `SeedProfile` — `FULL/LITE/CUSTOM` seed shape selector.
 - `EventCategory` — `WORKER/REMOTE/BACKUP/SEED/SECURITY` for `system_events`.
+
+---
+
+## 6. `remote_submissions` — submission outbox (`SubmissionState`, F-06)
+
+Enum: `SubmissionState`. Column: `remote_submissions.state`. The outbox makes a
+`/queries` POST crash-safe and idempotent. The deterministic idempotency key is
+`(provider, payload_hash)` where `payload_hash = sha256(canonical request
+payload)`. A **partial-UNIQUE** index over the live states (`PENDING`,
+`SUBMITTED`) guarantees at most one in-flight submission per payload, so a crash
+between the POST and its commit cannot cause a second POST.
+
+| State | Meaning | Terminal? |
+| --- | --- | --- |
+| `PENDING` | Intent written BEFORE the network call. | no |
+| `SUBMITTED` | POST confirmed; `query_id`/`remote_query_id` linked (same txn). | yes |
+| `FAILED` | No provider id obtained; idempotency key reusable. | yes |
+
+```
+PENDING ─success─▶ SUBMITTED      (links remote_query in ONE txn)
+        ─failure─▶ FAILED         (key freed for a later retry)
+```
+
+Protocol: write `PENDING` intent → POST → **durable-first** success path: create
+`remote_query`, flip the submission to `SUBMITTED`, and link `remote_query_items`
+in ONE fence-free transaction (the `remote_query_id` is captured even if a member
+lease is later lost); THEN park members in `POLL_WAIT` in a separate step that
+tolerates a per-member `LeaseLost` (a stolen member is skipped + left for reclaim
+— its durable query link means the result is not lost). On reconcile (a
+pre-existing live row found for the key): if `SUBMITTED`, re-link tasks to the
+existing query; if `PENDING` (in-doubt), do NOT re-POST.
+
+**Aging out in-doubt `PENDING` (liveness):** each in-doubt reconcile bumps
+`reconcile_attempts`. Once it exceeds `REMOTE_SUBMISSION_RECONCILE_MAX` OR the
+intent is older than `REMOTE_SUBMISSION_TTL_SECONDS`, it is flipped to `FAILED`
+(freeing the `(provider, payload_hash)` key) so EXACTLY ONE genuine re-POST can
+occur on a later tick — never a second POST while the key is still live. The
+operator command `manage.py reconcile_submissions [--fail ID | --fail-aged]`
+lists and force-resolves in-doubt intents.
+
+---
+
+## 7. `remote_circuits` — shared circuit breaker (`CircuitState`, F-08)
+
+Enum: `CircuitState`. Column: `remote_circuits.state` (one row per `provider`).
+Shared across ALL workers so N processes obey ONE breaker.
+
+| State | Meaning |
+| --- | --- |
+| `CLOSED` | Healthy; remote calls allowed. |
+| `OPEN` | Tripped after `consecutive_failures >= threshold`; calls skipped (tasks DEFERRED). Stays OPEN (the observable `state`) until a worker actually claims the probe — cool-down elapsing alone does not report HALF_OPEN. |
+| `HALF_OPEN` | A SINGLE probe is in flight (one worker won the conditional flip). |
+
+```
+CLOSED ─failures≥threshold─▶ OPEN
+OPEN   ─cooldown elapsed (one worker wins probe)─▶ HALF_OPEN
+HALF_OPEN ─probe success─▶ CLOSED
+          ─probe failure─▶ OPEN
+```
+
+Single-probe protocol (no thundering herd): the OPEN→HALF_OPEN promotion is a
+CONDITIONAL `UPDATE ... WHERE state='OPEN' AND opened_at <= now()-reset` flipping
+exactly one row to `HALF_OPEN`. The winning worker probes; every other worker
+sees `HALF_OPEN` and defers.
+
+---
+
+## 8. `remote_rate_buckets` — shared global token bucket (F-08)
+
+One row per `(provider, bucket)` (`entity`, `submit`). Tokens are drawn
+ATOMICALLY under a row lock (`SELECT ... FOR UPDATE`, lazily refill from
+`refill_rate_per_sec * elapsed` capped at `capacity`, then decrement iff
+`tokens >= 1`), so N workers across processes respect ONE global rate. A server
+`Retry-After` parks the bucket via `blocked_until` with absolute precedence.
+
+## 9. `remote_attempts` — per-attempt audit log (F-10)
+
+Append-only. One row per remote attempt (`operation` ∈ `ENTITY/SUBMIT/POLL`)
+records the explicit HTTP `classification` (`FOUND`/`SUCCESS`/`RUNNING`/
+`COMPLETE`/`RETRYABLE`/`AUTH_FAILURE`/`NOT_FOUND`/`PROTOCOL_ERROR`/`PERMANENT`),
+`http_status`, and the `raw_payload` of that attempt — so failures are auditable
+and an unmapped status is never silently treated as success.

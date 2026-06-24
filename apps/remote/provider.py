@@ -28,12 +28,59 @@ from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 
+class HttpOutcome(StrEnum):
+    """Explicit classification of a provider HTTP response (F-10).
+
+    Every HTTP status maps to exactly one outcome; an unrecognized/unmapped
+    status is ``PROTOCOL_ERROR`` and is NEVER silently treated as success.
+
+    * 404                      -> NOT_FOUND (entity/query absent)
+    * 401/403                  -> AUTH_FAILURE (stop retrying; surface)
+    * 408/425/429/5xx/network  -> RETRYABLE (backoff; honour Retry-After)
+    * other 4xx                -> PERMANENT (permanent input failure)
+    * 2xx                      -> SUCCESS
+    * anything else            -> PROTOCOL_ERROR
+    """
+
+    SUCCESS = "SUCCESS"
+    NOT_FOUND = "NOT_FOUND"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    RETRYABLE = "RETRYABLE"
+    PERMANENT = "PERMANENT"
+    PROTOCOL_ERROR = "PROTOCOL_ERROR"
+
+
+# HTTP status codes that are RETRYABLE per the F-10 contract.
+RETRYABLE_HTTP_STATUSES: frozenset[int] = frozenset({408, 425, 429})
+
+
+def classify_http_status(status_code: int) -> HttpOutcome:
+    """Map an HTTP status code to its explicit :class:`HttpOutcome`.
+
+    Pure + language-agnostic so a Go/Rust port can reproduce the exact routing.
+    An unknown status (e.g. 1xx, 3xx redirects, 6xx) is ``PROTOCOL_ERROR``.
+    """
+    if 200 <= status_code < 300:
+        return HttpOutcome.SUCCESS
+    if status_code == 404:
+        return HttpOutcome.NOT_FOUND
+    if status_code in (401, 403):
+        return HttpOutcome.AUTH_FAILURE
+    if status_code in RETRYABLE_HTTP_STATUSES or 500 <= status_code < 600:
+        return HttpOutcome.RETRYABLE
+    if 400 <= status_code < 500:
+        return HttpOutcome.PERMANENT
+    return HttpOutcome.PROTOCOL_ERROR
+
+
 class EntityLookupStatus(StrEnum):
     """Outcome of an entity (cached classification) lookup."""
 
     FOUND = "FOUND"
     MISS = "MISS"
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    PROTOCOL_ERROR = "PROTOCOL_ERROR"
 
 
 class PollStatus(StrEnum):
@@ -42,6 +89,9 @@ class PollStatus(StrEnum):
     RUNNING = "RUNNING"
     COMPLETE = "COMPLETE"
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    NOT_FOUND = "NOT_FOUND"
+    PROTOCOL_ERROR = "PROTOCOL_ERROR"
 
 
 @dataclass(frozen=True)
@@ -58,6 +108,7 @@ class EntityLookupResult:
     raw_json: dict[str, Any] | None = None
     retry_after: float | None = None
     detail: str | None = None
+    http_status: int | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +117,7 @@ class SubmitResult:
 
     remote_query_id: str
     raw_json: dict[str, Any] | None = None
+    http_status: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +128,7 @@ class PollResult:
     raw_json: dict[str, Any] | None = None
     retry_after: float | None = None
     detail: str | None = None
+    http_status: int | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +176,24 @@ class RetryableProviderError(ProviderError):
 
 class NonRetryableProviderError(ProviderError):
     """A permanent failure (invalid structure, definite 4xx input error)."""
+
+
+class AuthProviderError(NonRetryableProviderError):
+    """An auth failure (401/403): stop retrying and surface for an operator.
+
+    A subclass of :class:`NonRetryableProviderError` so existing callers that
+    route non-retryable submit failures to a terminal state still work, while
+    callers that care can distinguish an auth failure (do not burn attempts).
+    """
+
+
+class ProtocolProviderError(NonRetryableProviderError):
+    """An unmapped/unknown provider status — never treated as success.
+
+    A subclass of :class:`NonRetryableProviderError` (terminal) so an
+    unrecognized status is surfaced explicitly rather than silently classified
+    as a successful submit.
+    """
 
 
 @runtime_checkable

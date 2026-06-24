@@ -1,28 +1,194 @@
-"""Circuit breaker for the remote provider boundary (NFR-P05).
+"""Circuit breaker for the remote provider boundary (NFR-P05, F-08).
 
 Consecutive remote failures open the circuit; while OPEN the worker stops making
 remote calls (and parks tasks as ``DEFERRED``) but LOCAL lookups and queue
 accumulation keep working — a Wishart outage must never stop the local pipeline.
-After a cool-down the circuit goes HALF_OPEN and admits a single probe; success
+After a cool-down the circuit goes HALF_OPEN and admits a SINGLE probe; success
 closes it, failure re-opens it.
 
-State lives in-process per worker by design: the breaker guards *this* worker's
-outbound calls. A clock is injectable for deterministic tests.
+Two implementations share one duck-typed interface (``allow``, ``record_success``,
+``record_failure``, ``state``):
+
+* :class:`DbCircuitBreaker` — the PRODUCTION breaker (F-08). State lives in a
+  shared ``remote_circuits`` row so N workers across processes share ONE breaker.
+  When OPEN→HALF_OPEN only ONE worker wins the probe via a CONDITIONAL update
+  (``WHERE state='OPEN' AND opened_at <= cutoff`` flips exactly one row to
+  HALF_OPEN); the rest still see OPEN and defer — no thundering herd.
+
+* :class:`CircuitBreaker` — the legacy in-process breaker, retained so tests can
+  inject a deterministic, network-free breaker. NOT the production default.
+
+``CircuitState`` is re-exported from :mod:`apps.core.enums` (the canonical,
+language-agnostic ``TextChoices``) so the persisted DB value and the in-process
+enum are the SAME string literals.
 """
 from __future__ import annotations
 
 from collections.abc import Callable
-from enum import StrEnum
+from typing import TYPE_CHECKING
+
+from apps.core.enums import CircuitState
+
+if TYPE_CHECKING:
+    from apps.remote.models import RemoteCircuit
+
+__all__ = ["CircuitBreaker", "CircuitState", "DbCircuitBreaker"]
 
 
-class CircuitState(StrEnum):
-    CLOSED = "CLOSED"
-    OPEN = "OPEN"
-    HALF_OPEN = "HALF_OPEN"
+# ---------------------------------------------------------------------------
+# DB-backed shared circuit breaker (F-08, production)
+# ---------------------------------------------------------------------------
+
+
+class DbCircuitBreaker:
+    """Shared, DB-backed consecutive-failure breaker (one row per provider)."""
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        reset_timeout: float = 60.0,
+        *,
+        provider: str = "wishart",
+    ) -> None:
+        self.failure_threshold = failure_threshold
+        self.reset_timeout = reset_timeout
+        self.provider = provider
+
+    def _row(self) -> RemoteCircuit:
+        from apps.remote.models import RemoteCircuit
+
+        row, _ = RemoteCircuit.objects.get_or_create(provider=self.provider)
+        return row
+
+    @property
+    def state(self) -> CircuitState:
+        """Current shared state EXACTLY as persisted (no side effects).
+
+        Reports the real DB row state: it stays ``OPEN`` until a worker actually
+        wins the probe via :meth:`allow` (which flips the row to ``HALF_OPEN``).
+        It does NOT pre-emptively report HALF_OPEN just because the cool-down has
+        elapsed — only an in-flight, claimed probe is HALF_OPEN, so observers see
+        the truthful circuit state.
+        """
+        return CircuitState(self._row().state)
+
+    def cooldown_elapsed(self) -> bool:
+        """Whether an OPEN circuit's cool-down has elapsed (probe eligible)."""
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        row = self._row()
+        return (
+            row.state == CircuitState.OPEN
+            and row.opened_at is not None
+            and row.opened_at <= timezone.now() - timedelta(seconds=self.reset_timeout)
+        )
+
+    def allow(self) -> bool:
+        """Whether THIS worker may attempt a remote call right now.
+
+        * CLOSED → always True.
+        * OPEN, cool-down NOT elapsed → False.
+        * OPEN, cool-down elapsed → exactly ONE worker wins the probe via a
+          CONDITIONAL ``UPDATE ... WHERE state='OPEN'`` flip to HALF_OPEN and
+          gets True; every other worker sees HALF_OPEN (probe in flight) → False.
+        * HALF_OPEN (a probe is already in flight) → False (no thundering herd).
+        """
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from apps.remote.models import RemoteCircuit
+
+        row = self._row()
+        if row.state == CircuitState.CLOSED:
+            return True
+        if row.state == CircuitState.HALF_OPEN:
+            # A probe is already in flight; this worker must not pile on.
+            return False
+        # OPEN: only the cool-down winner may probe.
+        if row.opened_at is None:
+            return False
+        cutoff = timezone.now() - timedelta(seconds=self.reset_timeout)
+        if row.opened_at > cutoff:
+            return False
+        won = RemoteCircuit.objects.filter(
+            provider=self.provider,
+            state=CircuitState.OPEN,
+            opened_at__lte=cutoff,
+        ).update(state=CircuitState.HALF_OPEN)
+        return bool(won)
+
+    def record_success(self) -> None:
+        from apps.remote.models import RemoteCircuit
+
+        RemoteCircuit.objects.update_or_create(
+            provider=self.provider,
+            defaults={
+                "state": CircuitState.CLOSED,
+                "consecutive_failures": 0,
+                "opened_at": None,
+            },
+        )
+
+    def record_failure(self) -> None:
+        from django.db import transaction
+        from django.db.models import F
+        from django.utils import timezone
+
+        from apps.remote.models import RemoteCircuit
+
+        with transaction.atomic():
+            row = (
+                RemoteCircuit.objects.select_for_update()
+                .get_or_create(provider=self.provider)[0]
+            )
+            if row.state == CircuitState.HALF_OPEN:
+                # A failure during the half-open probe immediately re-opens.
+                # Set consecutive_failures consistently (>= threshold) so the
+                # counter never goes stale below the trip line while OPEN.
+                row.state = CircuitState.OPEN
+                row.opened_at = timezone.now()
+                row.consecutive_failures = max(
+                    self.failure_threshold, row.consecutive_failures + 1
+                )
+                row.save(
+                    update_fields=[
+                        "state",
+                        "opened_at",
+                        "consecutive_failures",
+                        "updated_at",
+                    ]
+                )
+                return
+            RemoteCircuit.objects.filter(pk=row.pk).update(
+                consecutive_failures=F("consecutive_failures") + 1
+            )
+            row.refresh_from_db()
+            if row.consecutive_failures >= self.failure_threshold:
+                row.state = CircuitState.OPEN
+                row.opened_at = timezone.now()
+                row.save(update_fields=["state", "opened_at", "updated_at"])
+
+    @classmethod
+    def from_settings(cls, provider: str = "wishart") -> DbCircuitBreaker:
+        from django.conf import settings
+
+        return cls(
+            failure_threshold=getattr(settings, "REMOTE_CIRCUIT_THRESHOLD", 5),
+            reset_timeout=getattr(settings, "REMOTE_CIRCUIT_RESET_SECONDS", 60.0),
+            provider=provider,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Legacy in-process circuit breaker (tests / deterministic injection)
+# ---------------------------------------------------------------------------
 
 
 class CircuitBreaker:
-    """Consecutive-failure breaker with a half-open recovery probe."""
+    """Consecutive-failure breaker with a half-open recovery probe (in-process)."""
 
     def __init__(
         self,

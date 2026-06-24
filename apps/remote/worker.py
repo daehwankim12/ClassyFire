@@ -27,10 +27,11 @@ import json
 import logging
 import socket
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
+from typing import Protocol
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -39,22 +40,56 @@ from apps.core.enums import (
     BatchItemStatus,
     QueryState,
     SourceType,
+    SubmissionState,
     TaskState,
 )
 from apps.remote import fanout, queue
-from apps.remote.circuit import CircuitBreaker
-from apps.remote.models import RemoteQuery, RemoteQueryItem, RemoteTask
+from apps.remote.circuit import DbCircuitBreaker
+from apps.remote.models import (
+    RemoteAttempt,
+    RemoteQuery,
+    RemoteQueryItem,
+    RemoteSubmission,
+    RemoteTask,
+)
 from apps.remote.provider import (
+    AuthProviderError,
     EntityLookupStatus,
     NonRetryableProviderError,
     NormalizedClassification,
     PollStatus,
+    ProtocolProviderError,
     Provider,
     RetryableProviderError,
 )
-from apps.remote.rate_limit import RateLimiter
+from apps.remote.queue import LeaseLost
+from apps.remote.rate_limit import DbRateLimiter
 
 logger = logging.getLogger(__name__)
+
+# Provider namespace for the outbox/circuit/rate-bucket rows. Single provider
+# today; kept explicit so the idempotency key and shared state are namespaced.
+PROVIDER = "wishart"
+
+
+class _Bucket(Protocol):
+    def allow(self) -> bool: ...
+    def penalize(self, retry_after: float | None) -> None: ...
+
+
+class RateLimiterLike(Protocol):
+    """Duck-typed limiter: DB-backed (prod) or in-process (tests)."""
+
+    entity: _Bucket
+    submit: _Bucket
+
+
+class CircuitLike(Protocol):
+    """Duck-typed breaker: DB-backed (prod) or in-process (tests)."""
+
+    def allow(self) -> bool: ...
+    def record_success(self) -> None: ...
+    def record_failure(self) -> None: ...
 
 # Default lock lease: how long a claimed task may be held before the recovery
 # sweep reclaims it. Derived from the remote timeout with generous headroom.
@@ -74,14 +109,17 @@ class RemoteWorker:
         provider: Provider,
         *,
         worker_id: str | None = None,
-        rate_limiter: RateLimiter | None = None,
-        circuit: CircuitBreaker | None = None,
+        rate_limiter: RateLimiterLike | None = None,
+        circuit: CircuitLike | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
     ) -> None:
         self.provider = provider
         self.worker_id = worker_id or make_worker_id()
-        self.rate_limiter = rate_limiter or RateLimiter.from_settings()
-        self.circuit = circuit or CircuitBreaker.from_settings()
+        # Default to the SHARED, DB-backed limiter + circuit (F-08) so N worker
+        # processes respect ONE global rate and ONE breaker. Tests may inject the
+        # in-process variants for determinism.
+        self.rate_limiter = rate_limiter or DbRateLimiter.from_settings()
+        self.circuit = circuit or DbCircuitBreaker.from_settings()
         self.lease_seconds = lease_seconds
 
     # -- top-level steps ---------------------------------------------------
@@ -100,7 +138,17 @@ class RemoteWorker:
         task = queue.claim_task(self.worker_id)
         if task is None:
             return False
-        self.process(task)
+        try:
+            self.process(task)
+        except LeaseLost:
+            # Our lease was reclaimed mid-flight by another worker (F-07). Abort
+            # without overwriting the new owner's state. The reclaim already
+            # re-queued the task; we simply drop it.
+            logger.warning(
+                "lease lost for task %s (inchikey=%s); aborting",
+                task.pk,
+                task.inchikey,
+            )
         return True
 
     def process(self, task: RemoteTask) -> None:
@@ -138,6 +186,13 @@ class RemoteWorker:
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
             self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification="RETRYABLE",
+                raw_payload=result.raw_json,
+                http_status=result.http_status,
+                detail=result.detail,
+            )
             if result.retry_after is not None:
                 self.rate_limiter.entity.penalize(result.retry_after)
                 queue.retry_after_override(task, result.retry_after)
@@ -146,9 +201,53 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
 
+        if result.status == EntityLookupStatus.AUTH_FAILURE:
+            # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification="AUTH_FAILURE",
+                raw_payload=result.raw_json,
+                http_status=result.http_status,
+                detail=result.detail,
+            )
+            logger.error(
+                "remote entity AUTH_FAILURE (operator action) for %s: %s",
+                task.inchikey,
+                result.detail,
+            )
+            queue.defer_task(task, delay_seconds=self.lease_seconds)
+            fanout.mark_items_delayed(task.inchikey)
+            return
+
+        if result.status == EntityLookupStatus.PROTOCOL_ERROR:
+            # Unmapped status: never treat as MISS/COMPLETE; surface + retry.
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification="PROTOCOL_ERROR",
+                raw_payload=result.raw_json,
+                http_status=result.http_status,
+                detail=result.detail,
+            )
+            logger.error(
+                "remote entity PROTOCOL_ERROR for %s: %s",
+                task.inchikey,
+                result.detail,
+            )
+            queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
+            return
+
         self.circuit.record_success()
 
         if result.status == EntityLookupStatus.FOUND and result.raw_json is not None:
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification="FOUND",
+                raw_payload=result.raw_json,
+                http_status=result.http_status,
+            )
             norm = self.provider.parse_result(result.raw_json)
             if not self._key_matches(task.inchikey, norm.inchikey):
                 self._handle_key_mismatch(task)
@@ -176,12 +275,26 @@ class RemoteWorker:
             return
         self._submit_batch(task)
 
-    def _submit_batch(self, task: RemoteTask) -> None:
-        if not self.rate_limiter.submit.allow():
-            queue.defer_task(task, delay_seconds=5)
-            fanout.mark_items_delayed(task.inchikey)
-            return
+    @staticmethod
+    def _canonical_payload(structures: list[tuple[str, str]]) -> dict:
+        """Build the canonical (deterministic) request payload for hashing.
 
+        Sorted so the SAME set of structures always hashes identically — the
+        idempotency key is stable across retries of the same batch (F-06).
+        """
+        return {
+            "provider": PROVIDER,
+            "query_type": "STRUCTURE",
+            "structures": sorted([list(s) for s in structures]),
+        }
+
+    @staticmethod
+    def _payload_hash(payload: dict) -> str:
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _submit_batch(self, task: RemoteTask) -> None:
         # Batch this task with other READY tasks that have a structure, up to
         # REMOTE_BATCH_SIZE. The dedup index guarantees one task per inchikey.
         batch = [task]
@@ -197,10 +310,76 @@ class RemoteWorker:
             structures.append((member.inchikey, struct))
             members.append(member)
 
+        payload = self._canonical_payload(structures)
+        payload_hash = self._payload_hash(payload)
+
+        # --- F-06: transactional submission outbox + idempotency -------------
+        # Reconcile against any existing live (PENDING/SUBMITTED) intent for this
+        # exact payload BEFORE drawing a submit token or POSTing (MINOR-1) — a
+        # crash between a prior POST and its commit left an authoritative record
+        # we must honour, and an in-doubt re-park must NOT burn a global token.
+        existing = (
+            RemoteSubmission.objects.filter(
+                provider=PROVIDER,
+                payload_hash=payload_hash,
+                state__in=[s.value for s in SubmissionState.live_states()],
+            )
+            .order_by("-id")
+            .first()
+        )
+        if existing is not None:
+            self._reconcile_submission(existing, members)
+            return
+
+        # No existing intent → this is a genuine first/fresh submit. Only NOW
+        # draw a global submit token.
+        if not self.rate_limiter.submit.allow():
+            for member in members:
+                queue.defer_task(member, delay_seconds=5)
+                fanout.mark_items_delayed(member.inchikey)
+            return
+
+        # Persist INTENT (PENDING) BEFORE the network call. The partial-UNIQUE on
+        # (provider, payload_hash) makes a concurrent/duplicate intent fail fast.
+        try:
+            with transaction.atomic():
+                submission = RemoteSubmission.objects.create(
+                    provider=PROVIDER,
+                    payload_hash=payload_hash,
+                    state=SubmissionState.PENDING,
+                    request_payload=payload,
+                )
+        except IntegrityError:
+            # Another worker raced us to the intent; reconcile against it.
+            existing = (
+                RemoteSubmission.objects.filter(
+                    provider=PROVIDER,
+                    payload_hash=payload_hash,
+                    state__in=[s.value for s in SubmissionState.live_states()],
+                )
+                .order_by("-id")
+                .first()
+            )
+            if existing is not None:
+                self._reconcile_submission(existing, members)
+            else:
+                for member in members:
+                    queue.schedule_retry(member)
+                    fanout.mark_items_delayed(member.inchikey)
+            return
+
         try:
             submit = self.provider.submit_structures(structures)
         except RetryableProviderError as exc:
             self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="RETRYABLE",
+                raw_payload=None,
+                detail=str(exc),
+            )
+            # Free the idempotency key so a later retry can re-submit.
+            self._fail_submission(submission, detail=f"retryable: {exc}")
             retry_after = exc.retry_after
             if retry_after is not None:
                 self.rate_limiter.submit.penalize(retry_after)
@@ -211,41 +390,228 @@ class RemoteWorker:
                     queue.schedule_retry(member)
                 fanout.mark_items_delayed(member.inchikey)
             return
-        except NonRetryableProviderError:
+        except AuthProviderError as exc:
+            # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="AUTH_FAILURE",
+                raw_payload=None,
+                detail=str(exc),
+            )
+            self._fail_submission(submission, detail=f"auth: {exc}")
+            logger.error("remote submit AUTH_FAILURE (operator action): %s", exc)
+            for member in members:
+                queue.defer_task(member, delay_seconds=self.lease_seconds)
+                fanout.mark_items_delayed(member.inchikey)
+            return
+        except ProtocolProviderError as exc:
+            # Unmapped status: never treat as success; surface + defer (F-10).
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="PROTOCOL_ERROR",
+                raw_payload=None,
+                detail=str(exc),
+            )
+            self._fail_submission(submission, detail=f"protocol: {exc}")
+            logger.error("remote submit PROTOCOL_ERROR: %s", exc)
+            for member in members:
+                queue.schedule_retry(member)
+                fanout.mark_items_delayed(member.inchikey)
+            return
+        except NonRetryableProviderError as exc:
             self.circuit.record_success()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="PERMANENT",
+                raw_payload=None,
+                detail=str(exc),
+            )
+            self._fail_submission(submission, detail=f"permanent: {exc}")
             for member in members:
                 fanout.fan_out_result(member.inchikey, BatchItemStatus.INVALID_INPUT)
                 queue.finish_task(member)
             return
 
         self.circuit.record_success()
-        payload_hash = hashlib.sha256(
-            json.dumps(sorted(structures)).encode()
-        ).hexdigest()
-        query = RemoteQuery.objects.create(
-            remote_query_id=submit.remote_query_id,
-            payload_hash=payload_hash,
-            state=QueryState.SUBMITTED,
-            next_poll_at=timezone.now()
-            + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS),
-        )
+        # --- success: DURABLE-FIRST ordering (IMPORTANT-2) -------------------
+        # Step 1: persist the already-POSTed remote_query_id durably — create the
+        # RemoteQuery, flip the submission to SUBMITTED, link query items, and
+        # record the attempt in ONE transaction. This is fence-free (no
+        # lease-conditional writes) so it CANNOT roll back on a member's stolen
+        # lease; the remote_query_id is captured even if every member is lost.
         poll_at = timezone.now() + timedelta(
             seconds=settings.REMOTE_POLL_MIN_SECONDS
         )
-        for member in members:
-            RemoteQueryItem.objects.create(
+        with transaction.atomic():
+            query = RemoteQuery.objects.create(
+                remote_query_id=submit.remote_query_id,
+                payload_hash=payload_hash,
+                state=QueryState.SUBMITTED,
+                next_poll_at=poll_at,
+            )
+            submission.state = SubmissionState.SUBMITTED
+            submission.query = query
+            submission.remote_query_id = submit.remote_query_id
+            submission.save(
+                update_fields=["state", "query", "remote_query_id", "updated_at"]
+            )
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="SUCCESS",
+                raw_payload=submit.raw_json,
                 query=query,
-                task=member,
-                compound=member.compound,
-                inchikey=member.inchikey,
+                http_status=submit.http_status,
+                remote_query_id=submit.remote_query_id,
             )
-            queue.transition(
-                member,
-                TaskState.POLL_WAIT,
-                next_run_at=poll_at,
-                lock_owner=None,
-                locked_at=None,
+            for member in members:
+                RemoteQueryItem.objects.get_or_create(
+                    query=query,
+                    task=member,
+                    defaults={
+                        "compound": member.compound,
+                        "inchikey": member.inchikey,
+                    },
+                )
+
+        # Step 2: park each member in POLL_WAIT, tolerating a per-member
+        # LeaseLost. A member whose lease was stolen mid-batch is SKIPPED (left
+        # for its new owner / reclaim) rather than aborting the whole batch — the
+        # durable query link above means its result is NOT lost: whoever owns the
+        # task next finds the RemoteQueryItem and polls the submitted query.
+        self._park_members_poll_wait(members, poll_at)
+
+    def _park_members_poll_wait(
+        self, members: list[RemoteTask], poll_at: datetime
+    ) -> None:
+        """POLL_WAIT-park members, skipping any whose lease was lost (F-07)."""
+        for member in members:
+            try:
+                queue.transition(
+                    member,
+                    TaskState.POLL_WAIT,
+                    next_run_at=poll_at,
+                    lock_owner=None,
+                    locked_at=None,
+                )
+            except LeaseLost:
+                logger.warning(
+                    "member %s (inchikey=%s) lease lost during POLL_WAIT park; "
+                    "skipping — its query link is durable and it is re-claimable",
+                    member.pk,
+                    member.inchikey,
+                )
+
+    def _reconcile_submission(
+        self, submission: RemoteSubmission, members: list[RemoteTask]
+    ) -> None:
+        """Reconcile a pre-existing submission intent WITHOUT a second POST (F-06).
+
+        * SUBMITTED with a linked query → re-link any unlinked members to that
+          query and park them in POLL_WAIT (recover a crash that committed the
+          POST result but left tasks unparked). Per-member LeaseLost is tolerated.
+        * PENDING (in-doubt: POST may have hit the provider but never committed)
+          → do NOT re-POST on this tick. Bump ``reconcile_attempts``; once it
+          exceeds the cap OR the intent's TTL has elapsed, AGE IT OUT to FAILED
+          (freeing the idempotency key) so a single genuine re-POST may occur on
+          a later tick. The crucial invariant: no second POST is issued WHILE the
+          key is still live — only after it is freed.
+        """
+        poll_at = timezone.now() + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS)
+        if submission.state == SubmissionState.SUBMITTED and submission.query_id:
+            query = submission.query
+            with transaction.atomic():
+                for member in members:
+                    RemoteQueryItem.objects.get_or_create(
+                        query=query,
+                        task=member,
+                        defaults={
+                            "compound": member.compound,
+                            "inchikey": member.inchikey,
+                        },
+                    )
+            self._park_members_poll_wait(members, poll_at)
+            return
+
+        # PENDING in-doubt: avoid a second POST while the key is live; age out.
+        attempts = submission.reconcile_attempts + 1
+        ttl = timedelta(seconds=settings.REMOTE_SUBMISSION_TTL_SECONDS)
+        age = timezone.now() - submission.created_at
+        aged_out = (
+            attempts > settings.REMOTE_SUBMISSION_RECONCILE_MAX or age >= ttl
+        )
+        submission.reconcile_attempts = attempts
+        if aged_out:
+            submission.state = SubmissionState.FAILED
+            submission.detail = (
+                f"aged-out in-doubt PENDING after {attempts} reconcile(s), "
+                f"age={age.total_seconds():.0f}s; key freed for one re-POST"
             )
+            submission.save(
+                update_fields=[
+                    "state",
+                    "detail",
+                    "reconcile_attempts",
+                    "updated_at",
+                ]
+            )
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="AGED_OUT",
+                raw_payload=None,
+                remote_query_id=submission.remote_query_id,
+                detail=submission.detail,
+            )
+            logger.warning(
+                "reconcile: aged out in-doubt PENDING submission %s -> FAILED "
+                "(key freed for exactly one re-POST)",
+                submission.pk,
+            )
+        else:
+            submission.save(update_fields=["reconcile_attempts", "updated_at"])
+            logger.warning(
+                "reconcile: in-doubt PENDING submission %s (attempt %s/%s); "
+                "not re-POSTing yet",
+                submission.pk,
+                attempts,
+                settings.REMOTE_SUBMISSION_RECONCILE_MAX,
+            )
+        # Re-park members for a later tick regardless (a freed key lets the next
+        # tick genuinely re-POST; a still-live key reconciles again).
+        for member in members:
+            queue.defer_task(member, delay_seconds=5)
+            fanout.mark_items_delayed(member.inchikey)
+
+    @staticmethod
+    def _fail_submission(submission: RemoteSubmission, *, detail: str) -> None:
+        """Flip an intent to FAILED so its idempotency key can be reused."""
+        submission.state = SubmissionState.FAILED
+        submission.detail = detail
+        submission.save(update_fields=["state", "detail", "updated_at"])
+
+    def _record_attempt(
+        self,
+        operation: str,
+        *,
+        classification: str,
+        raw_payload: dict | None,
+        query: RemoteQuery | None = None,
+        http_status: int | None = None,
+        remote_query_id: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Append an audit row for ONE remote attempt (F-10, per-attempt raw)."""
+        RemoteAttempt.objects.create(
+            provider=PROVIDER,
+            operation=operation,
+            classification=classification,
+            raw_payload=raw_payload,
+            query=query,
+            http_status=http_status,
+            remote_query_id=remote_query_id,
+            detail=detail,
+        )
 
     def _claim_batch_extras(self, task: RemoteTask) -> list[RemoteTask]:
         """Claim up to REMOTE_BATCH_SIZE-1 extra READY tasks for this batch.
@@ -276,12 +642,9 @@ class RemoteWorker:
             for extra in candidates:
                 if self._structure_for(extra) is None:
                     continue
-                queue.transition(
-                    extra,
-                    TaskState.LOCKED,
-                    lock_owner=self.worker_id,
-                    locked_at=now,
-                )
+                # Claim with a fresh fencing lease so subsequent fenced
+                # transitions of the extra are owned by this worker (F-07).
+                queue.claim_extra(extra, self.worker_id)
                 extras.append(extra)
         return extras
 
@@ -329,6 +692,15 @@ class RemoteWorker:
 
         if poll.status == PollStatus.RETRYABLE_ERROR:
             self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_POLL,
+                classification="RETRYABLE",
+                raw_payload=poll.raw_json,
+                query=query,
+                http_status=poll.http_status,
+                remote_query_id=remote_query_id,
+                detail=poll.detail,
+            )
             if poll.retry_after is not None:
                 queue.retry_after_override(task, poll.retry_after)
             else:
@@ -336,9 +708,52 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
 
+        if poll.status == PollStatus.AUTH_FAILURE:
+            # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_POLL,
+                classification="AUTH_FAILURE",
+                raw_payload=poll.raw_json,
+                query=query,
+                http_status=poll.http_status,
+                remote_query_id=remote_query_id,
+                detail=poll.detail,
+            )
+            logger.error("remote poll AUTH_FAILURE (operator action): %s", poll.detail)
+            queue.defer_task(task, delay_seconds=self.lease_seconds)
+            fanout.mark_items_delayed(task.inchikey)
+            return
+
+        if poll.status in (PollStatus.NOT_FOUND, PollStatus.PROTOCOL_ERROR):
+            # NOT_FOUND (query absent) or unmapped status: never treat as
+            # COMPLETE. Surface + retry rather than silently resolving (F-10).
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_POLL,
+                classification=str(poll.status),
+                raw_payload=poll.raw_json,
+                query=query,
+                http_status=poll.http_status,
+                remote_query_id=remote_query_id,
+                detail=poll.detail,
+            )
+            logger.error("remote poll %s: %s", poll.status, poll.detail)
+            queue.schedule_retry(task)
+            fanout.mark_items_delayed(task.inchikey)
+            return
+
         self.circuit.record_success()
 
         if poll.status == PollStatus.RUNNING:
+            self._record_attempt(
+                RemoteAttempt.OPERATION_POLL,
+                classification="RUNNING",
+                raw_payload=poll.raw_json,
+                query=query,
+                http_status=poll.http_status,
+                remote_query_id=remote_query_id,
+            )
             query.state = QueryState.POLLING
             query.next_poll_at = timezone.now() + timedelta(
                 seconds=settings.REMOTE_POLL_MIN_SECONDS
@@ -355,6 +770,14 @@ class RemoteWorker:
 
         # COMPLETE
         raw = poll.raw_json or {}
+        self._record_attempt(
+            RemoteAttempt.OPERATION_POLL,
+            classification="COMPLETE",
+            raw_payload=raw,
+            query=query,
+            http_status=poll.http_status,
+            remote_query_id=remote_query_id,
+        )
         query.state = QueryState.COMPLETE
         query.raw_response = raw
         query.completed_at = timezone.now()

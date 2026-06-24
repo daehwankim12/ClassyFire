@@ -132,6 +132,59 @@ class QueryState(models.TextChoices):
     FAILED = "FAILED", "Failed"
 
 
+class SubmissionState(models.TextChoices):
+    """remote_submissions outbox lifecycle (F-06 transactional submission).
+
+    The submission outbox makes a /queries POST crash-safe and idempotent. A row
+    is written with state=PENDING *before* the network call. After the POST
+    succeeds the SAME transaction flips it to SUBMITTED and links the RemoteQuery.
+    A retryable failure (no provider id obtained) flips it to FAILED so the
+    deterministic idempotency key ``(provider, payload_hash)`` can be reused by a
+    later submit. The partial-UNIQUE over the non-FAILED states guarantees that a
+    crash between intent and confirmation cannot cause a second POST: the next
+    worker tick finds the existing PENDING/SUBMITTED row and reconciles instead.
+
+    State machine:
+      PENDING ──success──> SUBMITTED (terminal: links RemoteQuery)
+              ──failure──> FAILED    (terminal: key reusable)
+    """
+
+    PENDING = "PENDING", "Pending"
+    SUBMITTED = "SUBMITTED", "Submitted"
+    FAILED = "FAILED", "Failed"
+
+    @classmethod
+    def live_states(cls) -> tuple[SubmissionState, ...]:
+        """States that hold the idempotency slot (everything but FAILED)."""
+        return (cls.PENDING, cls.SUBMITTED)
+
+
+# Raw string values of the submission states that hold the idempotency slot,
+# handy for partial-UNIQUE constraints and other-language ports.
+LIVE_SUBMISSION_STATES: tuple[str, ...] = tuple(
+    s.value for s in SubmissionState.live_states()
+)
+
+
+class CircuitState(models.TextChoices):
+    """remote_circuits breaker lifecycle (F-08 DB-backed circuit breaker).
+
+    State lives in Postgres (one row per provider) so N workers across processes
+    share ONE breaker. Consecutive failures open the circuit; after a cool-down
+    a single worker wins the HALF_OPEN probe via a conditional UPDATE (no
+    thundering herd). See docs/state-machines.md §6.
+
+    CLOSED ──failures>=threshold──> OPEN
+    OPEN   ──cooldown elapsed (one probe wins)──> HALF_OPEN
+    HALF_OPEN ──probe success──> CLOSED
+              ──probe failure──> OPEN
+    """
+
+    CLOSED = "CLOSED", "Closed"
+    OPEN = "OPEN", "Open"
+    HALF_OPEN = "HALF_OPEN", "Half open"
+
+
 class SeedProfile(models.TextChoices):
     """Which seed shape was imported."""
 

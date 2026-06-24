@@ -11,7 +11,14 @@ from __future__ import annotations
 from django.db import models
 from django.db.models import Q
 
-from apps.core.enums import ACTIVE_TASK_STATES, QueryState, TaskState
+from apps.core.enums import (
+    ACTIVE_TASK_STATES,
+    LIVE_SUBMISSION_STATES,
+    CircuitState,
+    QueryState,
+    SubmissionState,
+    TaskState,
+)
 
 INCHIKEY_REGEX = r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"
 
@@ -44,6 +51,21 @@ class RemoteTask(models.Model):
     )
     locked_at = models.DateTimeField(
         null=True, blank=True, help_text="When the current lock was taken."
+    )
+
+    # --- lease fencing (F-07) ---
+    # A fencing token (uuid) + monotonic version issued on every claim/reclaim.
+    # EVERY subsequent state transition is conditional on BOTH so a stale worker
+    # whose lease was reclaimed cannot overwrite the new owner's state. The
+    # version is bumped (never reset) on each claim and on stale-lock recovery.
+    lease_token = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text="Fencing token of the worker currently holding the lease.",
+    )
+    lease_version = models.IntegerField(
+        default=0,
+        help_text="Monotonic fencing version, bumped on every claim/reclaim.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -163,3 +185,218 @@ class RemoteQueryItem(models.Model):
 
     def __str__(self) -> str:
         return f"qitem:{self.query_id}->{self.inchikey}"
+
+
+class RemoteSubmission(models.Model):
+    """Transactional submission outbox / idempotency record (F-06).
+
+    Persists submission INTENT to the DB *before* the network call so a crash
+    after the provider POST but before the local commit cannot cause a second
+    POST. The deterministic idempotency key ``(provider, payload_hash)`` —
+    ``payload_hash`` = sha256 hex of the canonical request payload — is unique
+    over the live (non-FAILED) states via a partial-UNIQUE index, so a retry of
+    the same payload reconciles against the existing row instead of re-POSTing.
+
+    Lifecycle: PENDING (intent written) → SUBMITTED (provider id recorded,
+    RemoteQuery linked, same txn) | FAILED (no id obtained; key reusable).
+    """
+
+    provider = models.CharField(
+        max_length=32,
+        default="wishart",
+        help_text="Remote provider namespace.",
+    )
+    payload_hash = models.CharField(
+        max_length=64,
+        help_text="sha256 hex of the canonical request payload (idempotency key).",
+    )
+    state = models.CharField(
+        max_length=16,
+        choices=SubmissionState.choices,
+        default=SubmissionState.PENDING,
+    )
+    query = models.ForeignKey(
+        RemoteQuery,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submissions",
+        help_text="Linked RemoteQuery once the POST is confirmed (SUBMITTED).",
+    )
+    remote_query_id = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Provider query id captured on a confirmed submit.",
+    )
+    request_payload = models.JSONField(
+        help_text="Canonical request payload submitted to the provider (JSONB).",
+    )
+    reconcile_attempts = models.IntegerField(
+        default=0,
+        help_text=(
+            "How many times an in-doubt PENDING intent has been reconciled "
+            "without resolving. Past the cap (or TTL) the intent is aged out to "
+            "FAILED so exactly one genuine re-POST may occur."
+        ),
+    )
+    detail = models.TextField(
+        null=True, blank=True, help_text="Failure detail when FAILED."
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_submissions"
+        constraints = [
+            # Idempotency: at most ONE live (PENDING/SUBMITTED) row per
+            # (provider, payload_hash). FAILED rows do not conflict so the key
+            # is reusable after a permanent submit failure.
+            models.UniqueConstraint(
+                fields=["provider", "payload_hash"],
+                name="remote_submission_idempotency_unique",
+                condition=Q(state__in=LIVE_SUBMISSION_STATES),
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["provider", "payload_hash"],
+                name="remote_submission_key_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"submission:{self.provider}:{self.payload_hash[:12]} ({self.state})"
+
+
+class RemoteRateBucket(models.Model):
+    """Shared DB-backed token bucket for global rate limiting (F-08).
+
+    A single row per ``(provider, bucket)`` holds the live token count; every
+    worker draws tokens atomically (``UPDATE ... SET tokens = tokens - 1 WHERE
+    tokens >= 1 RETURNING`` style) so N workers across processes respect ONE
+    global rate. Tokens refill lazily from ``refill_rate_per_sec`` based on
+    ``updated_at`` elapsed, capped at ``capacity``. A server ``Retry-After`` parks
+    the bucket until ``blocked_until`` regardless of token count.
+    """
+
+    provider = models.CharField(max_length=32, default="wishart")
+    bucket = models.CharField(
+        max_length=32, help_text="Bucket name, e.g. 'entity' or 'submit'."
+    )
+    capacity = models.IntegerField(help_text="Max tokens (burst size).")
+    tokens = models.FloatField(help_text="Current available token count.")
+    refill_rate_per_sec = models.FloatField(
+        help_text="Tokens added per second (per-minute budget / 60)."
+    )
+    blocked_until = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Bucket parked until this time (server Retry-After).",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_rate_buckets"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "bucket"],
+                name="remote_rate_bucket_provider_bucket_unique",
+            ),
+            models.CheckConstraint(
+                name="remote_rate_bucket_capacity_nonneg",
+                condition=Q(capacity__gte=0),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"bucket:{self.provider}:{self.bucket} ({self.tokens:.2f})"
+
+
+class RemoteCircuit(models.Model):
+    """Shared DB-backed circuit breaker state (F-08).
+
+    One row per provider; all workers share it. ``state`` is CLOSED/OPEN/
+    HALF_OPEN. Consecutive failures (``consecutive_failures``) past the threshold
+    OPEN the circuit. After ``reset_timeout`` a single worker wins the HALF_OPEN
+    probe via a conditional UPDATE (``WHERE state='OPEN' AND opened_at <= cutoff``
+    flipping to HALF_OPEN), so only one probe is issued — no thundering herd.
+    """
+
+    provider = models.CharField(max_length=32, default="wishart", unique=True)
+    state = models.CharField(
+        max_length=16,
+        choices=CircuitState.choices,
+        default=CircuitState.CLOSED,
+    )
+    consecutive_failures = models.IntegerField(default=0)
+    opened_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_circuits"
+        constraints = [
+            models.CheckConstraint(
+                name="remote_circuit_failures_nonneg",
+                condition=Q(consecutive_failures__gte=0),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"circuit:{self.provider} ({self.state})"
+
+
+class RemoteAttempt(models.Model):
+    """Append-only audit log of every remote call attempt (F-10).
+
+    One row per submit/poll/entity attempt records the raw provider payload and
+    the explicit HTTP status classification so failures are auditable. The table
+    is never updated in place — each attempt is a fresh row — so the full
+    request/response history of a query survives crashes and retries.
+    """
+
+    OPERATION_ENTITY = "ENTITY"
+    OPERATION_SUBMIT = "SUBMIT"
+    OPERATION_POLL = "POLL"
+    OPERATION_CHOICES = (
+        (OPERATION_ENTITY, "Entity lookup"),
+        (OPERATION_SUBMIT, "Submit"),
+        (OPERATION_POLL, "Poll"),
+    )
+
+    provider = models.CharField(max_length=32, default="wishart")
+    operation = models.CharField(max_length=16, choices=OPERATION_CHOICES)
+    query = models.ForeignKey(
+        RemoteQuery,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="attempts",
+    )
+    remote_query_id = models.TextField(null=True, blank=True)
+    http_status = models.IntegerField(
+        null=True, blank=True, help_text="HTTP status code, if any."
+    )
+    classification = models.CharField(
+        max_length=24,
+        help_text="Explicit outcome class (e.g. FOUND, RETRYABLE, AUTH_FAILURE).",
+    )
+    raw_payload = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Raw provider response payload for THIS attempt (JSONB).",
+    )
+    detail = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "remote_attempts"
+        indexes = [
+            models.Index(
+                fields=["query", "created_at"], name="remote_attempt_query_idx"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"attempt:{self.operation}:{self.classification}"
+
+
