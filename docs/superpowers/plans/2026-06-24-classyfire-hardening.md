@@ -69,31 +69,39 @@ Original build verified with **mock providers + SQLite substitute + no Docker**.
 
 ## GATE 2 — Required before real Wishart traffic / bulk user input
 
-### G2.1 — WS-D: real streaming ingest  [ ]
+> **STATUS (2026-06-24): GATE 2 CORE COMPLETE on main `ee3e6cd`.** All five workstreams (A/C/D/E/G)
+> implemented, individually reviewed (opus where concurrency-critical), fixed, and merged from
+> Gate-1 base `67d0322`. Full suite green on real Postgres (603 passed/22 skipped at WS-D merge).
+> Each WS shipped its own real-Postgres concurrency/crash tests (WS-H largely satisfied incrementally);
+> remaining: optional load/EXPLAIN-at-scale (G2.6) + the final whole-branch review.
+> Merge chain: WS-G `a2752da` → WS-C `457e0eb` → WS-A `e5e2d49` → (integration fix `5042030`) →
+> WS-E `6b44f0f` → WS-D `ee3e6cd`.
+
+### G2.1 — WS-D: real streaming ingest  [x] (main ee3e6cd)
 - [ ] **F-01** wire CSV/TSV/SDF parsers to the real web/API upload routes via format dispatch on suffix/content-type; bounded streaming (no full `file.read()`); SDF record/property byte caps; preserve external_id + original SMILES. Add **HTTP-route** integration tests (not just parser unit tests).
 - [ ] **F-11** move normalization/lookup/compound-upsert/task-create OUT of the HTTP request into a durable chunk worker; job state machine `UPLOADING→PARSING→NORMALIZING→LOCAL_LOOKUP→REMOTE_PENDING/ACTION_REQUIRED→COMPLETE`; chunk checkpoints; bulk `WHERE inchikey IN (...)` lookup + bulk upsert (kill N+1).
 - **Acceptance:** 100k-row CSV/SDF ingest with bounded memory; HTTP returns immediately; restart resumes PENDING_NORMALIZATION.
 
-### G2.2 — WS-C: remote queue crash-safety + true global control  [ ]
+### G2.2 — WS-C: remote queue crash-safety + true global control  [x] (main 457e0eb)
 - [ ] **F-06** transactional submission **outbox** + deterministic idempotency key `(provider, payload_hash)`; persist submission intent BEFORE the network call; reconcile uncertain state before resubmit; finalize query + task links in one transaction.
 - [ ] **F-07** lease **token + version** issued on claim; ALL transitions conditional (`WHERE lease_version=? AND lease_token=?`), raise on lost lease; heartbeat or operation-sized lease for long remote calls.
 - [ ] **F-08** **shared** (Postgres/Redis) global token-bucket rate limiter + provider circuit breaker with single half-open probe; fix `runworker` `any(worker.tick() ...)` serial short-circuit → real concurrency.
 - [ ] **F-10** explicit HTTP status classification (404=NOT_FOUND, 401/403=AUTH_FAILURE→stop, 408/425/429/5xx=RETRYABLE, other 4xx=PERMANENT); unknown provider status = protocol error (not COMPLETE); Retry-After HTTP-date support; reuse one `httpx.Client` (pooling); per-attempt raw saved.
 - **Acceptance:** crash-after-submit does not double-submit; expired-lease stale worker cannot overwrite; N workers respect ONE global rate; concurrent poll of one query is safe.
 
-### G2.3 — WS-A (full immutable model)  [ ]
+### G2.3 — WS-A (full immutable model)  [x] (main e5e2d49)
 - [ ] **F-05/F-20** append-only `ClassificationResult` / `RemoteAttempt` / `SourceArtifact`; `BatchItem.resolved_classification` FK (data-migrate from snapshot); preserve mismatch + submit + per-poll raw payloads; provenance-preserving official-import pipeline (staging→validate→immutable source event→current pointer).
 - **Acceptance:** every official result is reproducible from an immutable event with raw payload + checksum; mismatch is a stored source event, not a discarded failure.
 
-### G2.4 — WS-E: export scalability & lifecycle  [ ]
+### G2.4 — WS-E: export scalability & lifecycle  [x] (main 6b44f0f)
 - [ ] **F-12** `QuerySet.iterator(chunk_size)` + `select_related(resolved_classification)` + streaming gzip to temp file + atomic rename; `ExportArtifact` model + persistent volume + checksum + expiry + scheduled cleanup; CSV injection: strip leading whitespace before the `= + - @` check; add audit columns (canonical SMILES, InChI, requested/returned key, query id, source version).
 - **Acceptance:** large export with bounded memory; artifacts persist across container recreation; cleanup runs; injection-safe.
 
-### G2.5 — WS-G: full backup + restore integrity  [ ]
+### G2.5 — WS-G: full backup + restore integrity  [x] (main a2752da)
 - [ ] **F-13** dump the FULL DB excluding only the rebuildable seed (`--exclude-table=classyfire_seed*`); back up upload/export artifacts; restore test validates checksum, row counts, FK, exact lookup, and that pending tasks keep their submitted structure; fix the alpine `python3`/`stat` retention divergence.
 - **Acceptance:** restore-from-backup yields a working system with intact compound structures + provenance + resumable pending tasks.
 
-### G2.6 — WS-H full  [ ]
+### G2.6 — WS-H full  [~] (per-WS concurrency/crash tests merged; load/EXPLAIN-at-scale optional, deferred)
 - [ ] Add the real-Postgres concurrency/crash/load integration tests (see Missing Tests). Include EXPLAIN ANALYZE on the seed/live lookup at scale.
 
 **GATE 2 EXIT:** bulk ingest, remote outbox/lease/global-limiter, immutable provenance, streaming export, full backup/restore, and real-Postgres concurrency tests all in place and green.
