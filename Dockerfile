@@ -35,9 +35,14 @@ COPY pyproject.toml uv.lock ./
 
 # Install only runtime dependencies in the production image. Developer tools
 # are installed by local workflows through `uv run --locked --extra dev`.
+# --no-install-project: this layer runs BEFORE the application source is copied
+# (for layer caching), so install ONLY third-party deps here. The app itself is
+# imported from /app (WORKDIR) at runtime by gunicorn/manage.py, not from an
+# installed wheel — building the root project now (no source present) would
+# fail or produce an empty wheel.
 RUN pip install --upgrade pip setuptools wheel \
  && pip install --no-cache-dir uv==0.11.21 \
- && uv sync --locked --no-dev --no-editable
+ && uv sync --locked --no-dev --no-editable --no-install-project
 
 # ── Application source ───────────────────────────────────────────────────────
 # Copy only the source files needed at runtime; secrets, venv, dumps, etc.
