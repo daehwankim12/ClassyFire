@@ -5,6 +5,41 @@ Web application.
 
 ---
 
+## Real PostgreSQL Test Harness
+
+The trusted test path runs through a real PostgreSQL 16 database.  The harness
+maps `POSTGRES_TEST_*` variables into Django's `POSTGRES_*` settings, verifies
+the server version, then runs pytest.
+
+For a disposable local database managed by Docker Compose:
+
+```bash
+make postgres-test-up
+make test-postgres
+make postgres-test-down
+```
+
+The Compose service exposes PostgreSQL only on localhost at
+`${POSTGRES_TEST_PORT:-55432}`.
+
+If Docker daemon access is unavailable, point the harness at an already-running
+PostgreSQL 16 server:
+
+```bash
+POSTGRES_TEST_HOST=127.0.0.1 \
+POSTGRES_TEST_PORT=55432 \
+POSTGRES_TEST_DB=cf_test_wt4 \
+POSTGRES_TEST_USER=classyfire \
+POSTGRES_TEST_PASSWORD=classyfire \
+make test-postgres
+```
+
+On this machine, the current OS user cannot access `/var/run/docker.sock`.
+Local verification therefore used the already-running PostgreSQL 16.14 instance
+at `127.0.0.1:55432`.
+
+---
+
 ## Worker Management
 
 The classification worker is a Django management command that polls the

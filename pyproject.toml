@@ -29,12 +29,16 @@ dev = [
     "pytest>=8.0,<10.0",
     "pytest-django>=4.9,<5.0",
     "pytest-xdist>=3.6,<4.0",
+    "pyyaml>=6.0,<7.0",
     "ruff>=0.8,<1.0",
     "mypy>=1.13,<3.0",
     "django-stubs>=5.1,<6.0",
     "types-requests>=2.31,<3.0",
     "playwright>=1.40,<2.0",
 ]
+
+[tool.setuptools]
+packages = {find = {include = ["apps*", "config*"], exclude = ["tests*", "deploy*", "docs*", "stubs*", "static*", "templates*"]}}
 
 [tool.ruff]
 line-length = 100
