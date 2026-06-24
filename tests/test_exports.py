@@ -556,3 +556,6 @@ def test_export_reuse_invalidates_after_job_items_resolve():
     assert fresh_token != stale_token
     assert fresh_rows[0]["ClassyFy Status"] == "Completed"
     assert fresh_rows[0]["Kingdom"] == "Fresh completed kingdom"
+
+    stale_download = client.get(f"/api/exports/{stale_token}")
+    assert stale_download.status_code == 404

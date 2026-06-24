@@ -322,6 +322,19 @@ def _find_existing_token(job_id: str, fmt: str, rows_signature: str) -> str | No
     return None
 
 
+def _matches_current_rows_signature(meta: dict[str, str]) -> bool:
+    """Return True when metadata still matches the current job export rows."""
+    expected_signature = meta.get("rows_signature")
+    job_id = meta.get("job_id")
+    if not expected_signature or not job_id:
+        return True
+
+    job = BatchJob.objects.filter(pk=job_id).first()
+    if job is None:
+        return False
+    return _rows_signature(_rows_for_job(job)) == expected_signature
+
+
 def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
     valid_formats = {"csv", "tsv", "json", "csv.gz", "tsv.gz"}
     if fmt not in valid_formats:
@@ -376,6 +389,8 @@ def get_export_path(token: str) -> Path | None:
     """Return the file path for a valid export token, or None if not found/expired."""
     meta = _load_meta(token)
     if meta is None or not _is_valid_meta(meta):
+        return None
+    if not _matches_current_rows_signature(meta):
         return None
     fmt = meta.get("fmt", "")
     path = EXPORT_DIR / f"{token}.{fmt}"
