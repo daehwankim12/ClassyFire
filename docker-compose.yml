@@ -31,6 +31,9 @@ volumes:
   caddy_data:
   caddy_config:
   backup_data:
+  # Gate-2 WS-E (F-12): persistent export artifact storage.
+  # Mounted into web and worker so exports survive container recreation.
+  export_files:
 
 # ---------------------------------------------------------------------------
 # Networks
@@ -110,6 +113,8 @@ services:
     volumes:
       - static_files:/app/staticfiles
       - media_files:/app/media
+      # Gate-2 WS-E (F-12): persistent export storage survives container recreation
+      - export_files:/app/export_files
     networks:
       - internal
       - external
@@ -137,6 +142,8 @@ services:
       - runworker
     volumes:
       - media_files:/app/media
+      # Gate-2 WS-E (F-12): shared export storage
+      - export_files:/app/export_files
     networks:
       - internal
       - external
@@ -162,6 +169,8 @@ services:
       - cleanup_expired
     volumes:
       - media_files:/app/media
+      # Gate-2 WS-E (F-12): access export files for pruning
+      - export_files:/app/export_files
     networks:
       - internal
     depends_on:
