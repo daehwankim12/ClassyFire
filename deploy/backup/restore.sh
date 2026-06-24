@@ -18,8 +18,13 @@
 #   MANIFEST_FILE     — Specific manifest filename to restore from.
 #                       If not set, the most recent manifest in BACKUP_DIR
 #                       is used.
-#   RESTORE_MEDIA_DIR — If set, restore the media archive to this directory.
-#                       If not set, media restore is skipped.
+#   RESTORE_MEDIA_DIR          — If set, restore the media archive to this
+#                                directory. If not set, media restore is skipped.
+#   RESTORE_EXPORT_DIR         — If set, restore the exports archive to this
+#                                directory. If not set, exports restore is skipped.
+#   RESTORE_SOURCE_ARTIFACT_DIR — If set, restore the source_artifacts archive
+#                                to this directory. If not set, source artifacts
+#                                restore is skipped.
 #   RESTORE_DROP_DB   — Set to "1" to DROP + CREATE the target DB before
 #                       restore.  Default "0" (restore with --clean
 #                       --if-exists without dropping).
@@ -164,6 +169,68 @@ if [ -n "${RESTORE_MEDIA_DIR:-}" ] && [ -n "${MEDIA_FILE:-}" ] && [ "${MEDIA_FIL
   fi
 else
   echo "[restore] Media restore skipped (RESTORE_MEDIA_DIR not set or no media archive in manifest)."
+fi
+
+# ── Restore exports archive (optional) ────────────────────────────────────
+# Reads artifact_archives.exports from the manifest (if present).
+EXPORTS_FILE=$(awk -F'"' '/"exports"/{found=1} found && /"file"/{print $4; exit}' "${MANIFEST}" || true)
+if [ -n "${RESTORE_EXPORT_DIR:-}" ] && [ -n "${EXPORTS_FILE:-}" ] && [ "${EXPORTS_FILE}" != "null" ]; then
+  EXPORTS_PATH="${BACKUP_DIR}/${EXPORTS_FILE}"
+  if [ -f "${EXPORTS_PATH}" ]; then
+    EXPECTED_EXPORTS_CHECKSUM=$(awk -F'"' '/"exports"/{found=1} found && /"checksum"/{print $4; exit}' "${MANIFEST}" || true)
+    if [ -n "${EXPECTED_EXPORTS_CHECKSUM}" ] && [ "${EXPECTED_EXPORTS_CHECKSUM}" != "null" ]; then
+      echo "[restore] Verifying exports checksum for ${EXPORTS_FILE} ..."
+      ACTUAL_EXPORTS_CHECKSUM=$(sha256sum "${EXPORTS_PATH}" | awk '{print $1}')
+      if [ "${ACTUAL_EXPORTS_CHECKSUM}" != "${EXPECTED_EXPORTS_CHECKSUM}" ]; then
+        echo "[restore] ERROR: Exports checksum mismatch!" >&2
+        echo "[restore]   Expected: ${EXPECTED_EXPORTS_CHECKSUM}" >&2
+        echo "[restore]   Actual:   ${ACTUAL_EXPORTS_CHECKSUM}" >&2
+        exit 1
+      fi
+      echo "[restore] Exports checksum OK: ${ACTUAL_EXPORTS_CHECKSUM}"
+    else
+      echo "[restore] WARNING: no exports checksum in manifest — extracting without verification" >&2
+    fi
+    echo "[restore] Restoring exports archive: ${EXPORTS_FILE} -> ${RESTORE_EXPORT_DIR}"
+    mkdir -p "${RESTORE_EXPORT_DIR}"
+    tar -xzf "${EXPORTS_PATH}" -C "$(dirname "${RESTORE_EXPORT_DIR}")"
+    echo "[restore] Exports restore complete."
+  else
+    echo "[restore] WARNING: exports archive not found: ${EXPORTS_PATH}" >&2
+  fi
+else
+  echo "[restore] Exports restore skipped (RESTORE_EXPORT_DIR not set or no exports archive in manifest)."
+fi
+
+# ── Restore source_artifacts archive (optional) ───────────────────────────
+# Reads artifact_archives.source_artifacts from the manifest (if present).
+SOURCE_ARTIFACTS_FILE=$(awk -F'"' '/"source_artifacts"/{found=1} found && /"file"/{print $4; exit}' "${MANIFEST}" || true)
+if [ -n "${RESTORE_SOURCE_ARTIFACT_DIR:-}" ] && [ -n "${SOURCE_ARTIFACTS_FILE:-}" ] && [ "${SOURCE_ARTIFACTS_FILE}" != "null" ]; then
+  SOURCE_ARTIFACTS_PATH="${BACKUP_DIR}/${SOURCE_ARTIFACTS_FILE}"
+  if [ -f "${SOURCE_ARTIFACTS_PATH}" ]; then
+    EXPECTED_SOURCE_CHECKSUM=$(awk -F'"' '/"source_artifacts"/{found=1} found && /"checksum"/{print $4; exit}' "${MANIFEST}" || true)
+    if [ -n "${EXPECTED_SOURCE_CHECKSUM}" ] && [ "${EXPECTED_SOURCE_CHECKSUM}" != "null" ]; then
+      echo "[restore] Verifying source_artifacts checksum for ${SOURCE_ARTIFACTS_FILE} ..."
+      ACTUAL_SOURCE_CHECKSUM=$(sha256sum "${SOURCE_ARTIFACTS_PATH}" | awk '{print $1}')
+      if [ "${ACTUAL_SOURCE_CHECKSUM}" != "${EXPECTED_SOURCE_CHECKSUM}" ]; then
+        echo "[restore] ERROR: Source artifacts checksum mismatch!" >&2
+        echo "[restore]   Expected: ${EXPECTED_SOURCE_CHECKSUM}" >&2
+        echo "[restore]   Actual:   ${ACTUAL_SOURCE_CHECKSUM}" >&2
+        exit 1
+      fi
+      echo "[restore] Source artifacts checksum OK: ${ACTUAL_SOURCE_CHECKSUM}"
+    else
+      echo "[restore] WARNING: no source_artifacts checksum in manifest — extracting without verification" >&2
+    fi
+    echo "[restore] Restoring source_artifacts archive: ${SOURCE_ARTIFACTS_FILE} -> ${RESTORE_SOURCE_ARTIFACT_DIR}"
+    mkdir -p "${RESTORE_SOURCE_ARTIFACT_DIR}"
+    tar -xzf "${SOURCE_ARTIFACTS_PATH}" -C "$(dirname "${RESTORE_SOURCE_ARTIFACT_DIR}")"
+    echo "[restore] Source artifacts restore complete."
+  else
+    echo "[restore] WARNING: source artifacts archive not found: ${SOURCE_ARTIFACTS_PATH}" >&2
+  fi
+else
+  echo "[restore] Source artifacts restore skipped (RESTORE_SOURCE_ARTIFACT_DIR not set or no archive in manifest)."
 fi
 
 echo "[restore] Done."

@@ -37,6 +37,8 @@ set -euo pipefail
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 MEDIA_DIR="${MEDIA_DIR:-/app/media}"
+EXPORT_DIR="${EXPORT_DIR:-/app/export_files}"
+SOURCE_ARTIFACT_DIR="${SOURCE_ARTIFACT_DIR:-/app/source_artifacts}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 BACKUP_DAILY_COUNT="${BACKUP_DAILY_COUNT:-7}"
 BACKUP_WEEKLY_COUNT="${BACKUP_WEEKLY_COUNT:-4}"
@@ -44,6 +46,8 @@ BACKUP_MONTHLY_COUNT="${BACKUP_MONTHLY_COUNT:-6}"
 
 DUMP_FILE="${BACKUP_DIR}/classyfire_${TIMESTAMP}.dump"
 MEDIA_ARCHIVE="${BACKUP_DIR}/classyfire_media_${TIMESTAMP}.tar.gz"
+EXPORTS_ARCHIVE="${BACKUP_DIR}/classyfire_exports_${TIMESTAMP}.tar.gz"
+SOURCE_ARTIFACTS_ARCHIVE="${BACKUP_DIR}/classyfire_source_artifacts_${TIMESTAMP}.tar.gz"
 MANIFEST_FILE="${BACKUP_DIR}/classyfire_${TIMESTAMP}.manifest.json"
 
 echo "[backup] Starting backup at ${TIMESTAMP}"
@@ -73,7 +77,7 @@ DUMP_CHECKSUM=$(sha256sum "${DUMP_FILE}" | awk '{print $1}')
 echo "[backup] DB dump SHA-256: ${DUMP_CHECKSUM}"
 
 # ---------------------------------------------------------------------------
-# 2. Media (upload + export) artifact archive.
+# 2. Media artifact archive.
 #    Only run if the directory exists and is non-empty.
 # ---------------------------------------------------------------------------
 MEDIA_CHECKSUM=""
@@ -86,11 +90,37 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. Exports artifact archive.
+#     Only run if the directory exists and is non-empty.
+# ---------------------------------------------------------------------------
+EXPORTS_CHECKSUM=""
+if [ -d "${EXPORT_DIR}" ] && [ "$(find "${EXPORT_DIR}" -mindepth 1 -maxdepth 1 | head -c1)" != "" ]; then
+  tar -czf "${EXPORTS_ARCHIVE}" -C "$(dirname "${EXPORT_DIR}")" "$(basename "${EXPORT_DIR}")"
+  EXPORTS_CHECKSUM=$(sha256sum "${EXPORTS_ARCHIVE}" | awk '{print $1}')
+  echo "[backup] Exports archive written: ${EXPORTS_ARCHIVE} (SHA-256: ${EXPORTS_CHECKSUM})"
+else
+  echo "[backup] Exports dir empty or absent — skipping exports archive"
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. Source artifacts archive.
+#     Only run if the directory exists and is non-empty.
+# ---------------------------------------------------------------------------
+SOURCE_ARTIFACTS_CHECKSUM=""
+if [ -d "${SOURCE_ARTIFACT_DIR}" ] && [ "$(find "${SOURCE_ARTIFACT_DIR}" -mindepth 1 -maxdepth 1 | head -c1)" != "" ]; then
+  tar -czf "${SOURCE_ARTIFACTS_ARCHIVE}" -C "$(dirname "${SOURCE_ARTIFACT_DIR}")" "$(basename "${SOURCE_ARTIFACT_DIR}")"
+  SOURCE_ARTIFACTS_CHECKSUM=$(sha256sum "${SOURCE_ARTIFACTS_ARCHIVE}" | awk '{print $1}')
+  echo "[backup] Source artifacts archive written: ${SOURCE_ARTIFACTS_ARCHIVE} (SHA-256: ${SOURCE_ARTIFACTS_CHECKSUM})"
+else
+  echo "[backup] Source artifacts dir empty or absent — skipping source artifacts archive"
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Write manifest (JSON, no python3 required — use heredoc with sh vars)
 # ---------------------------------------------------------------------------
 BACKUP_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Build optional media fields
+# Build optional media fields (kept for backward compatibility)
 if [ -n "${MEDIA_CHECKSUM}" ]; then
   MEDIA_JSON="  \"media_file\": \"classyfire_media_${TIMESTAMP}.tar.gz\",
   \"media_checksum\": \"${MEDIA_CHECKSUM}\","
@@ -99,12 +129,38 @@ else
   \"media_checksum\": null,"
 fi
 
+# Build artifact_archives.media JSON fragment
+if [ -n "${MEDIA_CHECKSUM}" ]; then
+  ARTIFACT_MEDIA_JSON="    \"media\": {\"file\": \"classyfire_media_${TIMESTAMP}.tar.gz\", \"checksum\": \"${MEDIA_CHECKSUM}\"}"
+else
+  ARTIFACT_MEDIA_JSON="    \"media\": null"
+fi
+
+# Build artifact_archives.exports JSON fragment
+if [ -n "${EXPORTS_CHECKSUM}" ]; then
+  ARTIFACT_EXPORTS_JSON="    \"exports\": {\"file\": \"classyfire_exports_${TIMESTAMP}.tar.gz\", \"checksum\": \"${EXPORTS_CHECKSUM}\"}"
+else
+  ARTIFACT_EXPORTS_JSON="    \"exports\": null"
+fi
+
+# Build artifact_archives.source_artifacts JSON fragment
+if [ -n "${SOURCE_ARTIFACTS_CHECKSUM}" ]; then
+  ARTIFACT_SOURCE_JSON="    \"source_artifacts\": {\"file\": \"classyfire_source_artifacts_${TIMESTAMP}.tar.gz\", \"checksum\": \"${SOURCE_ARTIFACTS_CHECKSUM}\"}"
+else
+  ARTIFACT_SOURCE_JSON="    \"source_artifacts\": null"
+fi
+
 cat > "${MANIFEST_FILE}" <<EOF
 {
   "timestamp": "${BACKUP_TS}",
   "file": "classyfire_${TIMESTAMP}.dump",
   "checksum": "${DUMP_CHECKSUM}",
 ${MEDIA_JSON}
+  "artifact_archives": {
+${ARTIFACT_MEDIA_JSON},
+${ARTIFACT_EXPORTS_JSON},
+${ARTIFACT_SOURCE_JSON}
+  },
   "excludes": "classyfire_seed*",
   "status": "ok"
 }
@@ -185,15 +241,25 @@ for MFILE in ${MANIFESTS}; do
       rm "${BACKUP_DIR}/${DUMP_NAME}"
       echo "[backup] Pruned dump: ${DUMP_NAME}"
     fi
-    # Also prune associated media archive (same timestamp stem).
+    # Also prune associated artifact archives (same timestamp stem).
     STEM=$(basename "${MFILE}" .manifest.json)
-    # The media archive uses a different naming: classyfire_media_<TIMESTAMP>.tar.gz
+    # Archive naming: classyfire_{name}_{TIMESTAMP}.tar.gz
     # Extract timestamp from stem: classyfire_<TIMESTAMP>
     TS_PART=$(echo "${STEM}" | sed 's/^classyfire_//')
     MEDIA_NAME="classyfire_media_${TS_PART}.tar.gz"
     if [ -f "${BACKUP_DIR}/${MEDIA_NAME}" ]; then
       rm "${BACKUP_DIR}/${MEDIA_NAME}"
       echo "[backup] Pruned media archive: ${MEDIA_NAME}"
+    fi
+    EXPORTS_NAME="classyfire_exports_${TS_PART}.tar.gz"
+    if [ -f "${BACKUP_DIR}/${EXPORTS_NAME}" ]; then
+      rm "${BACKUP_DIR}/${EXPORTS_NAME}"
+      echo "[backup] Pruned exports archive: ${EXPORTS_NAME}"
+    fi
+    SOURCE_NAME="classyfire_source_artifacts_${TS_PART}.tar.gz"
+    if [ -f "${BACKUP_DIR}/${SOURCE_NAME}" ]; then
+      rm "${BACKUP_DIR}/${SOURCE_NAME}"
+      echo "[backup] Pruned source artifacts archive: ${SOURCE_NAME}"
     fi
     rm "${MFILE}"
     echo "[backup] Pruned manifest: $(basename "${MFILE}")"
