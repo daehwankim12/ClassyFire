@@ -220,12 +220,13 @@ Monitor circuit state on the `/stats/` page.
 # Pull latest code
 git pull origin main
 
-# Pull updated images
+# Pull updated images, then rebuild local app services
 docker compose pull
+docker compose build migrate web worker
 
-# Rerun migrations, then recreate app containers
-docker compose up -d --force-recreate migrate
-docker compose up -d web worker
+# Rerun migrations with the rebuilt image, then recreate app containers
+docker compose up --force-recreate --abort-on-container-exit migrate
+docker compose up -d --build web worker
 ```
 
 ---

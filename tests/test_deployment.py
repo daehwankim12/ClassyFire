@@ -52,12 +52,16 @@ def test_documented_deploy_reruns_migrate_before_web_and_worker():
     readme = read_file("README.md")
     operations = read_file("docs/operations.md")
 
-    expected = (
-        "docker compose up -d --force-recreate migrate\n"
-        "docker compose up -d web worker"
-    )
-    assert expected in readme
-    assert expected in "\n".join(line.strip() for line in operations.splitlines())
+    expected_commands = [
+        "docker compose build migrate web worker",
+        "docker compose up --force-recreate --abort-on-container-exit migrate",
+        "docker compose up -d --build web worker",
+    ]
+
+    for document in [readme, "\n".join(line.strip() for line in operations.splitlines())]:
+        positions = [document.find(command) for command in expected_commands]
+        assert all(position >= 0 for position in positions)
+        assert positions == sorted(positions)
 
 
 def test_dockerfile_uses_uv_frozen_runtime_install():

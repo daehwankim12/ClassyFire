@@ -308,12 +308,13 @@ docker compose exec web python manage.py admin_resume_remote
    ```bash
    git pull origin main
    docker compose pull
+   docker compose build migrate web worker
    ```
-2. Force-recreate the one-shot migration service, then recreate application
-   services:
+2. Force-recreate the one-shot migration service with the rebuilt image, then
+   recreate application services:
    ```bash
-   docker compose up -d --force-recreate migrate
-   docker compose up -d web worker
+   docker compose up --force-recreate --abort-on-container-exit migrate
+   docker compose up -d --build web worker
    ```
 3. Verify: check `/stats/` and run the backup smoke test.
 
