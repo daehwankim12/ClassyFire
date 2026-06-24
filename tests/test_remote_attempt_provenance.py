@@ -17,13 +17,20 @@ import json
 
 import pytest
 
+from apps.batches.models import BatchItem, BatchJob
+from apps.classifications.models import ClassificationResult, ClassyfireLive
 from apps.compounds.models import CompoundStructure
+from apps.core.enums import BatchItemStatus, ResultKind, TaskState
+from apps.remote.circuit import CircuitBreaker
+from apps.remote.mock import MockProvider, build_raw
 from apps.remote.models import RemoteAttempt, RemoteSubmission, RemoteTask
+from apps.remote.rate_limit import RateLimiter
 from apps.remote.worker import RemoteWorker
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
 IK = "RDHQFKQIGNGIED-MRVPVSSYSA-N"
+IK_RETURNED = "WQZGKKKJIJFFOK-GASJEMHNSA-N"
 SMILES = "CCO"
 
 
@@ -96,3 +103,67 @@ def test_remote_attempt_carries_request_response_identity(
     assert attempt.request_payload_hash
     assert attempt.raw_body_sha256
     assert attempt.raw_body_text is not None
+
+
+class _MismatchScenario:
+    """Drive a real worker entity path that returns a wrong-key classification.
+
+    Builds a CompoundStructure + RemoteTask + BatchItem and a MockProvider whose
+    entity lookup for ``requested`` resolves to a payload normalised to a
+    DIFFERENT key (``returned``). ``run()`` ticks the worker through the genuine
+    entity-lookup mismatch path (no direct ``_handle_key_mismatch`` call), so the
+    caller wiring is exercised end-to-end, and returns ``(requested, returned)``.
+    """
+
+    requested = IK
+    returned = IK_RETURNED
+
+    def run(self) -> tuple[str, str]:
+        from apps.remote import queue
+
+        job = BatchJob.objects.create(secret_hash="x", total_count=0)
+        compound = CompoundStructure.objects.create(
+            original_input=SMILES, canonical_smiles=SMILES, inchikey=self.requested
+        )
+        BatchItem.objects.create(
+            job=job,
+            row_order=0,
+            original_input=self.requested,
+            inchikey=self.requested,
+            compound=compound,
+            status=BatchItemStatus.PENDING_CLASSIFICATION,
+        )
+        queue.enqueue_task(self.requested, compound_id=compound.id)
+
+        provider = MockProvider(entities={self.requested: build_raw(self.returned)})
+        worker = RemoteWorker(
+            provider,
+            worker_id="w-mismatch",
+            rate_limiter=RateLimiter(1000, 1000),
+            circuit=CircuitBreaker(failure_threshold=1000),
+        )
+        worker.tick()
+        return self.requested, self.returned
+
+
+@pytest.fixture
+def remote_mismatch_scenario():
+    return _MismatchScenario()
+
+
+def test_remote_key_mismatch_appends_rejected_event(remote_mismatch_scenario):
+    requested_key, returned_key = remote_mismatch_scenario.run()
+
+    event = ClassificationResult.objects.get(requested_inchikey=requested_key)
+    assert event.returned_inchikey == returned_key
+    assert event.kind == ResultKind.REJECTED_MISMATCH
+    assert event.raw_json
+
+    # The mismatch must remain TERMINAL but never advance the live pointer.
+    task = RemoteTask.objects.get(inchikey=requested_key)
+    assert task.state == TaskState.DONE
+    assert not ClassyfireLive.objects.filter(inchikey=requested_key).exists()
+    assert (
+        BatchItem.objects.get(inchikey=requested_key).status
+        == BatchItemStatus.RESULT_KEY_MISMATCH
+    )

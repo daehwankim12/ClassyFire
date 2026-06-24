@@ -281,7 +281,7 @@ class RemoteWorker:
                 safe_headers=result.safe_headers,
             )
             if not self._key_matches(task.inchikey, norm.inchikey):
-                self._handle_key_mismatch(task)
+                self._handle_key_mismatch(task, norm, query=None)
                 return
             self._apply_result_with_fence(
                 task,
@@ -986,7 +986,7 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
         if not self._key_matches(task.inchikey, norm.inchikey):
-            self._handle_key_mismatch(task)
+            self._handle_key_mismatch(task, norm, query=query)
             return
         self._apply_result_with_fence(
             task,
@@ -1061,10 +1061,30 @@ class RemoteWorker:
     def _key_matches(requested: str, returned: str | None) -> bool:
         return returned is not None and returned == requested
 
-    def _handle_key_mismatch(self, task: RemoteTask) -> None:
-        """Result key mismatch: do NOT auto-apply; mark items + terminal task."""
-        fanout.fan_out_result(task.inchikey, BatchItemStatus.RESULT_KEY_MISMATCH)
-        queue.finish_task(task)
+    def _handle_key_mismatch(
+        self,
+        task: RemoteTask,
+        norm: NormalizedClassification,
+        *,
+        query: RemoteQuery | None,
+    ) -> None:
+        """Result key mismatch: persist the rejected result, never advance live.
+
+        Routes the mismatched ``norm`` through the SAME lease-fenced apply as a
+        clean result. ``write_live_result`` records an immutable
+        ``REJECTED_MISMATCH`` event (requested vs returned key + raw payload, with
+        remote provenance when ``query`` is set) and deliberately leaves the live
+        pointer UNCHANGED, so the mismatch is audited without ever becoming the
+        current classification. Fan-out marks waiting items RESULT_KEY_MISMATCH and
+        the task ends DONE — all under the F-07 fence, so a STALE worker writes
+        NOTHING (the rejected event included).
+        """
+        self._apply_result_with_fence(
+            task,
+            query=query,
+            norm=norm,
+            final_status=BatchItemStatus.RESULT_KEY_MISMATCH,
+        )
 
     def _structure_for(self, task: RemoteTask) -> str | None:
         """Return a submittable structure (SMILES/InChI) for the task, if any."""
