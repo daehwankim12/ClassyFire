@@ -57,6 +57,18 @@ from apps.remote.provider import (
     classify_http_status,
 )
 
+# Response headers safe to persist verbatim (no auth/cookies/PII). Lower-cased.
+SAFE_RESPONSE_HEADERS = {"content-type", "retry-after", "x-request-id"}
+
+
+def _safe_headers(response: httpx.Response) -> dict[str, str]:
+    """Filter response headers to the auditable allow-list (lower-cased keys)."""
+    return {
+        name.lower(): value
+        for name, value in response.headers.items()
+        if name.lower() in SAFE_RESPONSE_HEADERS
+    }
+
 
 def _parse_retry_after(response: httpx.Response) -> float | None:
     """Parse a ``Retry-After`` header supporting BOTH forms (F-10).
@@ -123,12 +135,16 @@ class WishartDirectProvider:
                 inchikey=inchikey,
                 detail=str(exc),
             )
+        headers = _safe_headers(resp)
+        raw_text = resp.text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.NOT_FOUND:
             return EntityLookupResult(
                 status=EntityLookupStatus.MISS,
                 inchikey=inchikey,
                 http_status=resp.status_code,
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.AUTH_FAILURE:
             return EntityLookupResult(
@@ -136,6 +152,8 @@ class WishartDirectProvider:
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.RETRYABLE:
             return EntityLookupResult(
@@ -144,6 +162,8 @@ class WishartDirectProvider:
                 retry_after=_parse_retry_after(resp),
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.PERMANENT:
             # Definite 4xx input error: surface as MISS (no entity, do not retry).
@@ -152,6 +172,8 @@ class WishartDirectProvider:
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.PROTOCOL_ERROR:
             return EntityLookupResult(
@@ -159,6 +181,8 @@ class WishartDirectProvider:
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"unmapped HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         # SUCCESS
         try:
@@ -169,6 +193,8 @@ class WishartDirectProvider:
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"malformed body: {exc}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         try:
             validate_entity_lookup_payload(raw)
@@ -179,12 +205,16 @@ class WishartDirectProvider:
                 raw_json=cast(dict[str, Any], raw),
                 http_status=resp.status_code,
                 detail=str(exc),
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         return EntityLookupResult(
             status=EntityLookupStatus.FOUND,
             inchikey=inchikey,
             raw_json=raw,
             http_status=resp.status_code,
+            raw_text=raw_text,
+            safe_headers=headers,
         )
 
     def submit_structures(
@@ -201,30 +231,63 @@ class WishartDirectProvider:
             resp = self._client().post(url, json=payload)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise RetryableProviderError(str(exc)) from exc
+        headers = _safe_headers(resp)
+        raw_text = resp.text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.RETRYABLE:
             raise RetryableProviderError(
-                f"HTTP {resp.status_code}", retry_after=_parse_retry_after(resp)
+                f"HTTP {resp.status_code}",
+                retry_after=_parse_retry_after(resp),
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
             )
         if outcome is HttpOutcome.AUTH_FAILURE:
-            raise AuthProviderError(f"HTTP {resp.status_code}")
+            raise AuthProviderError(
+                f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
         if outcome is HttpOutcome.PROTOCOL_ERROR:
-            raise ProtocolProviderError(f"unmapped HTTP {resp.status_code}")
+            raise ProtocolProviderError(
+                f"unmapped HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
         if outcome in (HttpOutcome.PERMANENT, HttpOutcome.NOT_FOUND):
-            raise NonRetryableProviderError(f"HTTP {resp.status_code}")
+            raise NonRetryableProviderError(
+                f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
         # SUCCESS
         try:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
-            raise RetryableProviderError(f"malformed body: {exc}") from exc
+            raise RetryableProviderError(
+                f"malformed body: {exc}",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            ) from exc
         try:
             body, query_id = validate_query_submit_payload(body)
         except ProviderContractError as exc:
-            raise ProtocolProviderError(str(exc)) from exc
+            raise ProtocolProviderError(
+                str(exc),
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            ) from exc
         return SubmitResult(
             remote_query_id=query_id,
             raw_json=body,
             http_status=resp.status_code,
+            raw_text=raw_text,
+            safe_headers=headers,
         )
 
     def poll_query(self, remote_query_id: str) -> PollResult:
@@ -233,6 +296,8 @@ class WishartDirectProvider:
             resp = self._client().get(url)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             return PollResult(status=PollStatus.RETRYABLE_ERROR, detail=str(exc))
+        headers = _safe_headers(resp)
+        raw_text = resp.text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.RETRYABLE:
             return PollResult(
@@ -240,37 +305,50 @@ class WishartDirectProvider:
                 retry_after=_parse_retry_after(resp),
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.AUTH_FAILURE:
             return PollResult(
                 status=PollStatus.AUTH_FAILURE,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.NOT_FOUND:
             return PollResult(
                 status=PollStatus.NOT_FOUND,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.PERMANENT:
             return PollResult(
                 status=PollStatus.PROTOCOL_ERROR,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if outcome is HttpOutcome.PROTOCOL_ERROR:
             return PollResult(
                 status=PollStatus.PROTOCOL_ERROR,
                 http_status=resp.status_code,
                 detail=f"unmapped HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         # SUCCESS
         try:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
             return PollResult(
-                status=PollStatus.RETRYABLE_ERROR, detail=f"malformed body: {exc}"
+                status=PollStatus.RETRYABLE_ERROR,
+                detail=f"malformed body: {exc}",
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         try:
             body, status = validate_query_poll_payload(body)
@@ -280,17 +358,23 @@ class WishartDirectProvider:
                 raw_json=cast(dict[str, Any], body),
                 http_status=resp.status_code,
                 detail=str(exc),
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         if status is QueryPollContractStatus.RUNNING:
             return PollResult(
                 status=PollStatus.RUNNING,
                 raw_json=body,
                 http_status=resp.status_code,
+                raw_text=raw_text,
+                safe_headers=headers,
             )
         return PollResult(
             status=PollStatus.COMPLETE,
             raw_json=body,
             http_status=resp.status_code,
+            raw_text=raw_text,
+            safe_headers=headers,
         )
 
     def parse_result(self, raw_json: dict[str, Any]) -> NormalizedClassification:

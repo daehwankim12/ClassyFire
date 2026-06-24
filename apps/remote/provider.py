@@ -109,6 +109,8 @@ class EntityLookupResult:
     retry_after: float | None = None
     detail: str | None = None
     http_status: int | None = None
+    raw_text: str | None = None
+    safe_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,8 @@ class SubmitResult:
     remote_query_id: str
     raw_json: dict[str, Any] | None = None
     http_status: int | None = None
+    raw_text: str | None = None
+    safe_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,8 @@ class PollResult:
     retry_after: float | None = None
     detail: str | None = None
     http_status: int | None = None
+    raw_text: str | None = None
+    safe_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -159,7 +165,25 @@ class NormalizedClassification:
 
 
 class ProviderError(Exception):
-    """Base class for provider failures."""
+    """Base class for provider failures.
+
+    Carries the raw response BODY text + allow-listed headers + HTTP status so
+    the worker can record a COMPLETE, reproducible audit row even when a submit
+    failed (non-JSON / permanent-error bodies are not silently dropped).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str | None = None,
+        safe_headers: dict[str, str] | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.safe_headers = safe_headers or {}
+        self.http_status = http_status
 
 
 class RetryableProviderError(ProviderError):
@@ -169,8 +193,21 @@ class RetryableProviderError(ProviderError):
     computed backoff (server ``429``/``Retry-After``).
     """
 
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        raw_text: str | None = None,
+        safe_headers: dict[str, str] | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            raw_text=raw_text,
+            safe_headers=safe_headers,
+            http_status=http_status,
+        )
         self.retry_after = retry_after
 
 

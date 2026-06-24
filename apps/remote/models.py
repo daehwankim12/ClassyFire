@@ -385,6 +385,22 @@ class RemoteAttempt(models.Model):
         on_delete=models.SET_NULL,
         related_name="attempts",
     )
+    task = models.ForeignKey(
+        RemoteTask,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="attempts",
+        help_text="The task whose identity this attempt was made for, if any.",
+    )
+    submission = models.ForeignKey(
+        "remote.RemoteSubmission",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="attempts",
+        help_text="The submission this attempt belongs to (submit/reconcile).",
+    )
     remote_query_id = models.TextField(null=True, blank=True)
     http_status = models.IntegerField(
         null=True, blank=True, help_text="HTTP status code, if any."
@@ -393,10 +409,50 @@ class RemoteAttempt(models.Model):
         max_length=24,
         help_text="Explicit outcome class (e.g. FOUND, RETRYABLE, AUTH_FAILURE).",
     )
+    request_inchikey = models.CharField(
+        max_length=27,
+        null=True,
+        blank=True,
+        help_text="Full 27-char InChIKey this attempt was made FOR, if any.",
+    )
+    returned_inchikey = models.CharField(
+        max_length=27,
+        null=True,
+        blank=True,
+        help_text="Full 27-char InChIKey the parsed response reported, if any.",
+    )
+    request_payload_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="SHA-256 of the canonical request payload (submit batches).",
+    )
+    request_structure_hash = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="SHA-256 of the structure involved, where applicable.",
+    )
     raw_payload = models.JSONField(
         null=True,
         blank=True,
         help_text="Raw provider response payload for THIS attempt (JSONB).",
+    )
+    raw_body_text = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Raw response BODY text (preserves non-JSON bodies verbatim).",
+    )
+    raw_body_sha256 = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="SHA-256 hex digest of raw_body_text.",
+    )
+    safe_headers = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Allow-listed response headers (content-type, retry-after, ...).",
     )
     detail = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -406,6 +462,18 @@ class RemoteAttempt(models.Model):
         indexes = [
             models.Index(
                 fields=["query", "created_at"], name="remote_attempt_query_idx"
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                name="remote_attempt_request_inchikey_len27",
+                condition=Q(request_inchikey__isnull=True)
+                | Q(request_inchikey__length=27),
+            ),
+            models.CheckConstraint(
+                name="remote_attempt_returned_inchikey_len27",
+                condition=Q(returned_inchikey__isnull=True)
+                | Q(returned_inchikey__length=27),
             ),
         ]
 

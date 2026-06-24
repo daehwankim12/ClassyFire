@@ -95,6 +95,21 @@ class CircuitLike(Protocol):
 DEFAULT_LEASE_SECONDS = 300.0
 
 
+def _raw_body_text(raw_payload: object | None, raw_body_text: str | None) -> str:
+    """Return the literal response BODY text for hashing/auditing.
+
+    Prefer the verbatim ``raw_body_text`` captured from the provider response
+    (preserves non-JSON bodies exactly). When only a parsed payload is available
+    (e.g. tests, or a payload reconstructed without the original bytes), fall
+    back to canonical JSON so the sha256 is deterministic across processes.
+    """
+    if raw_body_text is not None:
+        return raw_body_text
+    return json.dumps(
+        raw_payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+
+
 def make_worker_id() -> str:
     """A stable-ish unique id for this worker process (host:pid:uuid)."""
     return f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
@@ -191,6 +206,10 @@ class RemoteWorker:
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
             if result.retry_after is not None:
                 self.rate_limiter.entity.penalize(result.retry_after)
@@ -209,6 +228,10 @@ class RemoteWorker:
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
             logger.error(
                 "remote entity AUTH_FAILURE (operator action) for %s: %s",
@@ -228,6 +251,10 @@ class RemoteWorker:
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
             logger.error(
                 "remote entity PROTOCOL_ERROR for %s: %s",
@@ -241,13 +268,18 @@ class RemoteWorker:
         self.circuit.record_success()
 
         if result.status == EntityLookupStatus.FOUND and result.raw_json is not None:
+            norm = self.provider.parse_result(result.raw_json)
             self._record_attempt(
                 RemoteAttempt.OPERATION_ENTITY,
                 classification="FOUND",
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
+                task=task,
+                request_inchikey=task.inchikey,
+                returned_inchikey=norm.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
             )
-            norm = self.provider.parse_result(result.raw_json)
             if not self._key_matches(task.inchikey, norm.inchikey):
                 self._handle_key_mismatch(task)
                 return
@@ -372,6 +404,13 @@ class RemoteWorker:
                 classification="RETRYABLE",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             # Free the idempotency key so a later retry can re-submit.
             self._fail_submission(submission, detail=f"retryable: {exc}")
@@ -393,6 +432,13 @@ class RemoteWorker:
                 classification="AUTH_FAILURE",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"auth: {exc}")
             logger.error("remote submit AUTH_FAILURE (operator action): %s", exc)
@@ -408,6 +454,13 @@ class RemoteWorker:
                 classification="PROTOCOL_ERROR",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"protocol: {exc}")
             logger.error("remote submit PROTOCOL_ERROR: %s", exc)
@@ -422,6 +475,13 @@ class RemoteWorker:
                 classification="PERMANENT",
                 raw_payload=None,
                 detail=str(exc),
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"permanent: {exc}")
             for member in members:
@@ -459,6 +519,12 @@ class RemoteWorker:
                 query=query,
                 http_status=submit.http_status,
                 remote_query_id=submit.remote_query_id,
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                raw_body_text=submit.raw_text,
+                safe_headers=submit.safe_headers,
             )
             for member in members:
                 RemoteQueryItem.objects.get_or_create(
@@ -562,6 +628,13 @@ class RemoteWorker:
                 raw_payload=None,
                 remote_query_id=submission.remote_query_id,
                 detail=submission.detail,
+                submission=submission,
+                request_payload_hash=submission.payload_hash,
+                # Batch-level reconcile spans many members; record a
+                # representative member's key (or null when none) — the brief
+                # permits a null request_inchikey here, do NOT fabricate one.
+                task=members[0] if members else None,
+                request_inchikey=members[0].inchikey if members else None,
             )
             logger.warning(
                 "reconcile: in-doubt PENDING submission %s -> UNKNOWN "
@@ -601,8 +674,26 @@ class RemoteWorker:
         http_status: int | None = None,
         remote_query_id: str | None = None,
         detail: str | None = None,
+        task: RemoteTask | None = None,
+        submission: RemoteSubmission | None = None,
+        request_inchikey: str | None = None,
+        returned_inchikey: str | None = None,
+        request_payload_hash: str | None = None,
+        request_structure_hash: str | None = None,
+        raw_body_text: str | None = None,
+        safe_headers: dict[str, str] | None = None,
     ) -> None:
-        """Append an audit row for ONE remote attempt (F-10, per-attempt raw)."""
+        """Append a COMPLETE audit row for ONE remote attempt (F-10).
+
+        Records not just the parsed ``raw_payload`` but the request/response
+        IDENTITY: the originating task + its requested InChIKey, the request
+        payload/structure hashes, the returned InChIKey where known, the raw
+        response BODY text (verbatim, preserving non-JSON bodies) and its
+        sha256, and the allow-listed safe response headers. Every remote side
+        effect is therefore auditable and reproducible.
+        """
+        body_text = _raw_body_text(raw_payload, raw_body_text)
+        body_sha256 = hashlib.sha256(body_text.encode()).hexdigest()
         RemoteAttempt.objects.create(
             provider=PROVIDER,
             operation=operation,
@@ -612,6 +703,15 @@ class RemoteWorker:
             http_status=http_status,
             remote_query_id=remote_query_id,
             detail=detail,
+            task=task,
+            submission=submission,
+            request_inchikey=request_inchikey,
+            returned_inchikey=returned_inchikey,
+            request_payload_hash=request_payload_hash,
+            request_structure_hash=request_structure_hash,
+            raw_body_text=body_text,
+            raw_body_sha256=body_sha256,
+            safe_headers=safe_headers,
         )
 
     def _claim_batch_extras(self, task: RemoteTask) -> list[RemoteTask]:
@@ -712,6 +812,10 @@ class RemoteWorker:
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
                 detail=poll.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             if poll.retry_after is not None:
                 queue.retry_after_override(task, poll.retry_after)
@@ -731,6 +835,10 @@ class RemoteWorker:
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
                 detail=poll.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             logger.error("remote poll AUTH_FAILURE (operator action): %s", poll.detail)
             queue.defer_task(task, delay_seconds=self.lease_seconds)
@@ -749,6 +857,10 @@ class RemoteWorker:
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
                 detail=poll.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             logger.error("remote poll %s: %s", poll.status, poll.detail)
             queue.schedule_retry(task)
@@ -765,6 +877,10 @@ class RemoteWorker:
                 query=query,
                 http_status=poll.http_status,
                 remote_query_id=remote_query_id,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=poll.raw_text,
+                safe_headers=poll.safe_headers,
             )
             query.state = QueryState.POLLING
             query.next_poll_at = timezone.now() + timedelta(
@@ -789,6 +905,10 @@ class RemoteWorker:
             query=query,
             http_status=poll.http_status,
             remote_query_id=remote_query_id,
+            task=task,
+            request_inchikey=task.inchikey,
+            raw_body_text=poll.raw_text,
+            safe_headers=poll.safe_headers,
         )
         query.state = QueryState.COMPLETE
         query.raw_response = raw
