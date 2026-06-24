@@ -177,7 +177,14 @@ def _iter_text(file: IO[bytes]) -> Iterator[dict]:
         if not stripped:
             continue
         if len(stripped) > MAX_LINE_LEN:
-            stripped = stripped[:MAX_LINE_LEN]
+            yield {
+                "raw": stripped[:200],
+                "row_index": row_index,
+                "parse_error": "ROW_TOO_LONG",
+                "overflow_length": len(stripped),
+            }
+            row_index += 1
+            continue
         yield {"raw": stripped, "row_index": row_index}
         row_index += 1
 
@@ -206,7 +213,14 @@ def _iter_csv_tsv(file: IO[bytes], delimiter: str) -> Iterator[dict]:
         if not raw:
             continue
         if len(raw) > MAX_LINE_LEN:
-            raw = raw[:MAX_LINE_LEN]
+            yield {
+                "raw": raw[:200],
+                "row_index": row_index,
+                "parse_error": "ROW_TOO_LONG",
+                "overflow_length": len(raw),
+            }
+            row_index += 1
+            continue
         result: dict = {"raw": raw, "row_index": row_index}
         if id_index is not None and id_index < len(fields):
             ext = fields[id_index].strip()
@@ -288,15 +302,15 @@ def _build_sdf_row(buffer: list[str], row_index: int, overflowed: bool) -> dict:
     """Build one parser-style row dict from an accumulated SDF block."""
     block = "".join(buffer)
     if overflowed:
-        preview = block.strip()[:200]
         return {
-            "raw": (
-                f"{preview}…[SDF record exceeds {MAX_SDF_RECORD_LEN} bytes; truncated]"
-            ),
+            "raw": block[:200],
             "row_index": row_index,
+            "input_type": "SDF",
+            "parse_error": "SDF_RECORD_TOO_LONG",
+            "overflow_length": max(len(block), MAX_SDF_RECORD_LEN + 1),
         }
 
-    result: dict = {"raw": block.strip(), "row_index": row_index}
+    result: dict = {"raw": block.rstrip("\r\n"), "row_index": row_index, "input_type": "SDF"}
     ext_id = _extract_sdf_external_id(block)
     if ext_id:
         result["external_id"] = ext_id

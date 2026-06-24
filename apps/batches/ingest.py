@@ -85,6 +85,9 @@ def ingest_rows(
             row_order=row["row_index"],
             original_input=row["raw"],
             external_id=row.get("external_id"),
+            submitted_type=row.get("input_type") or None,
+            parse_error=row.get("parse_error"),
+            overflow_length=row.get("overflow_length"),
             status=BatchItemStatus.PENDING_NORMALIZATION,
         )
         chunk.append(item)

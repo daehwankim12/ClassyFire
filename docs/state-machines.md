@@ -288,6 +288,16 @@ The worker CLAIMS a job needing processing via
 `created_at, id`, flips it to `PARSING` with a fresh `claim_lease_version`
 (+ `claimed_by`/`claimed_at`), then runs the chunked, checkpointed pipeline.
 
+**Claim lease TTL + stale-reclaim (mirrors the remote queue, F-07).** The claim
+query additionally filters to jobs that are either *never claimed*
+(`claimed_by IS NULL`) **or** *stale* — `claimed_at < now() - INGEST_CLAIM_LEASE_SECONDS`
+(default 900s, env `INGEST_CLAIM_LEASE_SECONDS`). A job actively being driven by
+another worker (NORMALIZING/LOCAL_LOOKUP are claimable for crash-resume) is
+therefore **not** stealable until its lease goes stale, so a live worker is never
+preempted; a genuinely crashed worker's job becomes reclaimable once the TTL
+lapses, and the reclaim bumps `claim_lease_version` so the dead holder is fenced
+out.
+
 | State | Meaning | Claimable? |
 | --- | --- | --- |
 | `UPLOADING` | Raw upload being staged (reserved; current flow persists items in-request). | yes |
@@ -326,16 +336,38 @@ synchronous entry point `process_job_items(job)` drives the identical pipeline
 inline (used by the synchronous upload mode and unit tests); `manage.py
 process_jobs` claims + drives jobs durably.
 
-**Two upload-route modes (`INGEST_DEFER_HEAVY_PROCESSING`).** The web
-`submit_view` and API `create_job_view` run in one of two modes, selected by the
-boolean setting (env `INGEST_DEFER_HEAVY_PROCESSING`, default **False**):
+**Fenced processing writes (mirrors the remote queue lease/version fencing).**
+Every job-state write the worker makes — the `NORMALIZING` transition, the
+per-chunk `LOCAL_LOOKUP` transition, the per-chunk `processed_through_row_order`
+checkpoint, and the FAILED-parking write — goes through `_fenced_job_update`,
+which only updates the row when `claimed_by` + `claim_lease_version` still match
+the values captured on the in-memory job handle at claim time. If another worker
+reclaimed the job (bumping the version), the fenced write matches **0 rows** and
+raises `IngestLeaseLost`: a stale/crashed worker can never keep checkpointing or
+park a job FAILED over the new owner's state. On `IngestLeaseLost`,
+`process_claimed_job` re-raises WITHOUT the generic FAILED-parking path (the new
+owner now drives the job), and `manage.py process_jobs` logs it and claims the
+next job rather than crashing. This is the ingest-side analogue of the remote
+queue's lease-token + `lease_version` fencing (F-07).
 
-| Mode | Setting | Route behavior |
-| --- | --- | --- |
-| Synchronous (default) | `False` | Route parses (streaming) → `create_job_under_quota` stages items AND runs `process_job_items` inline → returns with the job already resolved. Preserves the existing immediate-result contract. |
-| Deferred | `True` | Route parses (streaming) → `stage_job_under_quota` consumes the row *iterator* straight into BatchItems (no full row-list materialization) and RETURNS immediately with the job in `PARSING` and items `PENDING_NORMALIZATION`. The durable `process_jobs` worker then claims + drains it to the SAME final statuses/pins. |
+**Upload routes are always deferred (`INGEST_DEFER_HEAVY_PROCESSING`, default
+**True**).** The web `submit_view` and API `create_job_view` authenticate, parse
+the upload as a bounded stream, stage rows, and RETURN — they never run heavy
+processing inside the HTTP request. The route consumes the row *iterator*
+straight into BatchItems via `stage_job_under_quota` (no full row-list
+materialization) and returns immediately (API: `202 Accepted` with
+`processing_state`; web: redirect to the job's claim page) with the job in
+`PARSING` and items `PENDING_NORMALIZATION`. The durable `process_jobs` worker
+then claims + drains the job to its final statuses/pins.
 
-In deferred mode the per-job `MAX_ROWS_PER_JOB` cap is enforced **mid-stream**
+The legacy synchronous helper `create_job_under_quota` (which staged items AND
+ran `process_job_items` inline) is retained ONLY for service-level tests and
+diagnostics: it raises `RuntimeError` when `INGEST_DEFER_HEAVY_PROCESSING` is
+enabled (the default), so no production route can run processing in-request.
+Tests that need inline processing call `create_job_records` + `process_job_items`
+(or `run_pending_jobs`) directly, or set the flag `False` explicitly.
+
+The per-job `MAX_ROWS_PER_JOB` cap is enforced **mid-stream**
 (`RowCapExceededError` → 413, transaction rolled back, no partial job); the
 daily row cap is re-checked once the true streamed count is known.
 

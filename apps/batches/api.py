@@ -68,7 +68,6 @@ from apps.core.enums import BatchItemStatus
 from apps.core.security import (
     UploadTooLargeError,
     check_upload_size,
-    create_job_under_quota,
     request_has_job_access_cookie,
     request_has_shared_access,
     require_csrf_for_cookie_auth,
@@ -181,23 +180,14 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
         content_type=getattr(file, "content_type", None) if file else None,
     )
 
-    if getattr(settings, "INGEST_DEFER_HEAVY_PROCESSING", False):
-        # DEFERRED mode (F-11): STAGE only and RETURN immediately; the durable
-        # `process_jobs` worker drains the job. Streamed straight into staging —
-        # no full row-list materialization.
-        job, plaintext_secret, quota_error = stage_job_under_quota(
-            request,
-            row_iter,
-            remote_enabled=remote_enabled,
-        )
-    else:
-        # SYNCHRONOUS mode (default): process inline so the job is resolved on
-        # return (preserves existing immediate-result behavior).
-        job, plaintext_secret, quota_error = create_job_under_quota(
-            request,
-            list(row_iter),
-            remote_enabled=remote_enabled,
-        )
+    # DEFERRED mode (F-11, always on): STAGE only and RETURN immediately with 202;
+    # the durable `process_jobs` worker drains the job. Streamed straight into
+    # staging — no full row-list materialization in the HTTP request.
+    job, plaintext_secret, quota_error = stage_job_under_quota(
+        request,
+        row_iter,
+        remote_enabled=remote_enabled,
+    )
     if quota_error is not None:
         return quota_error
 
@@ -205,8 +195,13 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"error": "Job creation failed."}, status=500)
 
     return JsonResponse(
-        {"job_id": str(job.pk), "result_secret": plaintext_secret},
-        status=201,
+        {
+            "job_id": str(job.pk),
+            "result_secret": plaintext_secret,
+            "status": job.status,
+            "processing_state": job.processing_state,
+        },
+        status=202,
     )
 
 

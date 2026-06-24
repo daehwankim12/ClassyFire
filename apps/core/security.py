@@ -478,7 +478,18 @@ def create_job_under_quota(
     *,
     remote_enabled: bool,
 ) -> tuple[BatchJob | None, str, JsonResponse | None]:
-    """Create a job while holding quota locks through the active-job insert."""
+    """Create a job while holding quota locks through the active-job insert.
+
+    Production routes must NOT call this function when async ingest is enabled.
+    It is retained for service-level tests and diagnostics only; set
+    ``INGEST_DEFER_HEAVY_PROCESSING = False`` in any test that needs the
+    synchronous pipeline.
+    """
+    if getattr(settings, "INGEST_DEFER_HEAVY_PROCESSING", True):
+        raise RuntimeError(
+            "create_job_under_quota is disabled when async ingest is enabled"
+        )
+
     from apps.batches import services
     from apps.batches.models import BatchQuotaEvent
 

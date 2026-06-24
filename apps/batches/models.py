@@ -158,6 +158,24 @@ class BatchItem(models.Model):
         choices=BatchItemStatus.choices,
         default=BatchItemStatus.PENDING_NORMALIZATION,
     )
+    submitted_type = models.CharField(
+        max_length=16,
+        choices=DetectedInputType.choices,
+        null=True,
+        blank=True,
+        help_text="Parser-supplied input type override, e.g. SDF from upload dispatch.",
+    )
+    parse_error = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="Parser-level error code, e.g. ROW_TOO_LONG or SDF_RECORD_TOO_LONG.",
+    )
+    overflow_length = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Original byte/char length of an over-limit row, for diagnostics.",
+    )
     message = models.TextField(
         null=True, blank=True, help_text="Human-readable detail for the status."
     )

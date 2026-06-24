@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 
-from django.conf import settings
 from django.contrib.auth.hashers import check_password
 from django.core.paginator import Paginator
 from django.db.models import Count, Q, QuerySet
@@ -35,7 +34,6 @@ from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
     UploadTooLargeError,
     check_upload_size,
-    create_job_under_quota,
     request_has_job_access_cookie,
     require_shared_access_web,
     set_job_access_cookie,
@@ -105,23 +103,15 @@ def submit_view(request: HttpRequest) -> HttpResponse:
             content_type=getattr(file, "content_type", None) if file else None,
         )
 
-        if getattr(settings, "INGEST_DEFER_HEAVY_PROCESSING", False):
-            # DEFERRED mode (F-11): STAGE items only and RETURN immediately;
-            # the durable `process_jobs` worker drains the job. The row iterator
-            # is consumed straight into the staging insert — no full list.
-            job, plaintext_secret, quota_error = stage_job_under_quota(
-                request,
-                row_iter,
-                remote_enabled=remote_enabled,
-            )
-        else:
-            # SYNCHRONOUS mode (default): process inline so results are ready on
-            # return (preserves existing immediate-result behavior).
-            job, plaintext_secret, quota_error = create_job_under_quota(
-                request,
-                list(row_iter),
-                remote_enabled=remote_enabled,
-            )
+        # DEFERRED mode (F-11, always on): STAGE items only and RETURN
+        # immediately; the durable `process_jobs` worker drains the job. The
+        # row iterator is consumed straight into the staging insert — no full
+        # list materialisation in the HTTP request.
+        job, plaintext_secret, quota_error = stage_job_under_quota(
+            request,
+            row_iter,
+            remote_enabled=remote_enabled,
+        )
         if quota_error is not None:
             quota_payload = json.loads(quota_error.content.decode("utf-8"))
             return render(

@@ -52,10 +52,13 @@ def compute_identifiers(
     elif input_type == DetectedInputType.INCHI:
         mol = MolFromInchi(stripped)
     elif input_type == DetectedInputType.SDF:
-        # Single SDF block passed as a string.
+        # Single SDF block passed as a string.  Pass `raw` rather than
+        # `stripped` so that a leading blank line (the V2000 title line) is
+        # preserved — stripping it shifts all line numbers and breaks RDKit's
+        # V2000 parser which expects the counts line at position 4.
         try:
             suppl = Chem.SDMolSupplier()
-            suppl.SetData(stripped, removeHs=False, sanitize=True)
+            suppl.SetData(raw, removeHs=False, sanitize=True)
             for m in suppl:
                 if m is not None:
                     mol = m

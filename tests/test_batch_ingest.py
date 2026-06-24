@@ -112,6 +112,33 @@ def _post_job(
     return response
 
 
+def _create_and_process_job(
+    text_input: str,
+    remote_enabled: bool = True,
+) -> Any:
+    """Create a job and process it synchronously via the service layer.
+
+    Replaces ``_post_job`` for tests that verify processing results (item
+    statuses, inchikeys, counters) rather than route-level behaviour.  The
+    returned object mimics the JSON response shape so callers only need
+    ``data["job_id"]`` and ``data["result_secret"]``.
+    """
+    from apps.batches.ingest import parse_text_input
+    from apps.batches.services import create_job_records, process_job_items
+
+    rows = list(parse_text_input(text_input))
+    job, plaintext_secret = create_job_records(rows, remote_enabled=remote_enabled)
+    process_job_items(job)
+
+    class _FakeResponse:
+        status_code = 202
+
+        def json(self_inner):  # noqa: N805
+            return {"job_id": str(job.pk), "result_secret": plaintext_secret}
+
+    return _FakeResponse()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -119,10 +146,10 @@ def _post_job(
 
 @pytest.mark.django_db(transaction=True)
 def test_post_jobs_creates_job_and_returns_id_and_secret():
-    """POST /api/jobs returns a job id (UUID) and a result secret."""
+    """POST /api/jobs returns 202 with a job id (UUID) and a result secret."""
     client = Client()
     response = _post_job(client, text_input=ASPIRIN_SMILES)
-    assert response.status_code == 201, response.content
+    assert response.status_code == 202, response.content
     data = response.json()
     assert "job_id" in data
     assert "result_secret" in data
@@ -162,9 +189,7 @@ def test_100_row_mixed_input_preserves_order_and_count():
         rows.append(ASPIRIN_INCHIKEY)
     text_input = "\n".join(rows)
 
-    client = Client()
-    response = _post_job(client, text_input=text_input)
-    assert response.status_code == 201
+    response = _create_and_process_job(text_input)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -181,8 +206,7 @@ def test_duplicate_rows_preserved():
     from apps.batches.models import BatchItem, BatchJob
 
     text_input = f"{ASPIRIN_SMILES}\n{ASPIRIN_SMILES}"
-    client = Client()
-    response = _post_job(client, text_input=text_input)
+    response = _create_and_process_job(text_input)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -204,9 +228,7 @@ def test_invalid_row_isolated_others_processed():
     from apps.core.enums import BatchItemStatus
 
     text_input = f"{ASPIRIN_SMILES}\nbad-smiles-%%%\n{CAFFEINE_SMILES}"
-    client = Client()
-    response = _post_job(client, text_input=text_input)
-    assert response.status_code == 201
+    response = _create_and_process_job(text_input)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -231,8 +253,7 @@ def test_live_hit_sets_found_live_cache():
     node = _make_chemont(10, "Chemical entities")
     _make_live(ASPIRIN_INCHIKEY, kingdom_id=node.numeric_id)
 
-    client = Client()
-    response = _post_job(client, text_input=ASPIRIN_SMILES)
+    response = _create_and_process_job(ASPIRIN_SMILES)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -251,8 +272,7 @@ def test_seed_hit_sets_found_seed_cache():
     node = _make_chemont(11, "Organic compounds")
     _make_seed(ASPIRIN_INCHIKEY, kingdom_id=node.numeric_id)
 
-    client = Client()
-    response = _post_job(client, text_input=ASPIRIN_SMILES)
+    response = _create_and_process_job(ASPIRIN_SMILES)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -267,9 +287,7 @@ def test_inchikey_only_miss_remote_disabled_sets_need_structure():
     from apps.batches.models import BatchItem, BatchJob
     from apps.core.enums import BatchItemStatus
 
-    client = Client()
-    response = _post_job(client, text_input=GHOST_INCHIKEY, remote_enabled=False)
-    assert response.status_code == 201
+    response = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=False)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -285,9 +303,7 @@ def test_inchikey_only_miss_remote_enabled_creates_remote_task():
     from apps.core.enums import BatchItemStatus
     from apps.remote.models import RemoteTask
 
-    client = Client()
-    response = _post_job(client, text_input=GHOST_INCHIKEY, remote_enabled=True)
-    assert response.status_code == 201
+    response = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=True)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -306,9 +322,7 @@ def test_smiles_miss_remote_enabled_creates_remote_task():
     from apps.core.enums import BatchItemStatus
     from apps.remote.models import RemoteTask
 
-    client = Client()
-    response = _post_job(client, text_input=GHOST_SMILES, remote_enabled=True)
-    assert response.status_code == 201
+    response = _create_and_process_job(GHOST_SMILES, remote_enabled=True)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -398,15 +412,10 @@ def test_global_dedupe_one_active_remote_task():
     from apps.core.enums import BatchItemStatus, TaskState
     from apps.remote.models import RemoteTask
 
-    client = Client()
-
     # First job
-    r1 = _post_job(client, text_input=GHOST_INCHIKEY, remote_enabled=True)
-    assert r1.status_code == 201
-
+    r1 = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=True)
     # Second job, same inchikey
-    r2 = _post_job(client, text_input=GHOST_INCHIKEY, remote_enabled=True)
-    assert r2.status_code == 201
+    r2 = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=True)
 
     d1, d2 = r1.json(), r2.json()
 
@@ -433,8 +442,7 @@ def test_job_counters_all_local_hits():
     _make_live(ASPIRIN_INCHIKEY)
 
     text_input = f"{ASPIRIN_SMILES}\n{ASPIRIN_INCHI}\n{ASPIRIN_INCHIKEY}"
-    client = Client()
-    response = _post_job(client, text_input=text_input)
+    response = _create_and_process_job(text_input)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -459,8 +467,7 @@ def test_job_counters_mixed():
     # We only do 1 job; to keep it simple use remote_enabled=False
     # line0=aspirin (live), line1=bad, line2=ghost_inchikey (need_structure remote off)
     text_input = f"{ASPIRIN_SMILES}\nbad-smiles-%%%\n{GHOST_INCHIKEY}"
-    client = Client()
-    response = _post_job(client, text_input=text_input, remote_enabled=False)
+    response = _create_and_process_job(text_input, remote_enabled=False)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -482,8 +489,7 @@ def test_job_counter_remote_pending():
     from apps.batches.models import BatchJob
     from apps.core.enums import BatchJobStatus
 
-    client = Client()
-    response = _post_job(client, text_input=GHOST_INCHIKEY, remote_enabled=True)
+    response = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=True)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -703,8 +709,7 @@ def test_compound_structure_created_for_smiles():
     from apps.batches.models import BatchItem, BatchJob
     from apps.compounds.models import CompoundStructure
 
-    client = Client()
-    response = _post_job(client, text_input=ASPIRIN_SMILES)
+    response = _create_and_process_job(ASPIRIN_SMILES)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -722,10 +727,9 @@ def test_compound_usage_updated():
     """CompoundUsage is created/updated for each processed (non-invalid) row."""
     from apps.compounds.models import CompoundUsage
 
-    client = Client()
     # Process same compound twice across two jobs
-    _post_job(client, text_input=ASPIRIN_SMILES)
-    _post_job(client, text_input=ASPIRIN_SMILES)
+    _create_and_process_job(ASPIRIN_SMILES)
+    _create_and_process_job(ASPIRIN_SMILES)
 
     usage = CompoundUsage.objects.filter(inchikey=ASPIRIN_INCHIKEY).first()
     assert usage is not None
@@ -737,8 +741,7 @@ def test_inchikey_input_links_item_inchikey():
     """A bare InChIKey input is stored on the item even without a structure."""
     from apps.batches.models import BatchItem, BatchJob
 
-    client = Client()
-    response = _post_job(client, text_input=GHOST_INCHIKEY, remote_enabled=False)
+    response = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=False)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -754,8 +757,7 @@ def test_seed_hit_counter():
 
     _make_seed(ASPIRIN_INCHIKEY)
 
-    client = Client()
-    response = _post_job(client, text_input=ASPIRIN_SMILES)
+    response = _create_and_process_job(ASPIRIN_SMILES)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -775,8 +777,7 @@ def test_job_complete_when_all_resolved():
     _make_live(CAFFEINE_INCHIKEY)
 
     text_input = f"{ASPIRIN_SMILES}\n{CAFFEINE_SMILES}"
-    client = Client()
-    response = _post_job(client, text_input=text_input)
+    response = _create_and_process_job(text_input)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -789,9 +790,7 @@ def test_empty_text_input_returns_empty_job():
     from apps.batches.models import BatchItem, BatchJob
     from apps.core.enums import BatchJobStatus
 
-    client = Client()
-    response = _post_job(client, text_input="")
-    assert response.status_code == 201
+    response = _create_and_process_job("")
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -805,8 +804,7 @@ def test_inchi_input_resolves_inchikey():
     """InChI input is normalized and the correct InChIKey is stored on the item."""
     from apps.batches.models import BatchItem, BatchJob
 
-    client = Client()
-    response = _post_job(client, text_input=ASPIRIN_INCHI)
+    response = _create_and_process_job(ASPIRIN_INCHI)
     data = response.json()
 
     job = BatchJob.objects.get(pk=data["job_id"])
@@ -820,9 +818,7 @@ def test_remote_task_has_compound_fk_for_smiles():
     """When SMILES → RemoteTask, compound FK is set on the task (structure is known)."""
     from apps.remote.models import RemoteTask
 
-    client = Client()
-    response = _post_job(client, text_input=GHOST_SMILES, remote_enabled=True)
-    assert response.status_code == 201
+    _create_and_process_job(GHOST_SMILES, remote_enabled=True)
 
     task = RemoteTask.objects.filter(inchikey__isnull=False).first()
     assert task is not None
@@ -940,9 +936,9 @@ def test_api_structure_resubmit_cache_hit_updates_counters():
 
     client = Client()
     # Create a job with the L-Trp InChIKey (no structure) — remote disabled so
-    # the item stays at NEED_STRUCTURE.
-    r = _post_job(client, text_input=LTRP_INCHIKEY, remote_enabled=False)
-    assert r.status_code == 201
+    # the item stays at NEED_STRUCTURE.  Use the service layer directly so the
+    # sync pipeline runs regardless of INGEST_DEFER_HEAVY_PROCESSING.
+    r = _create_and_process_job(LTRP_INCHIKEY, remote_enabled=False)
     data = r.json()
     job = BatchJob.objects.get(pk=data["job_id"])
     secret = data["result_secret"]
@@ -998,8 +994,9 @@ def test_api_structure_resubmit_pending_updates_counters():
 
     client = Client()
     # Create a NEED_STRUCTURE job (remote disabled, L-Trp InChIKey, no seed/live data).
-    r = _post_job(client, text_input=LTRP_INCHIKEY, remote_enabled=False)
-    assert r.status_code == 201
+    # Use the service layer directly so the sync pipeline runs regardless of
+    # INGEST_DEFER_HEAVY_PROCESSING.
+    r = _create_and_process_job(LTRP_INCHIKEY, remote_enabled=False)
     data = r.json()
     job = BatchJob.objects.get(pk=data["job_id"])
     secret = data["result_secret"]

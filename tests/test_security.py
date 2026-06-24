@@ -125,7 +125,8 @@ class TestAuthGateUnauthenticated:
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
-    def test_post_api_jobs_valid_bearer_returns_201(self) -> None:
+    def test_post_api_jobs_valid_bearer_returns_202(self) -> None:
+        """Async ingest always returns 202 (staged, not yet processed)."""
         client = Client()
         response = client.post(
             "/api/jobs",
@@ -133,8 +134,8 @@ class TestAuthGateUnauthenticated:
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
         )
-        assert response.status_code == 201, (
-            f"Expected 201 with valid bearer, got {response.status_code}: {response.content}"
+        assert response.status_code == 202, (
+            f"Expected 202 with valid bearer, got {response.status_code}: {response.content}"
         )
 
     @pytest.mark.django_db(transaction=True)
@@ -172,7 +173,7 @@ class TestAuthGateUnauthenticated:
             **auth,
         )
 
-        assert first.status_code == 201
+        assert first.status_code == 202
         assert second.status_code == 429
 
     @pytest.mark.django_db(transaction=True)
@@ -289,7 +290,7 @@ class TestCsrfPolicy:
             content_type="application/json",
             HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
         )
-        assert response.status_code == 201
+        assert response.status_code == 202
 
 
 # ===========================================================================
@@ -537,7 +538,7 @@ class TestResultUrlSecret:
             HTTP_X_CSRFTOKEN=csrf_token,
         )
 
-        assert response.status_code == 201
+        assert response.status_code == 202
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
@@ -1007,10 +1008,14 @@ class TestSecurityImplementationGuards:
             assert _principal(request).startswith("session:")
 
     @pytest.mark.django_db(transaction=True)
+    @override_settings(INGEST_DEFER_HEAVY_PROCESSING=False)
     def test_create_job_under_quota_processes_items_after_quota_transaction(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Service-level test: create_job_under_quota runs processing outside the
+        quota transaction.  Requires INGEST_DEFER_HEAVY_PROCESSING=False so the
+        guard inside create_job_under_quota does not raise."""
         from django.db import connection
         from django.test import RequestFactory
 
@@ -1353,7 +1358,15 @@ class TestUploadSizeGuardOnRealPath:
     def test_overlong_row_results_in_invalid_item_others_processed(self) -> None:
         """A row whose structure string exceeds MAX_STRUCTURE_LEN must be
         recorded as INVALID_INPUT; other rows in the same job must still be
-        processed normally."""
+        processed normally.
+
+        The web submit route now uses the deferred path, so overlong-row
+        detection only runs when the durable worker processes the job.  This
+        test stages the job via the route, then drains it with run_pending_jobs
+        before checking the final item statuses.
+        """
+        from apps.batches.models import BatchJob
+        from apps.batches.services import run_pending_jobs
         from apps.core.enums import BatchItemStatus
         from apps.core.security import MAX_STRUCTURE_LEN
 
@@ -1383,12 +1396,13 @@ class TestUploadSizeGuardOnRealPath:
         response2 = client.get(claim_response["Location"])
         assert response2.status_code == 200
 
-        # Inspect the DB: the aspirin row must be present and processed;
-        # the overlong row must be INVALID_INPUT.
-        from apps.batches.models import BatchJob
-
+        # Drain the deferred job with the durable worker.
         parts = location.strip("/").split("/")
         job_id = parts[1]
+        run_pending_jobs("test-worker", max_jobs=10)
+
+        # Inspect the DB: the aspirin row must be present and processed;
+        # the overlong row must be INVALID_INPUT.
         job = BatchJob.objects.get(pk=job_id)
         items = list(job.items.order_by("row_order"))
         assert len(items) == 2, f"Expected 2 items, got {len(items)}"
@@ -1446,33 +1460,32 @@ class TestApiIngestGuards:
         )
 
     @pytest.mark.django_db(transaction=True)
-    def test_overlong_row_via_api_is_invalid_with_bounded_original(self) -> None:
-        """An over-limit row submitted via /api/jobs must become INVALID_INPUT.
+    def test_overlong_row_via_service_is_invalid_with_bounded_original(self) -> None:
+        """An over-limit row submitted via the service layer must become INVALID_INPUT.
 
         The item's original_input must contain a recognisable prefix of the
         submitted text (not a synthetic sentinel) plus a truncation marker, and
         the message must state the length limit.  Other rows in the same job
         must be processed normally.
+
+        Note: the HTTP route now always uses the deferred path, so heavy
+        processing (including overlong-row detection) only runs in the worker.
+        This test exercises the service layer (create_job_records +
+        process_job_items) directly, which is the correct layer for testing
+        per-item business rules.
         """
-        from apps.batches.models import BatchJob
+        from apps.batches.ingest import parse_text_input
+        from apps.batches.services import create_job_records, process_job_items
         from apps.core.enums import BatchItemStatus
         from apps.core.security import MAX_STRUCTURE_LEN
 
         long_structure = "C" * (MAX_STRUCTURE_LEN + 1)
         text_input = f"{ASPIRIN_SMILES}\n{long_structure}"
 
-        client = Client()
-        response = client.post(
-            "/api/jobs",
-            data=json.dumps({"text_input": text_input}),
-            content_type="application/json",
-        )
-        assert response.status_code == 201, (
-            f"Expected 201, got {response.status_code}: {response.content}"
-        )
-        data = response.json()
+        rows = list(parse_text_input(text_input))
+        job, _secret = create_job_records(rows, remote_enabled=False)
+        process_job_items(job)
 
-        job = BatchJob.objects.get(pk=data["job_id"])
         items = list(job.items.order_by("row_order"))
         assert len(items) == 2
 
