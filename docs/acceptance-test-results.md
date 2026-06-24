@@ -327,6 +327,23 @@ application instance.  Not available in the standard CI environment.
 
 ---
 
+## G4-IW-01 Default Ingest Worker Compose Service
+
+**Status:** Automated
+**File:** `tests/test_compose_services.py`
+**Tests:**
+- `test_compose_has_default_ingest_worker_service`
+
+Parses `docker-compose.yml` with PyYAML and asserts that the `ingest-worker`
+service is present without a `profiles` key (always-on), uses
+`command: [python, manage.py, process_jobs]`, has `restart: unless-stopped`,
+depends on `migrate` with `service_completed_successfully`, and is attached to
+both `internal` and `external` networks.  Docker-daemon validation was skipped
+because the Docker socket is not accessible in this environment; YAML
+correctness was verified with `python -c "import yaml; yaml.safe_load(...)"`.
+
+---
+
 ## NFR-P05 Remote-Outage Local Survival
 
 **Status:** Automated  
