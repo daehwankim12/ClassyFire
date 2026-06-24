@@ -6,21 +6,29 @@ Endpoints (relative to ``WISHART_BASE_URL``):
 * ``POST /queries`` — submit a STRUCTURE query (label / query_input / query_type).
 * ``GET  /queries/{query_id}.json`` — poll a submitted query.
 
-HTTP outcomes are classified into the provider taxonomy:
+HTTP outcomes are classified EXPLICITLY (F-10) via
+:func:`apps.remote.provider.classify_http_status`:
 
 * ``2xx`` with a body         → FOUND / COMPLETE.
-* entity ``404``              → MISS (not an error; just no cached entity).
-* ``429`` / ``5xx`` / timeout / connection reset → RETRYABLE (honour
-  ``Retry-After`` when present).
-* other definite ``4xx``      → non-retryable input error.
+* ``404``                     → NOT_FOUND (entity/query absent → MISS for entity).
+* ``401`` / ``403``           → AUTH_FAILURE (stop retrying, surface to operator).
+* ``408`` / ``425`` / ``429`` / ``5xx`` / timeout / connection reset → RETRYABLE
+  (honour ``Retry-After``, supporting BOTH delta-seconds AND HTTP-date forms).
+* other definite ``4xx``      → PERMANENT (non-retryable input error).
+* unknown/unmapped status     → PROTOCOL ERROR (never silently COMPLETE).
+
+A SINGLE ``httpx.Client`` is created per provider instance and reused across all
+calls (connection pooling) instead of a per-request client.
 
 NB: tests never exercise this class against the network — they use
-:class:`apps.remote.mock.MockProvider`. A guarded live smoke test against the
-real Wishart service is deferred/manual.
+:class:`apps.remote.mock.MockProvider` or an ``httpx.MockTransport``. A guarded
+live smoke test against the real Wishart service is deferred/manual.
 """
 from __future__ import annotations
 
+import email.utils
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -28,29 +36,53 @@ from django.conf import settings
 
 from apps.remote.mock import parse_wishart_payload, parse_wishart_results
 from apps.remote.provider import (
+    AuthProviderError,
     EntityLookupResult,
     EntityLookupStatus,
+    HttpOutcome,
     NonRetryableProviderError,
     NormalizedClassification,
     PollResult,
     PollStatus,
+    ProtocolProviderError,
     RetryableProviderError,
     SubmitResult,
+    classify_http_status,
 )
 
 
 def _parse_retry_after(response: httpx.Response) -> float | None:
+    """Parse a ``Retry-After`` header supporting BOTH forms (F-10).
+
+    * delta-seconds: ``Retry-After: 120`` → ``120.0``.
+    * HTTP-date:     ``Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`` → seconds
+      from now until that instant (clamped at >= 0).
+
+    Returns ``None`` when the header is absent or unparseable.
+    """
     raw = response.headers.get("Retry-After")
     if raw is None:
         return None
+    raw = raw.strip()
     try:
         return float(raw)
     except (TypeError, ValueError):
+        pass
+    # HTTP-date form.
+    parsed = email.utils.parsedate_to_datetime(raw)
+    if parsed is None:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    delta = (parsed - datetime.now(UTC)).total_seconds()
+    return max(delta, 0.0)
 
 
 class WishartDirectProvider:
-    """Talks to the real Wishart ClassyFire HTTP API via httpx."""
+    """Talks to the real Wishart ClassyFire HTTP API via httpx.
+
+    Reuses a single ``httpx.Client`` (connection pooling) across calls.
+    """
 
     def __init__(
         self, base_url: str | None = None, timeout: float | None = None
@@ -59,55 +91,89 @@ class WishartDirectProvider:
         self.timeout = (
             timeout if timeout is not None else settings.REMOTE_TIMEOUT_SECONDS
         )
+        self._http_client: httpx.Client | None = None
 
     def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=self.timeout)
+        """Return the shared, lazily-created httpx.Client (connection pooling)."""
+        if self._http_client is None:
+            self._http_client = httpx.Client(timeout=self.timeout)
+        return self._http_client
+
+    def close(self) -> None:
+        if self._http_client is not None:
+            self._http_client.close()
+            self._http_client = None
 
     # -- Provider protocol -------------------------------------------------
 
     def lookup_entity(self, inchikey: str) -> EntityLookupResult:
         url = f"{self.base_url}/entities/{inchikey}.json"
         try:
-            with self._client() as client:
-                resp = client.get(url)
+            resp = self._client().get(url)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             return EntityLookupResult(
                 status=EntityLookupStatus.RETRYABLE_ERROR,
                 inchikey=inchikey,
                 detail=str(exc),
             )
-        if resp.status_code == 404:
+        outcome = classify_http_status(resp.status_code)
+        if outcome is HttpOutcome.NOT_FOUND:
             return EntityLookupResult(
-                status=EntityLookupStatus.MISS, inchikey=inchikey
+                status=EntityLookupStatus.MISS,
+                inchikey=inchikey,
+                http_status=resp.status_code,
             )
-        if resp.status_code == 429 or resp.status_code >= 500:
+        if outcome is HttpOutcome.AUTH_FAILURE:
+            return EntityLookupResult(
+                status=EntityLookupStatus.AUTH_FAILURE,
+                inchikey=inchikey,
+                http_status=resp.status_code,
+                detail=f"HTTP {resp.status_code}",
+            )
+        if outcome is HttpOutcome.RETRYABLE:
             return EntityLookupResult(
                 status=EntityLookupStatus.RETRYABLE_ERROR,
                 inchikey=inchikey,
                 retry_after=_parse_retry_after(resp),
+                http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
             )
-        if resp.status_code >= 400:
+        if outcome is HttpOutcome.PERMANENT:
             # Definite 4xx input error: surface as MISS (no entity, do not retry).
             return EntityLookupResult(
                 status=EntityLookupStatus.MISS,
                 inchikey=inchikey,
+                http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
             )
+        if outcome is HttpOutcome.PROTOCOL_ERROR:
+            return EntityLookupResult(
+                status=EntityLookupStatus.PROTOCOL_ERROR,
+                inchikey=inchikey,
+                http_status=resp.status_code,
+                detail=f"unmapped HTTP {resp.status_code}",
+            )
+        # SUCCESS
         try:
             raw = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
             return EntityLookupResult(
                 status=EntityLookupStatus.RETRYABLE_ERROR,
                 inchikey=inchikey,
+                http_status=resp.status_code,
                 detail=f"malformed body: {exc}",
             )
         if not raw:
             return EntityLookupResult(
-                status=EntityLookupStatus.MISS, inchikey=inchikey
+                status=EntityLookupStatus.MISS,
+                inchikey=inchikey,
+                http_status=resp.status_code,
             )
         return EntityLookupResult(
-            status=EntityLookupStatus.FOUND, inchikey=inchikey, raw_json=raw
+            status=EntityLookupStatus.FOUND,
+            inchikey=inchikey,
+            raw_json=raw,
+            http_status=resp.status_code,
         )
 
     def submit_structures(
@@ -121,16 +187,21 @@ class WishartDirectProvider:
         }
         url = f"{self.base_url}/queries"
         try:
-            with self._client() as client:
-                resp = client.post(url, json=payload)
+            resp = self._client().post(url, json=payload)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise RetryableProviderError(str(exc)) from exc
-        if resp.status_code == 429 or resp.status_code >= 500:
+        outcome = classify_http_status(resp.status_code)
+        if outcome is HttpOutcome.RETRYABLE:
             raise RetryableProviderError(
                 f"HTTP {resp.status_code}", retry_after=_parse_retry_after(resp)
             )
-        if resp.status_code >= 400:
+        if outcome is HttpOutcome.AUTH_FAILURE:
+            raise AuthProviderError(f"HTTP {resp.status_code}")
+        if outcome is HttpOutcome.PROTOCOL_ERROR:
+            raise ProtocolProviderError(f"unmapped HTTP {resp.status_code}")
+        if outcome in (HttpOutcome.PERMANENT, HttpOutcome.NOT_FOUND):
             raise NonRetryableProviderError(f"HTTP {resp.status_code}")
+        # SUCCESS
         try:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
@@ -138,25 +209,51 @@ class WishartDirectProvider:
         query_id = body.get("id")
         if query_id is None:
             raise RetryableProviderError("submit response missing query id")
-        return SubmitResult(remote_query_id=str(query_id), raw_json=body)
+        return SubmitResult(
+            remote_query_id=str(query_id),
+            raw_json=body,
+            http_status=resp.status_code,
+        )
 
     def poll_query(self, remote_query_id: str) -> PollResult:
         url = f"{self.base_url}/queries/{remote_query_id}.json"
         try:
-            with self._client() as client:
-                resp = client.get(url)
+            resp = self._client().get(url)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             return PollResult(status=PollStatus.RETRYABLE_ERROR, detail=str(exc))
-        if resp.status_code == 429 or resp.status_code >= 500:
+        outcome = classify_http_status(resp.status_code)
+        if outcome is HttpOutcome.RETRYABLE:
             return PollResult(
                 status=PollStatus.RETRYABLE_ERROR,
                 retry_after=_parse_retry_after(resp),
+                http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
             )
-        if resp.status_code >= 400:
+        if outcome is HttpOutcome.AUTH_FAILURE:
             return PollResult(
-                status=PollStatus.RETRYABLE_ERROR, detail=f"HTTP {resp.status_code}"
+                status=PollStatus.AUTH_FAILURE,
+                http_status=resp.status_code,
+                detail=f"HTTP {resp.status_code}",
             )
+        if outcome is HttpOutcome.NOT_FOUND:
+            return PollResult(
+                status=PollStatus.NOT_FOUND,
+                http_status=resp.status_code,
+                detail=f"HTTP {resp.status_code}",
+            )
+        if outcome is HttpOutcome.PERMANENT:
+            return PollResult(
+                status=PollStatus.PROTOCOL_ERROR,
+                http_status=resp.status_code,
+                detail=f"HTTP {resp.status_code}",
+            )
+        if outcome is HttpOutcome.PROTOCOL_ERROR:
+            return PollResult(
+                status=PollStatus.PROTOCOL_ERROR,
+                http_status=resp.status_code,
+                detail=f"unmapped HTTP {resp.status_code}",
+            )
+        # SUCCESS
         try:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
@@ -165,8 +262,16 @@ class WishartDirectProvider:
             )
         status = str(body.get("classification_status", "")).lower()
         if status and status not in {"done", "complete", "completed"}:
-            return PollResult(status=PollStatus.RUNNING, raw_json=body)
-        return PollResult(status=PollStatus.COMPLETE, raw_json=body)
+            return PollResult(
+                status=PollStatus.RUNNING,
+                raw_json=body,
+                http_status=resp.status_code,
+            )
+        return PollResult(
+            status=PollStatus.COMPLETE,
+            raw_json=body,
+            http_status=resp.status_code,
+        )
 
     def parse_result(self, raw_json: dict[str, Any]) -> NormalizedClassification:
         # Wishart query results wrap entities; unwrap the single-entity case.

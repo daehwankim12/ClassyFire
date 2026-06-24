@@ -20,14 +20,30 @@ reproduce it.
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import timedelta
 
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.core.enums import TaskState
 from apps.remote.models import RemoteTask
+
+
+class LeaseLost(Exception):  # noqa: N818 - domain name fixed by the F-07 contract
+    """Raised when a conditional transition matches 0 rows (F-07).
+
+    The task's lease was stolen or reclaimed (its ``lease_version``/
+    ``lease_token`` no longer match), so this worker MUST abort processing it and
+    must NOT overwrite the new owner's state.
+    """
+
+    def __init__(self, task_pk: int) -> None:
+        super().__init__(
+            f"lease lost for remote_task pk={task_pk}: version/token no longer match"
+        )
+        self.task_pk = task_pk
 
 # Backoff schedule in seconds: 1m, 5m, 30m, 2h, 6h, 24h. Past the end of the
 # schedule the task is DEFERRED (parked, retried ~daily), never discarded.
@@ -106,10 +122,23 @@ def claim_task(worker_id: str) -> RemoteTask | None:
         )
         if task is None:
             return None
+        # Issue a fresh fencing token + bump the monotonic lease version (F-07)
+        # so any previous holder's late writes are rejected.
         task.state = TaskState.LOCKED
         task.lock_owner = worker_id
         task.locked_at = now
-        task.save(update_fields=["state", "lock_owner", "locked_at", "updated_at"])
+        task.lease_token = uuid.uuid4()
+        task.lease_version = task.lease_version + 1
+        task.save(
+            update_fields=[
+                "state",
+                "lock_owner",
+                "locked_at",
+                "lease_token",
+                "lease_version",
+                "updated_at",
+            ]
+        )
         return task
 
 
@@ -120,6 +149,8 @@ def recover_stale_locks(lease_seconds: float) -> int:
     recovered.
     """
     cutoff = timezone.now() - timedelta(seconds=lease_seconds)
+    # Bump lease_version + clear the token so the dead holder's late, fenced
+    # writes can no longer match (F-07): the reclaim invalidates its lease.
     return (
         RemoteTask.objects.filter(
             state__in=[TaskState.LOCKED, TaskState.RUNNING, TaskState.ENTITY_LOOKUP],
@@ -128,18 +159,63 @@ def recover_stale_locks(lease_seconds: float) -> int:
             state=TaskState.READY,
             lock_owner=None,
             locked_at=None,
+            lease_token=None,
+            lease_version=F("lease_version") + 1,
             updated_at=timezone.now(),
         )
     )
 
 
 def transition(task: RemoteTask, state: TaskState, **fields: object) -> None:
-    """Persist a state transition plus any extra column updates."""
+    """Persist a lease-fenced state transition plus any extra column updates.
+
+    EVERY transition is conditional on the task's current
+    ``(pk, lease_version, lease_token)`` (F-07): the UPDATE only writes the row
+    if the lease still matches. If 0 rows are updated the lease was stolen /
+    reclaimed by another worker — we raise :class:`LeaseLost` and do NOT
+    overwrite the new owner's state. The in-memory ``task`` is mutated to reflect
+    the intended new values only after the conditional UPDATE succeeds.
+
+    Tasks that have never been claimed (``lease_token is None``) are transitioned
+    on the ``pk + lease_version`` pair alone — there is no competing owner to
+    fence against until a claim issues a token.
+    """
+    update_values: dict[str, object] = {"state": state, "updated_at": timezone.now()}
+    update_values.update(fields)
+
+    guard = RemoteTask.objects.filter(pk=task.pk, lease_version=task.lease_version)
+    if task.lease_token is not None:
+        guard = guard.filter(lease_token=task.lease_token)
+    updated = guard.update(**update_values)
+    if updated == 0:
+        raise LeaseLost(task.pk)
+
     task.state = state
-    update_fields = ["state", "updated_at", *fields.keys()]
     for key, value in fields.items():
         setattr(task, key, value)
-    task.save(update_fields=update_fields)
+
+
+def claim_extra(task: RemoteTask, worker_id: str) -> None:
+    """Claim a select_for_update'd extra into LOCKED with a fresh lease (F-07).
+
+    Mirrors :func:`claim_task`'s fencing for tasks folded into a submit batch:
+    issues a new ``lease_token`` and bumps ``lease_version`` so subsequent
+    fenced transitions of the extra are owned by this worker. Caller MUST already
+    hold the row lock (``SELECT ... FOR UPDATE SKIP LOCKED``).
+    """
+    now = timezone.now()
+    token = uuid.uuid4()
+    RemoteTask.objects.filter(pk=task.pk).update(
+        state=TaskState.LOCKED,
+        lock_owner=worker_id,
+        locked_at=now,
+        lease_token=token,
+        lease_version=F("lease_version") + 1,
+        updated_at=now,
+    )
+    task.refresh_from_db(
+        fields=["state", "lock_owner", "locked_at", "lease_token", "lease_version"]
+    )
 
 
 def schedule_retry(task: RemoteTask) -> None:
@@ -200,11 +276,18 @@ def defer_task(task: RemoteTask, delay_seconds: float) -> None:
 def reactivate_due_tasks() -> int:
     """Move RETRY_WAIT/DEFERRED tasks whose next_run_at elapsed back to READY."""
     now = timezone.now()
+    # Clear any stale fencing token + bump the version so a previous holder of a
+    # parked POLL_WAIT task cannot match after the task is reactivated (F-07).
     return (
         RemoteTask.objects.filter(
             state__in=[TaskState.RETRY_WAIT, TaskState.DEFERRED, TaskState.POLL_WAIT],
             next_run_at__lte=now,
-        ).update(state=TaskState.READY, updated_at=now)
+        ).update(
+            state=TaskState.READY,
+            lease_token=None,
+            lease_version=F("lease_version") + 1,
+            updated_at=now,
+        )
     )
 
 

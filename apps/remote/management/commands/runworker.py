@@ -54,7 +54,12 @@ class Command(BaseCommand):
         idle_sleep = options["idle_sleep"]
         try:
             while True:
-                did_work = any(worker.tick() for worker in workers)
+                # Tick EVERY worker each cycle — do NOT short-circuit. The old
+                # ``any(worker.tick() for ...)`` stopped at the first truthy tick,
+                # so only one worker ever ran per cycle. Materialise all results
+                # so every worker claims + processes a task this cycle (F-08).
+                results = [worker.tick() for worker in workers]
+                did_work = any(results)
                 if once:
                     break
                 if not did_work:

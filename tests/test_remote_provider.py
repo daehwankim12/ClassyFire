@@ -5,15 +5,21 @@ HTTP outcome classification using httpx's MockTransport — NO real network.
 """
 from __future__ import annotations
 
+from datetime import UTC
+
 import httpx
 import pytest
 
 from apps.remote.mock import MockProvider, build_query_response, build_raw
 from apps.remote.provider import (
+    AuthProviderError,
     EntityLookupStatus,
+    HttpOutcome,
     NonRetryableProviderError,
     PollStatus,
+    ProtocolProviderError,
     RetryableProviderError,
+    classify_http_status,
 )
 
 IK_A = "RDHQFKQIGNGIED-MRVPVSSYSA-N"
@@ -242,3 +248,136 @@ def test_wishart_timeout_is_retryable_entity():
     provider = _wishart_with(handler)
     result = provider.lookup_entity(IK_A)
     assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+
+
+# ---------------------------------------------------------------------------
+# F-10: explicit HTTP status classification
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        (200, HttpOutcome.SUCCESS),
+        (201, HttpOutcome.SUCCESS),
+        (404, HttpOutcome.NOT_FOUND),
+        (401, HttpOutcome.AUTH_FAILURE),
+        (403, HttpOutcome.AUTH_FAILURE),
+        (408, HttpOutcome.RETRYABLE),
+        (425, HttpOutcome.RETRYABLE),
+        (429, HttpOutcome.RETRYABLE),
+        (500, HttpOutcome.RETRYABLE),
+        (503, HttpOutcome.RETRYABLE),
+        (400, HttpOutcome.PERMANENT),
+        (422, HttpOutcome.PERMANENT),
+        (302, HttpOutcome.PROTOCOL_ERROR),
+        (100, HttpOutcome.PROTOCOL_ERROR),
+        (600, HttpOutcome.PROTOCOL_ERROR),
+    ],
+)
+def test_classify_http_status_routing(code, expected):
+    assert classify_http_status(code) == expected
+
+
+def test_wishart_entity_401_is_auth_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="unauthorized")
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.AUTH_FAILURE
+    assert result.http_status == 401
+
+
+def test_wishart_entity_unknown_status_is_protocol_error():
+    # An unmapped status must NEVER be silently treated as a successful FOUND.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, text="redirect")
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.PROTOCOL_ERROR
+    assert result.status != EntityLookupStatus.FOUND
+
+
+def test_wishart_entity_permanent_4xx_is_miss():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text="unprocessable")
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.MISS
+
+
+def test_wishart_submit_401_raises_auth_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="forbidden")
+
+    with pytest.raises(AuthProviderError):
+        _wishart_with(handler).submit_structures([(IK_A, "CCO")])
+
+
+def test_wishart_submit_unknown_status_raises_protocol_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302)
+
+    with pytest.raises(ProtocolProviderError):
+        _wishart_with(handler).submit_structures([(IK_A, "CCO")])
+
+
+def test_wishart_poll_404_is_not_found_not_complete():
+    # A 404 on poll means the query is absent — NOT a successful COMPLETE.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    result = _wishart_with(handler).poll_query("q-missing")
+    assert result.status == PollStatus.NOT_FOUND
+    assert result.status != PollStatus.COMPLETE
+
+
+def test_wishart_poll_unknown_status_is_protocol_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302)
+
+    result = _wishart_with(handler).poll_query("q1")
+    assert result.status == PollStatus.PROTOCOL_ERROR
+
+
+def test_wishart_retry_after_delta_seconds():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "45"})
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after == 45.0
+
+
+def test_wishart_retry_after_http_date_form():
+    # ACCEPTANCE (F-10): Retry-After supports BOTH delta-seconds AND HTTP-date.
+    import email.utils
+    from datetime import datetime, timedelta
+
+    future = datetime.now(UTC) + timedelta(seconds=120)
+    http_date = email.utils.format_datetime(future, usegmt=True)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": http_date})
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after is not None
+    assert 110 < result.retry_after <= 121
+
+
+def test_wishart_reuses_single_http_client():
+    # ACCEPTANCE (F-10): a single httpx.Client is reused across calls (pooling),
+    # rather than a fresh per-request client.
+    from apps.remote.wishart import WishartDirectProvider
+
+    provider = WishartDirectProvider(base_url="https://wishart.test")
+    first = provider._client()
+    second = provider._client()
+    assert first is second, "the httpx.Client must be cached + reused"
+    provider.close()
+    # After close the cache is cleared and a new client is created lazily.
+    assert provider._http_client is None
+    third = provider._client()
+    assert third is not first
+    provider.close()

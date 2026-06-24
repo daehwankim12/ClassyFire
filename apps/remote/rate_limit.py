@@ -1,27 +1,189 @@
-"""Global rate limiter for remote calls.
+"""Rate limiting for remote calls.
 
-Two independent buckets — entity lookups and query submits — each honour a
-per-minute budget (``REMOTE_ENTITY_REQUESTS_PER_MIN`` /
-``REMOTE_SUBMITS_PER_MIN``). A server ``429`` / ``Retry-After`` takes ABSOLUTE
-precedence: ``penalize(retry_after)`` parks the relevant bucket until that
-deadline regardless of the local budget.
+Two implementations share one duck-typed interface (a limiter exposes
+``.entity`` and ``.submit`` buckets, each with ``allow() -> bool`` and
+``penalize(retry_after)``):
 
-The limiter is a sliding-window counter keyed only on monotonic timestamps, so
-the same algorithm is trivially portable to another language reading the same
-config. A clock is injectable for deterministic tests.
+* :class:`DbRateLimiter` — the PRODUCTION limiter (F-08). A **shared, DB-backed
+  token bucket** (one ``remote_rate_buckets`` row per ``(provider, bucket)``):
+  tokens are drawn ATOMICALLY with ``UPDATE ... SET tokens = tokens - 1 WHERE
+  tokens >= 1 RETURNING`` under a row lock, so N workers across processes
+  respect ONE global rate. Tokens refill lazily from ``refill_rate_per_sec``
+  based on elapsed wall-clock time, capped at ``capacity``. A server
+  ``Retry-After`` parks the bucket (``blocked_until``) with absolute precedence.
+
+* :class:`RateLimiter` — the legacy in-process sliding-window limiter, retained
+  so tests that inject a deterministic, network-free limiter keep working. It is
+  NOT used as the default in production.
+
+Both are keyed only on timestamps + config, so the algorithm is portable to a
+Go/Rust worker reading the same ``remote_rate_buckets`` rows.
 """
 from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
+
+from django.db import transaction
+from django.utils import timezone
 
 WINDOW_SECONDS = 60.0
 
 
+# ---------------------------------------------------------------------------
+# DB-backed shared token bucket (F-08, production)
+# ---------------------------------------------------------------------------
+
+
+class DbTokenBucket:
+    """One shared token bucket row drawn from atomically across processes."""
+
+    def __init__(
+        self,
+        bucket: str,
+        capacity: int,
+        refill_per_min: int,
+        *,
+        provider: str = "wishart",
+    ) -> None:
+        self.bucket = bucket
+        self.provider = provider
+        # capacity is the burst size; default it to the per-minute budget so a
+        # fresh worker can immediately use a full minute's worth of tokens.
+        self.capacity = max(int(capacity), 0)
+        self.refill_rate_per_sec = max(refill_per_min, 0) / WINDOW_SECONDS
+
+    def _ensure_row(self) -> None:
+        from apps.remote.models import RemoteRateBucket
+
+        RemoteRateBucket.objects.get_or_create(
+            provider=self.provider,
+            bucket=self.bucket,
+            defaults={
+                "capacity": self.capacity,
+                "tokens": float(self.capacity),
+                "refill_rate_per_sec": self.refill_rate_per_sec,
+            },
+        )
+
+    def allow(self) -> bool:
+        """Atomically consume one token if available across ALL workers.
+
+        Locks the single bucket row (``SELECT ... FOR UPDATE``), lazily refills
+        based on elapsed time, then decrements iff a whole token is available.
+        Returns whether the caller may proceed. Disabled (capacity 0 AND no
+        refill) buckets always allow.
+        """
+        from apps.remote.models import RemoteRateBucket
+
+        if self.capacity <= 0 and self.refill_rate_per_sec <= 0:
+            return True
+        self._ensure_row()
+        now = timezone.now()
+        with transaction.atomic():
+            row = (
+                RemoteRateBucket.objects.select_for_update()
+                .filter(provider=self.provider, bucket=self.bucket)
+                .get()
+            )
+            # Keep config in sync with settings (capacity/refill may change).
+            row.capacity = self.capacity
+            row.refill_rate_per_sec = self.refill_rate_per_sec
+            if row.blocked_until is not None and now < row.blocked_until:
+                row.save(update_fields=["capacity", "refill_rate_per_sec"])
+                return False
+            elapsed = max((now - row.updated_at).total_seconds(), 0.0)
+            refilled = min(
+                float(row.capacity),
+                row.tokens + elapsed * row.refill_rate_per_sec,
+            )
+            if refilled >= 1.0:
+                row.tokens = refilled - 1.0
+                row.save(
+                    update_fields=[
+                        "tokens",
+                        "capacity",
+                        "refill_rate_per_sec",
+                        "updated_at",
+                    ]
+                )
+                return True
+            row.tokens = refilled
+            row.save(
+                update_fields=[
+                    "tokens",
+                    "capacity",
+                    "refill_rate_per_sec",
+                    "updated_at",
+                ]
+            )
+            return False
+
+    def penalize(self, retry_after: float | None) -> None:
+        """Park the shared bucket until ``now + retry_after`` (server precedence)."""
+        if retry_after is None or retry_after <= 0:
+            return
+        from apps.remote.models import RemoteRateBucket
+
+        self._ensure_row()
+        deadline = timezone.now() + timedelta(seconds=retry_after)
+        with transaction.atomic():
+            row = (
+                RemoteRateBucket.objects.select_for_update()
+                .filter(provider=self.provider, bucket=self.bucket)
+                .get()
+            )
+            if row.blocked_until is None or deadline > row.blocked_until:
+                row.blocked_until = deadline
+                row.save(update_fields=["blocked_until", "updated_at"])
+
+
+class DbRateLimiter:
+    """Holds the shared DB-backed entity + submit token buckets."""
+
+    def __init__(
+        self,
+        entity_per_min: int,
+        submit_per_min: int,
+        *,
+        provider: str = "wishart",
+        entity_capacity: int | None = None,
+        submit_capacity: int | None = None,
+    ) -> None:
+        self.entity = DbTokenBucket(
+            "entity",
+            entity_capacity if entity_capacity is not None else entity_per_min,
+            entity_per_min,
+            provider=provider,
+        )
+        self.submit = DbTokenBucket(
+            "submit",
+            submit_capacity if submit_capacity is not None else submit_per_min,
+            submit_per_min,
+            provider=provider,
+        )
+
+    @classmethod
+    def from_settings(cls, provider: str = "wishart") -> DbRateLimiter:
+        from django.conf import settings
+
+        return cls(
+            entity_per_min=settings.REMOTE_ENTITY_REQUESTS_PER_MIN,
+            submit_per_min=settings.REMOTE_SUBMITS_PER_MIN,
+            provider=provider,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Legacy in-process sliding-window limiter (tests / deterministic injection)
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class _Bucket:
-    """Sliding-window limiter for one operation class."""
+    """Sliding-window limiter for one operation class (in-process)."""
 
     limit_per_min: int
     clock: Callable[[], float]
@@ -61,7 +223,7 @@ class _Bucket:
 
 
 class RateLimiter:
-    """Holds the entity + submit buckets."""
+    """Holds the entity + submit buckets (legacy in-process)."""
 
     def __init__(
         self,
