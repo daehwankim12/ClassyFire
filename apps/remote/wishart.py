@@ -29,11 +29,18 @@ from __future__ import annotations
 import email.utils
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from django.conf import settings
 
+from apps.remote.contract import (
+    ProviderContractError,
+    QueryPollContractStatus,
+    validate_entity_lookup_payload,
+    validate_query_poll_payload,
+    validate_query_submit_payload,
+)
 from apps.remote.mock import parse_wishart_payload, parse_wishart_results
 from apps.remote.provider import (
     AuthProviderError,
@@ -163,11 +170,15 @@ class WishartDirectProvider:
                 http_status=resp.status_code,
                 detail=f"malformed body: {exc}",
             )
-        if not raw:
+        try:
+            validate_entity_lookup_payload(raw)
+        except ProviderContractError as exc:
             return EntityLookupResult(
-                status=EntityLookupStatus.MISS,
+                status=EntityLookupStatus.PROTOCOL_ERROR,
                 inchikey=inchikey,
+                raw_json=cast(dict[str, Any], raw),
                 http_status=resp.status_code,
+                detail=str(exc),
             )
         return EntityLookupResult(
             status=EntityLookupStatus.FOUND,
@@ -206,11 +217,12 @@ class WishartDirectProvider:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
             raise RetryableProviderError(f"malformed body: {exc}") from exc
-        query_id = body.get("id")
-        if query_id is None:
-            raise RetryableProviderError("submit response missing query id")
+        try:
+            body, query_id = validate_query_submit_payload(body)
+        except ProviderContractError as exc:
+            raise ProtocolProviderError(str(exc)) from exc
         return SubmitResult(
-            remote_query_id=str(query_id),
+            remote_query_id=query_id,
             raw_json=body,
             http_status=resp.status_code,
         )
@@ -260,8 +272,16 @@ class WishartDirectProvider:
             return PollResult(
                 status=PollStatus.RETRYABLE_ERROR, detail=f"malformed body: {exc}"
             )
-        status = str(body.get("classification_status", "")).lower()
-        if status and status not in {"done", "complete", "completed"}:
+        try:
+            body, status = validate_query_poll_payload(body)
+        except ProviderContractError as exc:
+            return PollResult(
+                status=PollStatus.PROTOCOL_ERROR,
+                raw_json=cast(dict[str, Any], body),
+                http_status=resp.status_code,
+                detail=str(exc),
+            )
+        if status is QueryPollContractStatus.RUNNING:
             return PollResult(
                 status=PollStatus.RUNNING,
                 raw_json=body,
