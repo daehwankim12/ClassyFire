@@ -97,6 +97,7 @@ STORAGES = {
 from apps.core.settings import env_str as _env_str  # noqa: E402
 
 EXPORT_DIR = _env_str("EXPORT_DIR", "/app/export_files")
+SOURCE_ARTIFACT_DIR = _env_str("SOURCE_ARTIFACT_DIR", "/app/source_artifacts")
 
 # ---------------------------------------------------------------------------
 # Logging (minimal — full observability is Task 11)

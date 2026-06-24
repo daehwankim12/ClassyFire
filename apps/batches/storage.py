@@ -63,6 +63,9 @@ class ArtifactStorage(Protocol):
     def write_bytes_atomic(self, path: Path, content: bytes) -> None:
         """Atomically write small storage metadata bytes."""
 
+    def save_bytes(self, key: str, data: bytes) -> Path:
+        """Atomically write raw bytes to a storage key path and return the path."""
+
 
 class LocalArtifactStorage:
     """Local filesystem implementation for export artifacts."""
@@ -132,6 +135,25 @@ class LocalArtifactStorage:
         except BaseException:
             self.delete(tmp_path)
             raise
+
+    def save_bytes(self, key: str, data: bytes) -> Path:
+        """Atomically write raw bytes to a storage key path and return the path.
+
+        Parent directories are created as needed. Uses an atomic temp-file + rename
+        so a crashed write never leaves a partial file at the destination.
+        """
+        dest = self.root / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path_str = tempfile.mkstemp(dir=dest.parent, prefix=f".tmp.{dest.name}.")
+        tmp_path = Path(tmp_path_str)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_path, dest)
+        except BaseException:
+            self.delete(tmp_path)
+            raise
+        return dest
 
 
 def get_artifact_storage(root: str | Path | None = None) -> ArtifactStorage:

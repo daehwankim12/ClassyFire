@@ -33,21 +33,33 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from apps.batches.storage import get_artifact_storage
 from apps.classifications.models import SourceArtifact
 from apps.classifications.result_writer import WriteOutcome, write_live_result
 from apps.core.enums import SourceType
 from apps.remote.provider import ChemOntSlot, NormalizedClassification
 
+FULL_INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
+
 
 class OfficialImportError(ValueError):
     """The official-import artifact failed validation."""
+
+
+def validate_full_inchikey(value: object, *, row_number: int) -> str:
+    """Return *value* if it is a valid full InChIKey, else raise OfficialImportError."""
+    if not isinstance(value, str) or FULL_INCHIKEY_RE.fullmatch(value) is None:
+        raise OfficialImportError(f"Record {row_number} has invalid full InChIKey.")
+    return value
 
 
 @dataclass(frozen=True)
@@ -94,11 +106,7 @@ def _validate(raw: bytes) -> list[NormalizedClassification]:
     for i, record in enumerate(payload):
         if not isinstance(record, dict):
             raise OfficialImportError(f"Record {i} is not an object.")
-        inchikey = record.get("inchikey")
-        if not isinstance(inchikey, str) or len(inchikey) != 27:
-            raise OfficialImportError(
-                f"Record {i} has a missing/invalid 27-char inchikey."
-            )
+        inchikey = validate_full_inchikey(record.get("inchikey"), row_number=i)
         records.append(
             NormalizedClassification(
                 inchikey=inchikey,
@@ -133,11 +141,21 @@ def import_official_artifact(
     """
     records = _validate(raw)
 
+    checksum = _checksum(raw)
+    # Source artifacts live on their OWN volume/dir (SOURCE_ARTIFACT_DIR), NOT
+    # under EXPORT_DIR — so the artifact-aware backup (Gate 6 Task 4) archives
+    # them as a distinct "source_artifacts" namespace rather than mislabelling
+    # them as exports.
+    storage_key = f"{checksum}.json"
+    get_artifact_storage(root=settings.SOURCE_ARTIFACT_DIR).save_bytes(storage_key, raw)
+
     artifact = SourceArtifact.objects.create(
         source_type=SourceType.LAB_OFFICIAL_IMPORT,
         name=name,
         uri=uri,
-        checksum=_checksum(raw),
+        checksum=checksum,
+        content_sha256=checksum,
+        storage_key=storage_key,
         byte_size=len(raw),
         metadata=metadata,
     )
