@@ -131,7 +131,7 @@ def _create_and_process_job(
     process_job_items(job)
 
     class _FakeResponse:
-        status_code = 201
+        status_code = 202
 
         def json(self_inner):  # noqa: N805
             return {"job_id": str(job.pk), "result_secret": plaintext_secret}
