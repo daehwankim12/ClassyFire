@@ -161,17 +161,48 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
 
 
 # ---------------------------------------------------------------------------
-# Media archive helper
+# Archive helpers
 # ---------------------------------------------------------------------------
 
 
 def _archive_media(media_dir: Path, archive_path: Path) -> str | None:
     """Create a tar.gz of media_dir at archive_path. Returns sha256 or None."""
-    if not media_dir.exists() or not any(media_dir.iterdir()):
+    return _archive_dir(media_dir, archive_path)
+
+
+def _archive_dir(src_dir: Path, archive_path: Path) -> str | None:
+    """Create a tar.gz of src_dir at archive_path. Returns sha256 or None.
+
+    Returns None if the directory is absent or empty (nothing to archive).
+    """
+    if not src_dir.exists() or not any(src_dir.iterdir()):
         return None
     with tarfile.open(archive_path, "w:gz") as tar:
-        tar.add(str(media_dir), arcname=media_dir.name)
+        tar.add(str(src_dir), arcname=src_dir.name)
     return _sha256_file(archive_path)
+
+
+def _build_artifact_archives(
+    backup_dir: Path,
+    timestamp: str,
+    artifact_dirs: dict[str, Path],
+) -> dict[str, Any]:
+    """Archive each non-empty directory in artifact_dirs and return the
+    ``artifact_archives`` manifest sub-dict.
+
+    Keys in artifact_dirs map to the logical name used in the manifest (e.g.
+    "media", "exports", "source_artifacts").  Archives are written into
+    backup_dir using the naming convention
+    ``classyfire_{name}_{timestamp}.tar.gz``.
+    """
+    result: dict[str, Any] = {}
+    for name, src_dir in artifact_dirs.items():
+        archive_filename = f"classyfire_{name}_{timestamp}.tar.gz"
+        archive_path = backup_dir / archive_filename
+        checksum = _archive_dir(src_dir, archive_path)
+        if checksum is not None:
+            result[name] = {"file": archive_filename, "checksum": checksum}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +251,23 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
     media_archive_path = backup_dir / media_archive_filename
     media_checksum = _archive_media(media_dir, media_archive_path)
 
+    # Build artifact_archives for all artifact directories.
+    artifact_dirs = {
+        "media": media_dir,
+        "exports": Path(getattr(settings, "EXPORT_DIR", "/app/export_files")),
+        "source_artifacts": Path(
+            getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts")
+        ),
+    }
+    artifact_archives = _build_artifact_archives(backup_dir, timestamp, artifact_dirs)
+
     manifest: dict[str, Any] = {
         "timestamp": now.isoformat(),
         "file": dump_filename,
         "checksum": checksum,
         "media_file": media_archive_filename if media_checksum else None,
         "media_checksum": media_checksum,
+        "artifact_archives": artifact_archives,
         "excludes": _seed_exclude_pattern(),
         "status": "ok",
         "stderr": result.stderr or "",
@@ -280,12 +322,29 @@ def run_backup_injectable(
 
     checksum = _sha256_file(dump_path)
 
+    # Archive all artifact directories.
+    artifact_dirs = {
+        "media": Path(getattr(settings, "MEDIA_ROOT", "/app/media")),
+        "exports": Path(getattr(settings, "EXPORT_DIR", "/app/export_files")),
+        "source_artifacts": Path(
+            getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts")
+        ),
+    }
+    artifact_archives = _build_artifact_archives(backup_dir, timestamp, artifact_dirs)
+
+    # media_file / media_checksum: kept for backward compatibility with
+    # existing callers that read these top-level keys.
+    media_entry = artifact_archives.get("media")
+    media_file = media_entry["file"] if media_entry else None
+    media_checksum = media_entry["checksum"] if media_entry else None
+
     manifest: dict[str, Any] = {
         "timestamp": now.isoformat(),
         "file": dump_filename,
         "checksum": checksum,
-        "media_file": None,
-        "media_checksum": None,
+        "media_file": media_file,
+        "media_checksum": media_checksum,
+        "artifact_archives": artifact_archives,
         "excludes": _seed_exclude_pattern(),
         "status": "ok",
         "stderr": "",
