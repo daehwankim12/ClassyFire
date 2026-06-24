@@ -512,10 +512,14 @@ class RemoteWorker:
           POST result but left tasks unparked). Per-member LeaseLost is tolerated.
         * PENDING (in-doubt: POST may have hit the provider but never committed)
           → do NOT re-POST on this tick. Bump ``reconcile_attempts``; once it
-          exceeds the cap OR the intent's TTL has elapsed, AGE IT OUT to FAILED
-          (freeing the idempotency key) so a single genuine re-POST may occur on
-          a later tick. The crucial invariant: no second POST is issued WHILE the
-          key is still live — only after it is freed.
+          exceeds the cap OR the intent's TTL has elapsed, PARK it as UNKNOWN.
+          UNKNOWN is a LIVE state, so it KEEPS HOLDING the idempotency key — the
+          worker NEVER auto-re-POSTs the same structures (which would duplicate
+          the upstream submission when the provider had in fact accepted the
+          dropped POST). An operator resolves UNKNOWN out-of-band via
+          ``manage.py resolve_submission`` (confirm → SUBMITTED, or verify
+          non-acceptance → FAILED). The crucial invariant: while the key is held
+          (PENDING or UNKNOWN) no second POST is EVER issued.
         """
         poll_at = timezone.now() + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS)
         if submission.state == SubmissionState.SUBMITTED and submission.query_id:
@@ -533,19 +537,20 @@ class RemoteWorker:
             self._park_members_poll_wait(members, poll_at)
             return
 
-        # PENDING in-doubt: avoid a second POST while the key is live; age out.
+        # PENDING in-doubt: NEVER re-POST while the key is held. Once the cap or
+        # TTL elapses, PARK as UNKNOWN (still a live state → key STAYS held).
         attempts = submission.reconcile_attempts + 1
         ttl = timedelta(seconds=settings.REMOTE_SUBMISSION_TTL_SECONDS)
         age = timezone.now() - submission.created_at
-        aged_out = (
+        park_unknown = (
             attempts > settings.REMOTE_SUBMISSION_RECONCILE_MAX or age >= ttl
         )
         submission.reconcile_attempts = attempts
-        if aged_out:
-            submission.state = SubmissionState.FAILED
+        if park_unknown:
+            submission.state = SubmissionState.UNKNOWN
             submission.detail = (
-                f"aged-out in-doubt PENDING after {attempts} reconcile(s), "
-                f"age={age.total_seconds():.0f}s; key freed for one re-POST"
+                f"provider acceptance unknown after {attempts} reconcile(s), "
+                f"age={age.total_seconds():.0f}s; automatic re-submit is blocked"
             )
             submission.save(
                 update_fields=[
@@ -557,14 +562,14 @@ class RemoteWorker:
             )
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
-                classification="AGED_OUT",
+                classification="UNKNOWN_ACCEPTANCE",
                 raw_payload=None,
                 remote_query_id=submission.remote_query_id,
                 detail=submission.detail,
             )
             logger.warning(
-                "reconcile: aged out in-doubt PENDING submission %s -> FAILED "
-                "(key freed for exactly one re-POST)",
+                "reconcile: in-doubt PENDING submission %s -> UNKNOWN "
+                "(key HELD; operator must resolve via resolve_submission)",
                 submission.pk,
             )
         else:
@@ -576,10 +581,11 @@ class RemoteWorker:
                 attempts,
                 settings.REMOTE_SUBMISSION_RECONCILE_MAX,
             )
-        # Re-park members for a later tick regardless (a freed key lets the next
-        # tick genuinely re-POST; a still-live key reconciles again).
+        # Re-park members for a later tick regardless. The key stays held in both
+        # branches (PENDING below the cap, UNKNOWN at/above it), so no later tick
+        # ever re-POSTs — UNKNOWN is cleared only by the operator command.
         for member in members:
-            queue.defer_task(member, delay_seconds=5)
+            queue.defer_task(member, delay_seconds=self.lease_seconds)
             fanout.mark_items_delayed(member.inchikey)
 
     @staticmethod

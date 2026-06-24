@@ -208,7 +208,10 @@ class RemoteSubmission(models.Model):
     the same payload reconciles against the existing row instead of re-POSTing.
 
     Lifecycle: PENDING (intent written) → SUBMITTED (provider id recorded,
-    RemoteQuery linked, same txn) | FAILED (no id obtained; key reusable).
+    RemoteQuery linked, same txn) | UNKNOWN (in-doubt: provider may have accepted
+    but acceptance is unconfirmed — key HELD, never auto-re-POSTed) | FAILED (no
+    id obtained; key reusable). UNKNOWN is operator-resolved via
+    ``manage.py resolve_submission``.
     """
 
     provider = models.CharField(

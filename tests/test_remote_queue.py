@@ -1337,10 +1337,11 @@ def test_crash_after_post_before_commit_does_not_double_submit(monkeypatch):
     assert len(provider.submit_calls) == 1, "must NOT POST a second time"
 
 
-def test_in_doubt_pending_ages_out_and_allows_exactly_one_repost(settings):
-    # IMPORTANT-1: an in-doubt PENDING intent must not hold the key forever. After
-    # the reconcile cap it ages out to FAILED (freeing the key), enabling EXACTLY
-    # ONE genuine re-POST — and NO second POST before the key is freed.
+def test_in_doubt_pending_parks_as_unknown_and_never_reposts(settings):
+    # G5-T1: an in-doubt PENDING intent must NEVER be auto-re-POSTed (the provider
+    # may have accepted the dropped POST). Below the reconcile cap it stays PENDING
+    # (no re-POST); at/above the cap it is parked UNKNOWN — a LIVE state that KEEPS
+    # holding the idempotency key — so still NO second POST ever issues.
     settings.REMOTE_SUBMISSION_RECONCILE_MAX = 2
     settings.REMOTE_SUBMISSION_TTL_SECONDS = 999999  # cap, not TTL, triggers here
 
@@ -1362,7 +1363,7 @@ def test_in_doubt_pending_ages_out_and_allows_exactly_one_repost(settings):
         request_payload=payload,
     )
 
-    # Reconcile attempts up to the cap: NO re-POST while the key is live.
+    # Reconcile attempts up to the cap: NO re-POST while the key is held; PENDING.
     for i in range(settings.REMOTE_SUBMISSION_RECONCILE_MAX):
         RemoteTask.objects.filter(inchikey=IK_A).update(
             state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
@@ -1371,27 +1372,28 @@ def test_in_doubt_pending_ages_out_and_allows_exactly_one_repost(settings):
         assert provider.submit_calls == [], f"must not re-POST on reconcile {i + 1}"
         assert RemoteSubmission.objects.get().state == "PENDING"
 
-    # One more reconcile exceeds the cap -> ages the intent out to FAILED.
+    # One more reconcile exceeds the cap -> parks the intent as UNKNOWN (NOT
+    # FAILED). The key stays held; the aging tick itself must not re-POST.
     RemoteTask.objects.filter(inchikey=IK_A).update(
         state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
     )
     worker.tick()
-    assert RemoteSubmission.objects.filter(state="FAILED").count() == 1
-    assert provider.submit_calls == [], "aging tick itself must not re-POST"
+    assert RemoteSubmission.objects.filter(state="UNKNOWN").count() == 1
+    assert provider.submit_calls == [], "parking tick itself must not re-POST"
 
-    # NOW the key is free: the next tick performs exactly ONE genuine re-POST.
+    # The key remains HELD: any later tick reconciles against the UNKNOWN intent
+    # and STILL never re-POSTs. Only the operator command resolves UNKNOWN.
     RemoteTask.objects.filter(inchikey=IK_A).update(
         state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
     )
     worker.tick()
-    assert len(provider.submit_calls) == 1, "exactly one re-POST after key freed"
-    # A fresh live SUBMITTED intent now exists alongside the aged-out FAILED one.
-    assert RemoteSubmission.objects.filter(state="SUBMITTED").count() == 1
-    assert RemoteSubmission.objects.filter(state="FAILED").count() == 1
+    assert provider.submit_calls == [], "UNKNOWN must never auto-re-POST"
+    assert RemoteSubmission.objects.filter(state="UNKNOWN").count() == 1
+    assert RemoteSubmission.objects.filter(state="SUBMITTED").count() == 0
 
 
-def test_in_doubt_pending_ages_out_by_ttl(settings):
-    # Aging also triggers on TTL (not just the reconcile cap).
+def test_in_doubt_pending_parks_unknown_by_ttl(settings):
+    # Parking also triggers on TTL (not just the reconcile cap).
     settings.REMOTE_SUBMISSION_RECONCILE_MAX = 999
     settings.REMOTE_SUBMISSION_TTL_SECONDS = 60
 
@@ -1417,7 +1419,7 @@ def test_in_doubt_pending_ages_out_by_ttl(settings):
     )
     worker.tick()
     sub.refresh_from_db()
-    assert sub.state == "FAILED"
+    assert sub.state == "UNKNOWN"
 
 
 def test_mid_batch_lease_lost_preserves_query_id_and_reclaims_member(
