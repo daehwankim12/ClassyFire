@@ -29,14 +29,25 @@ RUN groupadd --gid 1001 appgroup \
 WORKDIR /app
 
 # ── Python dependencies ──────────────────────────────────────────────────────
-# ── Application source ───────────────────────────────────────────────────────
-COPY . .
+# Copy only the dependency manifests first so Docker can cache this layer
+# independently from application source changes.
+COPY pyproject.toml uv.lock ./
 
 # Install only runtime dependencies in the production image. Developer tools
 # are installed by local workflows through `uv run --locked --extra dev`.
 RUN pip install --upgrade pip setuptools wheel \
  && pip install --no-cache-dir uv==0.11.21 \
- && uv sync --frozen --no-dev --no-editable
+ && uv sync --locked --no-dev --no-editable
+
+# ── Application source ───────────────────────────────────────────────────────
+# Copy only the source files needed at runtime; secrets, venv, dumps, etc.
+# are excluded via .dockerignore and selective COPY directives below.
+COPY manage.py ./
+COPY apps ./apps
+COPY config ./config
+COPY templates ./templates
+COPY static ./static
+COPY deploy ./deploy
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
@@ -50,14 +61,12 @@ ENV DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY} \
     DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}
 
 # Collect static at build with placeholder env (collectstatic needs no DB).
-# A failure must remain VISIBLE in the build log rather than be silently
-# swallowed, but it should not abort the image build — missing static assets
-# surface and are recoverable at runtime via `collectstatic` on start.
+# Failure aborts the image build so misconfigured static storage is caught
+# immediately rather than silently producing a broken image.
 RUN POSTGRES_HOST=localhost POSTGRES_PASSWORD=placeholder \
     NGROK_DOMAIN=placeholder.example.com \
     SHARED_ACCESS_PASSWORD_HASH=placeholder \
-    python manage.py collectstatic --noinput 2>&1 \
-    || echo "WARN: collectstatic failed at build time — run it at container start; check STORAGES/whitenoise config"
+    python manage.py collectstatic --noinput
 
 # ── Runtime ownership ────────────────────────────────────────────────────────
 RUN chown -R appuser:appgroup /app
