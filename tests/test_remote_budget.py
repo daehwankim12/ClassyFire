@@ -160,3 +160,41 @@ def test_fair_claim_locks_principal_state_rows_before_task_update():
         if sql.startswith('UPDATE "remote_tasks"')
     )
     assert state_lock_index < task_update_index
+
+
+@pytest.mark.django_db(transaction=True)
+def test_claim_retries_when_locked_frontier_disappears(monkeypatch):
+    from apps.core.enums import TaskState
+    from apps.remote import queue
+    from apps.remote.models import RemoteTask
+
+    high = RemoteTask.objects.create(
+        inchikey=IK_A,
+        principal="principal-a",
+        state=TaskState.READY,
+        priority=10,
+    )
+    low = RemoteTask.objects.create(
+        inchikey=IK_B,
+        principal="principal-b",
+        state=TaskState.READY,
+        priority=0,
+    )
+    original = queue._claim_task_once
+    calls = 0
+
+    def racing_claim_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            RemoteTask.objects.filter(pk=high.pk).update(state=TaskState.LOCKED)
+            return None, True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(queue, "_claim_task_once", racing_claim_once)
+
+    claimed = queue.claim_task("worker-1")
+
+    assert claimed is not None
+    assert claimed.pk == low.pk
+    assert calls == 2

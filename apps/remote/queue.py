@@ -123,6 +123,95 @@ def _due_ready_tasks(now):
     )
 
 
+def _locked_principal_states(principals: list[str]) -> dict[str, RemotePrincipalState]:
+    for principal in principals:
+        RemotePrincipalState.objects.get_or_create(
+            principal=principal,
+            defaults={"last_claimed_at": None, "claim_count": 0},
+        )
+    return {
+        state.principal: state
+        for state in RemotePrincipalState.objects.select_for_update()
+        .filter(principal__in=principals)
+        .order_by("principal")
+    }
+
+
+def _claim_task_once(
+    worker_id: str,
+    *,
+    exclude_ids: set[int] | None,
+    structure_required: bool,
+    now,
+) -> tuple[RemoteTask | None, bool]:
+    base_qs = _due_ready_tasks(now)
+    if exclude_ids:
+        base_qs = base_qs.exclude(id__in=exclude_ids)
+    if structure_required:
+        base_qs = base_qs.filter(
+            Q(compound__canonical_smiles__isnull=False)
+            | Q(compound__inchi__isnull=False)
+        )
+
+    top_priority = base_qs.order_by("-priority").values_list(
+        "priority", flat=True
+    ).first()
+    if top_priority is None:
+        return None, False
+    principals = list(
+        base_qs.filter(priority=top_priority)
+        .order_by("principal")
+        .values_list("principal", flat=True)
+        .distinct()
+    )
+    states = _locked_principal_states(principals)
+
+    def principal_fairness_key(principal: str) -> tuple[bool, object, str]:
+        state = states.get(principal)
+        last_claimed_at = state.last_claimed_at if state is not None else None
+        return (
+            last_claimed_at is not None,
+            last_claimed_at or MIN_AWARE_DATETIME,
+            principal,
+        )
+
+    task = None
+    for principal in sorted(principals, key=principal_fairness_key):
+        candidate_qs = (
+            base_qs.select_for_update(skip_locked=True)
+            .filter(priority=top_priority, principal=principal)
+            .order_by("next_run_at", "id")
+        )
+        task = cast("RemoteTask | None", candidate_qs.first())
+        if task is not None:
+            break
+    if task is None:
+        return None, True
+
+    # Issue a fresh fencing token + bump the monotonic lease version (F-07)
+    # so any previous holder's late writes are rejected.
+    task.state = TaskState.LOCKED
+    task.lock_owner = worker_id
+    task.locked_at = now
+    task.lease_token = uuid.uuid4()
+    task.lease_version = task.lease_version + 1
+    task.save(
+        update_fields=[
+            "state",
+            "lock_owner",
+            "locked_at",
+            "lease_token",
+            "lease_version",
+            "updated_at",
+        ]
+    )
+    RemotePrincipalState.objects.filter(pk=states[task.principal].pk).update(
+        last_claimed_at=now,
+        claim_count=F("claim_count") + 1,
+    )
+    return task, False
+
+
 def claim_task(
     worker_id: str,
     *,
@@ -134,84 +223,18 @@ def claim_task(
     Must be called inside a transaction-managing caller; we open our own atomic
     block so the row lock is held only for the claim flip.
     """
-    now = timezone.now()
-    with transaction.atomic():
-        base_qs = _due_ready_tasks(now)
-        if exclude_ids:
-            base_qs = base_qs.exclude(id__in=exclude_ids)
-        if structure_required:
-            base_qs = base_qs.filter(
-                Q(compound__canonical_smiles__isnull=False)
-                | Q(compound__inchi__isnull=False)
+    for _attempt in range(3):
+        now = timezone.now()
+        with transaction.atomic():
+            task, retry = _claim_task_once(
+                worker_id,
+                exclude_ids=exclude_ids,
+                structure_required=structure_required,
+                now=now,
             )
-
-        top_priority = base_qs.order_by("-priority").values_list(
-            "priority", flat=True
-        ).first()
-        if top_priority is None:
-            return None
-        principals = list(
-            base_qs.filter(priority=top_priority)
-            .order_by("principal")
-            .values_list("principal", flat=True)
-            .distinct()
-        )
-        for principal in principals:
-            RemotePrincipalState.objects.get_or_create(
-                principal=principal,
-                defaults={"last_claimed_at": None, "claim_count": 0},
-            )
-        states = {
-            state.principal: state
-            for state in RemotePrincipalState.objects.select_for_update()
-            .filter(principal__in=principals)
-            .order_by("principal")
-        }
-
-        def principal_fairness_key(principal: str) -> tuple[bool, object, str]:
-            state = states.get(principal)
-            last_claimed_at = state.last_claimed_at if state is not None else None
-            return (
-                last_claimed_at is not None,
-                last_claimed_at or MIN_AWARE_DATETIME,
-                principal,
-            )
-
-        task = None
-        for principal in sorted(principals, key=principal_fairness_key):
-            candidate_qs = (
-                base_qs.select_for_update(skip_locked=True)
-                .filter(priority=top_priority, principal=principal)
-                .order_by("next_run_at", "id")
-            )
-            task = cast("RemoteTask | None", candidate_qs.first())
-            if task is not None:
-                break
-        if task is None:
-            return None
-
-        # Issue a fresh fencing token + bump the monotonic lease version (F-07)
-        # so any previous holder's late writes are rejected.
-        task.state = TaskState.LOCKED
-        task.lock_owner = worker_id
-        task.locked_at = now
-        task.lease_token = uuid.uuid4()
-        task.lease_version = task.lease_version + 1
-        task.save(
-            update_fields=[
-                "state",
-                "lock_owner",
-                "locked_at",
-                "lease_token",
-                "lease_version",
-                "updated_at",
-            ]
-        )
-        RemotePrincipalState.objects.filter(pk=states[task.principal].pk).update(
-            last_claimed_at=now,
-            claim_count=F("claim_count") + 1,
-        )
-        return task
+        if task is not None or not retry:
+            return task
+    return None
 
 
 def recover_stale_locks(lease_seconds: float) -> int:
