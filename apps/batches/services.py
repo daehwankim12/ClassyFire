@@ -10,6 +10,14 @@ create_job(
     Creates a BatchJob, ingests rows, runs local processing synchronously,
     updates counters, and returns (job, plaintext_secret).
 
+create_job_records(
+    rows: Iterable[dict],
+    *,
+    remote_enabled: bool = True,
+) -> tuple[BatchJob, str]
+    Creates only the BatchJob and raw BatchItems in one transaction, returning
+    (job, plaintext_secret). Call process_job_items(job) separately.
+
 process_job_items(job: BatchJob) -> None
     Runs local normalization + lookup for every PENDING_NORMALIZATION item
     in the job, updating statuses, creating compounds, and scheduling remote
@@ -388,12 +396,12 @@ def process_job_items(job: BatchJob) -> None:
     job.refresh_from_db()
 
 
-def create_job(
+def create_job_records(
     rows: Iterable[dict],
     *,
     remote_enabled: bool = True,
 ) -> tuple[BatchJob, str]:
-    """Create a BatchJob, ingest rows, and run local processing.
+    """Create a BatchJob and ingest its raw rows without local processing.
 
     Parameters
     ----------
@@ -417,6 +425,24 @@ def create_job(
             remote_enabled=remote_enabled,
         )
         ingest_rows(job, rows)
+
+    return job, plaintext_secret
+
+
+def create_job(
+    rows: Iterable[dict],
+    *,
+    remote_enabled: bool = True,
+) -> tuple[BatchJob, str]:
+    """Create a BatchJob, ingest rows, and run local processing.
+
+    The durable job row and raw items are committed before local processing so
+    a processing error cannot roll back the existence of the job itself.
+    """
+    job, plaintext_secret = create_job_records(
+        rows,
+        remote_enabled=remote_enabled,
+    )
 
     # Local processing runs outside the creation transaction so that a partial
     # error in one item does not roll back the job row itself.

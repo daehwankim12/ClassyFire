@@ -58,10 +58,12 @@ def test_submit_post_redirects_to_job():
     )
     assert response.status_code == 302
     location = response["Location"]
-    # Should redirect to /jobs/<uuid>/<secret>/
+    # Should redirect to the one-time claim URL; the claim response then
+    # exchanges the secret for a cookie and lands on /jobs/<uuid>/.
     assert location.startswith("/jobs/")
     parts = location.strip("/").split("/")
-    assert len(parts) == 3  # jobs, uuid, secret
+    assert len(parts) == 4  # jobs, uuid, claim, secret
+    assert parts[2] == "claim"
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +103,9 @@ def test_job_detail_shows_counters():
     rows = list(parse_text_input(ASPIRIN_SMILES))
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
-    response = client.get(f"/jobs/{job.pk}/{secret}/")
+    claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+    assert claim_response.status_code == 303
+    response = client.get(f"/jobs/{job.pk}/")
     assert response.status_code == 200
     content = response.content.decode()
     # UUID should appear somewhere on the page
@@ -120,7 +124,9 @@ def test_pagination_default_100_rows():
     rows = list(parse_text_input(text))
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
-    response = client.get(f"/jobs/{job.pk}/{secret}/")
+    claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+    assert claim_response.status_code == 303
+    response = client.get(f"/jobs/{job.pk}/")
     assert response.status_code == 200
     content = response.content.decode()
     # Count occurrences of a unique per-row marker — the original_input appears in table cells
@@ -141,7 +147,9 @@ def test_status_filter_invalid():
     rows = list(parse_text_input(text))
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
-    response = client.get(f"/jobs/{job.pk}/{secret}/", {"status_filter": "INVALID"})
+    claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+    assert claim_response.status_code == 303
+    response = client.get(f"/jobs/{job.pk}/", {"status_filter": "INVALID"})
     assert response.status_code == 200
     content = response.content.decode()
     # The invalid item should appear, the valid SMILES should NOT appear in the table
@@ -161,7 +169,9 @@ def test_search_by_external_id():
     rows[0]["external_id"] = "MY-UNIQUE-EXT-ID-9999"
     job, secret = create_job(rows, remote_enabled=False)
     client = Client()
-    response = client.get(f"/jobs/{job.pk}/{secret}/", {"search": "MY-UNIQUE-EXT-ID-9999"})
+    claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+    assert claim_response.status_code == 303
+    response = client.get(f"/jobs/{job.pk}/", {"search": "MY-UNIQUE-EXT-ID-9999"})
     assert response.status_code == 200
     content = response.content.decode()
     assert "MY-UNIQUE-EXT-ID-9999" in content
@@ -194,6 +204,81 @@ def test_structure_form_matching_inchikey_succeeds():
         assert response.status_code == 302
 
 
+@pytest.mark.django_db(transaction=True)
+def test_legacy_structure_get_exchanges_cookie_without_rendering_secret():
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.first()
+    assert item is not None
+    client = Client()
+
+    response = client.get(f"/items/{item.pk}/{secret}/structure")
+
+    assert response.status_code == 303
+    assert response["Location"] == f"/items/{item.pk}/structure"
+    assert secret.encode() not in response.content
+    follow_response = client.get(response["Location"])
+    assert follow_response.status_code == 200
+    content = follow_response.content.decode()
+    assert secret not in content
+
+
+@pytest.mark.django_db(transaction=True)
+def test_legacy_structure_post_redirects_without_secret():
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.first()
+    assert item is not None
+    client = Client()
+
+    response = client.post(
+        f"/items/{item.pk}/{secret}/structure",
+        {"structure": GHOST_SMILES},
+    )
+
+    assert response.status_code in (302, 303)
+    assert response["Location"] == f"/jobs/{job.pk}/"
+    assert secret not in response["Location"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_legacy_items_partial_exchanges_cookie_without_rendering_secret():
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    client = Client()
+
+    response = client.get(
+        f"/jobs/{job.pk}/{secret}/items",
+        {"status_filter": "NEED_STRUCTURE"},
+    )
+
+    assert response.status_code == 303
+    assert response["Location"] == f"/jobs/{job.pk}/items?status_filter=NEED_STRUCTURE"
+    assert secret.encode() not in response.content
+    follow_response = client.get(response["Location"])
+    assert follow_response.status_code == 200
+    assert secret not in follow_response.content.decode()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_legacy_structure_post_error_redirects_without_secret():
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.first()
+    assert item is not None
+    client = Client()
+
+    response = client.post(
+        f"/items/{item.pk}/{secret}/structure",
+        {"structure": ASPIRIN_SMILES},
+    )
+
+    assert response.status_code == 303
+    assert response["Location"] == f"/items/{item.pk}/structure"
+    assert secret not in response["Location"]
+    assert secret.encode() not in response.content
+
+
 # ---------------------------------------------------------------------------
 # 10. Structure form: mismatching InChIKey shows error
 # ---------------------------------------------------------------------------
@@ -208,9 +293,11 @@ def test_structure_form_mismatching_inchikey_shows_error():
     assert item.status == BatchItemStatus.NEED_STRUCTURE
 
     client = Client()
+    claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+    assert claim_response.status_code == 303
     # Submit ASPIRIN structure for the GHOST_INCHIKEY item → mismatch
     response = client.post(
-        f"/items/{item.pk}/{secret}/structure",
+        f"/items/{item.pk}/structure",
         {"structure": ASPIRIN_SMILES},
     )
     assert response.status_code == 200

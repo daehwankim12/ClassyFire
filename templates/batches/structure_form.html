@@ -23,5 +23,9 @@
   <button type="submit">Submit Structure</button>
 </form>
 
+{% if secretless %}
+<p><a href="/jobs/{{ item.job.id }}/">Back to job</a></p>
+{% else %}
 <p><a href="/jobs/{{ item.job.id }}/{{ secret }}/">Back to job</a></p>
+{% endif %}
 {% endblock %}

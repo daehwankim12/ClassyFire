@@ -53,6 +53,18 @@
         health_status 200
     }
 
+    # Claim and legacy result/structure URLs carry one-time job secrets. Do
+    # not write those raw paths to Caddy access logs; Django immediately
+    # exchanges them for an HttpOnly cookie and redirects to secretless URLs.
+    @jobClaimSecret path_regexp job_claim_secret ^/jobs/[^/]+/claim/[^/]+/?$
+    log_skip @jobClaimSecret
+    @jobLegacySecret path_regexp job_legacy_secret ^/jobs/[^/]+/[^/]+/?$
+    log_skip @jobLegacySecret
+    @jobLegacyItemsSecret path_regexp job_legacy_items_secret ^/jobs/[^/]+/[^/]+/items/?$
+    log_skip @jobLegacyItemsSecret
+    @itemLegacyStructureSecret path_regexp item_legacy_structure_secret ^/items/[0-9]+/[^/]+/structure/?$
+    log_skip @itemLegacyStructureSecret
+
     # ── Serve collected static files directly ────────────────────────────────
     # Mount the same volume that `web` writes staticfiles into.
     handle_path /static/* {

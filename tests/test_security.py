@@ -43,6 +43,8 @@ from apps.core.security import (
 )
 
 ASPIRIN_SMILES = "CC(=O)Oc1ccccc1C(=O)O"
+GHOST_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"
+GHOST_SMILES = "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O"
 
 # Fixed test credentials.  Password hashed with pbkdf2_sha256 / salt=testsalt0001
 # so no Django setup is required at import time and the value is stable.
@@ -71,10 +73,24 @@ def _reload_prod_settings(
     }
     base_env.update(env_overrides)
     monkeypatch.setattr(os, "environ", {**os.environ, **base_env})
-    for mod_name in list(sys.modules.keys()):
-        if mod_name.startswith("config.settings") or mod_name == "apps.core.settings":
-            del sys.modules[mod_name]
-    return importlib.import_module("config.settings.prod")
+    reload_names = {
+        "config.settings.base",
+        "config.settings.prod",
+        "apps.core.settings",
+    }
+    saved_modules = {
+        mod_name: sys.modules[mod_name]
+        for mod_name in reload_names
+        if mod_name in sys.modules
+    }
+    for mod_name in reload_names:
+        sys.modules.pop(mod_name, None)
+    try:
+        return importlib.import_module("config.settings.prod")
+    finally:
+        for mod_name in reload_names:
+            sys.modules.pop(mod_name, None)
+        sys.modules.update(saved_modules)
 
 
 def _make_zip_bomb(compressed_size_target: int = 1024) -> bytes:
@@ -132,6 +148,48 @@ class TestAuthGateUnauthenticated:
             HTTP_AUTHORIZATION="Bearer wrong-password",
         )
         assert response.status_code in (401, 403)
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        JOB_CREATE_RATE_LIMIT_PER_MINUTE=1,
+    )
+    def test_job_create_rate_limit_rejects_abuse(self) -> None:
+        client = Client()
+        payload = {"text_input": ASPIRIN_SMILES, "remote_enabled": False}
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {_TEST_PASSWORD}"}
+
+        first = client.post(
+            "/api/jobs",
+            data=json.dumps(payload),
+            content_type="application/json",
+            **auth,
+        )
+        second = client.post(
+            "/api/jobs",
+            data=json.dumps(payload),
+            content_type="application/json",
+            **auth,
+        )
+
+        assert first.status_code == 201
+        assert second.status_code == 429
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        DISK_UPLOAD_PAUSE_PERCENT=0,
+    )
+    def test_disk_high_water_blocks_job_create(self) -> None:
+        client = Client()
+        response = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": False}),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+        )
+
+        assert response.status_code == 503
 
 
 # ===========================================================================
@@ -241,12 +299,13 @@ class TestCsrfPolicy:
 
 class TestResultUrlSecret:
     @pytest.mark.django_db(transaction=True)
-    def test_correct_secret_gives_200(self) -> None:
+    def test_correct_secret_redirects_to_secretless_url(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
         response = client.get(f"/jobs/{job.pk}/{secret}/")
-        assert response.status_code == 200
+        assert response.status_code == 303
+        assert response["Location"] == f"/jobs/{job.pk}/"
 
     @pytest.mark.django_db(transaction=True)
     def test_wrong_secret_gives_403(self) -> None:
@@ -271,6 +330,384 @@ class TestResultUrlSecret:
         response = client.get(f"/api/jobs/{job.pk}?secret=wrongsecret")
         # dev-open: auth gate passes, then per-job secret check gives 403
         assert response.status_code == 403
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SESSION_COOKIE_SECURE=True)
+    def test_job_claim_sets_cookie_and_redirects_to_secretless_url(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+
+        response = client.get(f"/jobs/{job.pk}/claim/{secret}/", secure=True)
+
+        assert response.status_code == 303
+        assert response["Location"] == f"/jobs/{job.pk}/"
+        job_cookies = [
+            morsel
+            for name, morsel in response.cookies.items()
+            if name.startswith("cf_job_access_")
+        ]
+        assert len(job_cookies) == 1
+        cookie = job_cookies[0]
+        assert cookie["httponly"]
+        assert cookie["secure"]
+        assert cookie["samesite"] == "Lax"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_secret_path_is_not_rendered_after_claim(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        response = client.get(f"/jobs/{job.pk}/")
+
+        assert response.status_code == 200
+        content = response.content.decode()
+        assert secret not in content
+        assert f"/jobs/{job.pk}/{secret}/" not in content
+        assert f"/jobs/{job.pk}/claim/{secret}/" not in content
+
+    @pytest.mark.django_db(transaction=True)
+    def test_legacy_secret_url_sets_cookie_and_redirects_without_rendering_secret(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+
+        response = client.get(f"/jobs/{job.pk}/{secret}/")
+
+        assert response.status_code == 303
+        assert response["Location"] == f"/jobs/{job.pk}/"
+        assert secret.encode() not in response.content
+        job_cookies = [
+            morsel
+            for name, morsel in response.cookies.items()
+            if name.startswith("cf_job_access_")
+        ]
+        assert len(job_cookies) == 1
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_claim_cookie_accesses_api_status_and_items_without_secret(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+
+        status_response = client.get(f"/api/jobs/{job.pk}")
+        items_response = client.get(f"/api/jobs/{job.pk}/items")
+
+        assert status_response.status_code == 200
+        assert status_response.json()["id"] == str(job.pk)
+        assert items_response.status_code == 200
+        assert items_response.json()["count"] >= 1
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_wrong_explicit_secret_fails_even_with_valid_job_cookie(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client()
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        response = client.get(f"/api/jobs/{job.pk}", {"secret": "wrong"})
+
+        assert response.status_code == 403
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_cookie_cannot_be_reused_for_another_job(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        first_job, first_secret = create_job(rows, remote_enabled=False)
+        second_job, _second_secret = create_job(rows, remote_enabled=False)
+        client = Client()
+
+        claim_response = client.get(f"/jobs/{first_job.pk}/claim/{first_secret}/")
+        assert claim_response.status_code == 303
+        response = client.get(f"/api/jobs/{second_job.pk}")
+
+        assert response.status_code in (401, 403)
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_claim_cookie_creates_and_downloads_export_without_shared_auth(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client(enforce_csrf_checks=True)
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        csrf_response = client.get(f"/jobs/{job.pk}/")
+        csrf_token = csrf_response.cookies["csrftoken"].value
+        create_response = client.post(
+            f"/api/jobs/{job.pk}/exports",
+            data=json.dumps({"format": "csv"}),
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        assert create_response.status_code == 201
+
+        token = create_response.json()["token"]
+        download_response = client.get(f"/api/exports/{token}")
+
+        assert download_response.status_code == 200
+        assert "csv" in download_response.get("Content-Type", "")
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_cookie_export_post_without_csrf_is_rejected(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client(enforce_csrf_checks=True)
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        response = client.post(
+            f"/api/jobs/{job.pk}/exports",
+            data=json.dumps({"format": "csv"}),
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_cookie_export_post_with_csrf_is_accepted(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client(enforce_csrf_checks=True)
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        csrf_response = client.get(f"/jobs/{job.pk}/")
+        csrf_token = csrf_response.cookies["csrftoken"].value
+        response = client.post(
+            f"/api/jobs/{job.pk}/exports",
+            data=json.dumps({"format": "csv"}),
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        assert response.status_code == 201
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_shared_session_job_create_without_csrf_is_rejected(self) -> None:
+        client = Client(enforce_csrf_checks=True)
+        login_page = client.get("/access/")
+        csrf_token = login_page.cookies["csrftoken"].value
+        login_response = client.post(
+            "/access/",
+            {"password": _TEST_PASSWORD, "next": "/"},
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        assert login_response.status_code == 303
+
+        response = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": False}),
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_shared_session_job_create_with_csrf_is_accepted(self) -> None:
+        client = Client(enforce_csrf_checks=True)
+        login_page = client.get("/access/")
+        csrf_token = login_page.cookies["csrftoken"].value
+        login_response = client.post(
+            "/access/",
+            {"password": _TEST_PASSWORD, "next": "/"},
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        assert login_response.status_code == 303
+        csrf_response = client.get("/")
+        csrf_token = csrf_response.cookies["csrftoken"].value
+
+        response = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": False}),
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        assert response.status_code == 201
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_cookie_item_structure_post_without_csrf_is_rejected(self) -> None:
+        rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+        job, secret = create_job(rows, remote_enabled=False)
+        item = job.items.first()
+        assert item is not None
+        client = Client(enforce_csrf_checks=True)
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        response = client.post(
+            f"/api/items/{item.pk}/structure",
+            data=json.dumps({"structure": GHOST_SMILES}),
+            content_type="application/json",
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_cookie_item_structure_post_with_csrf_is_accepted(self) -> None:
+        rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+        job, secret = create_job(rows, remote_enabled=False)
+        item = job.items.first()
+        assert item is not None
+        client = Client(enforce_csrf_checks=True)
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        csrf_response = client.get(f"/jobs/{job.pk}/")
+        csrf_token = csrf_response.cookies["csrftoken"].value
+        response = client.post(
+            f"/api/items/{item.pk}/structure",
+            data=json.dumps({"structure": GHOST_SMILES}),
+            content_type="application/json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        assert response.status_code == 200
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    @pytest.mark.parametrize(
+        "auth_header",
+        [
+            {"HTTP_AUTHORIZATION": "Bearer wrong-token"},
+            {"HTTP_X_SHARED_ACCESS_TOKEN": "wrong-token"},
+        ],
+    )
+    def test_invalid_token_header_with_valid_job_cookie_still_requires_csrf(
+        self,
+        auth_header: dict[str, str],
+    ) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client(enforce_csrf_checks=True)
+
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        response = client.post(
+            f"/api/jobs/{job.pk}/exports",
+            data=json.dumps({"format": "csv"}),
+            content_type="application/json",
+            **auth_header,
+        )
+
+        assert response.status_code == 403
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_shared_password_form_authenticates_browser_session(self) -> None:
+        client = Client(enforce_csrf_checks=True)
+
+        login_page = client.get("/access/")
+        assert login_page.status_code == 200
+        csrf_token = login_page.cookies["csrftoken"].value
+
+        login_response = client.post(
+            "/access/",
+            {"password": _TEST_PASSWORD, "next": "/"},
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        assert login_response.status_code == 303
+        assert login_response["Location"] == "/"
+        response = client.get("/")
+        assert response.status_code == 200
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_shared_password_login_cycles_session_key(self) -> None:
+        from apps.core.security import SHARED_ACCESS_SESSION_KEY
+
+        client = Client(enforce_csrf_checks=True)
+        session = client.session
+        session["pre_login_marker"] = "kept"
+        session.save()
+        old_session_key = session.session_key
+
+        login_page = client.get("/access/")
+        csrf_token = login_page.cookies["csrftoken"].value
+        login_response = client.post(
+            "/access/",
+            {"password": _TEST_PASSWORD, "next": "/"},
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        assert login_response.status_code == 303
+        assert client.session.session_key != old_session_key
+        assert client.session.get("pre_login_marker") == "kept"
+        assert client.session.get(SHARED_ACCESS_SESSION_KEY) is True
+
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        SHARED_ACCESS_LOGIN_FAILURE_LIMIT=2,
+        SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS=60,
+    )
+    def test_shared_password_login_throttles_repeated_failures(self) -> None:
+        client = Client(enforce_csrf_checks=True)
+        ip = "198.51.100.77"
+
+        first_page = client.get("/access/", REMOTE_ADDR=ip)
+        first = client.post(
+            "/access/",
+            {"password": "wrong", "next": "/"},
+            HTTP_X_CSRFTOKEN=first_page.cookies["csrftoken"].value,
+            REMOTE_ADDR=ip,
+        )
+        second_page = client.get("/access/", REMOTE_ADDR=ip)
+        second = client.post(
+            "/access/",
+            {"password": "wrong", "next": "/"},
+            HTTP_X_CSRFTOKEN=second_page.cookies["csrftoken"].value,
+            REMOTE_ADDR=ip,
+        )
+        blocked_page = client.get("/access/", REMOTE_ADDR=ip)
+        blocked = client.post(
+            "/access/",
+            {"password": "wrong", "next": "/"},
+            HTTP_X_CSRFTOKEN=blocked_page.cookies["csrftoken"].value,
+            REMOTE_ADDR=ip,
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert blocked.status_code == 429
+
+    def test_caddy_does_not_log_raw_claim_secret_paths(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "log_skip" in content
+        assert "/claim/" in content
+
+    def test_caddy_does_not_log_raw_legacy_secret_paths(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "jobLegacySecret" in content
+        assert "^/jobs/[^/]+/[^/]+/?$" in content
+        assert "^/jobs/[^/]+/[^/]+/items/?$" in content
+
+    def test_caddy_does_not_log_raw_legacy_structure_secret_paths(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "itemLegacyStructureSecret" in content
+        assert "^/items/[0-9]+/[^/]+/structure/?$" in content
 
 
 # ===========================================================================
@@ -366,6 +803,13 @@ class TestDockerComposePortExposure:
         port_strings = [str(p) for p in ports]
         assert any("80" in p for p in port_strings), "proxy should publish port 80"
         assert any("443" in p for p in port_strings), "proxy should publish port 443"
+
+    def test_web_gunicorn_access_log_disabled_but_error_log_kept(self) -> None:
+        data = self._load_compose()
+        command = data["services"]["web"]["command"]
+        assert "--access-logfile=/dev/null" in command
+        assert "--access-logfile=-" not in command
+        assert "--error-logfile=-" in command
 
 
 # ===========================================================================
@@ -515,21 +959,99 @@ class TestLogRedaction:
         assert result == "abc"
 
 
+class TestSecurityImplementationGuards:
+    def test_api_does_not_import_private_export_helpers(self) -> None:
+        api_file = Path(__file__).resolve().parents[1] / "apps/batches/api.py"
+        content = api_file.read_text()
+
+        assert "_find_existing_token" not in content
+        assert "_write_export_file" not in content
+        assert "_meta_path" not in content
+        assert "_create_export_without_secret" not in content
+        assert "create_export_for_authorized_job" in content
+
+    def test_quota_advisory_lock_keys_are_stable_and_distinct(self) -> None:
+        from apps.core.security import quota_advisory_lock_keys
+
+        first = quota_advisory_lock_keys("job_create", "principal-a", "127.0.0.1")
+        again = quota_advisory_lock_keys("job_create", "principal-a", "127.0.0.1")
+        different_principal = quota_advisory_lock_keys(
+            "job_create", "principal-b", "127.0.0.1"
+        )
+        different_ip = quota_advisory_lock_keys("job_create", "principal-a", "127.0.0.2")
+
+        assert first == again
+        assert first != different_principal
+        assert first != different_ip
+        assert all(-(2**31) <= value < 2**31 for value in first)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_create_job_under_quota_processes_items_after_quota_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from django.db import connection
+        from django.test import RequestFactory
+
+        from apps.batches import services
+        from apps.batches.models import BatchQuotaEvent
+        from apps.core.security import create_job_under_quota
+
+        request = RequestFactory().post("/api/jobs", REMOTE_ADDR="198.51.100.20")
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        original_create_job_records = services.create_job_records
+        original_process_job_items = services.process_job_items
+        create_atomic_states: list[bool] = []
+        process_atomic_states: list[bool] = []
+
+        def spy_create_job_records(
+            rows_arg: list[dict[str, object]],
+            *,
+            remote_enabled: bool,
+        ):
+            create_atomic_states.append(connection.in_atomic_block)
+            return original_create_job_records(rows_arg, remote_enabled=remote_enabled)
+
+        def spy_process_job_items(job):
+            process_atomic_states.append(connection.in_atomic_block)
+            return original_process_job_items(job)
+
+        monkeypatch.setattr(services, "create_job_records", spy_create_job_records)
+        monkeypatch.setattr(services, "process_job_items", spy_process_job_items)
+
+        job, secret, quota_error = create_job_under_quota(
+            request,
+            rows,
+            remote_enabled=False,
+        )
+
+        assert quota_error is None
+        assert job is not None
+        assert secret
+        assert create_atomic_states == [True]
+        assert process_atomic_states == [False]
+        assert BatchQuotaEvent.objects.filter(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            row_count=len(rows),
+        ).exists()
+
+
 # ===========================================================================
 # 10. Referrer-Policy: no-referrer header (defence-in-depth for URL secrets)
 # ===========================================================================
 
 
 class TestReferrerPolicy:
-    """Responses must carry Referrer-Policy: no-referrer so the per-job secret
-    embedded in result-page URLs is never forwarded in a Referer header."""
+    """Responses must carry Referrer-Policy: no-referrer for defense in depth."""
 
     @pytest.mark.django_db(transaction=True)
     def test_result_page_has_no_referrer_policy(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
-        response = client.get(f"/jobs/{job.pk}/{secret}/")
+        claim_response = client.get(f"/jobs/{job.pk}/claim/{secret}/")
+        assert claim_response.status_code == 303
+        response = client.get(f"/jobs/{job.pk}/")
         assert response.status_code == 200
         assert response.headers.get("Referrer-Policy") == "no-referrer", (
             f"Expected Referrer-Policy: no-referrer, got: {response.headers.get('Referrer-Policy')}"
@@ -708,16 +1230,16 @@ class TestWebGate:
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
     def test_job_detail_accessible_by_job_secret_in_locked_mode(self) -> None:
-        """Per-job result pages must NOT require the shared-access credential;
-        they are already authorized by the per-job secret embedded in the URL."""
+        """Legacy per-job secret links exchange to a scoped job cookie."""
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
         response = client.get(f"/jobs/{job.pk}/{secret}/")
-        assert response.status_code == 200, (
-            f"Expected 200 for job detail page with correct secret in locked mode, "
+        assert response.status_code == 303, (
+            f"Expected 303 for job detail page with correct secret in locked mode, "
             f"got {response.status_code}"
         )
+        assert response["Location"] == f"/jobs/{job.pk}/"
 
 
 # ===========================================================================
@@ -797,8 +1319,11 @@ class TestUploadSizeGuardOnRealPath:
         assert location.startswith("/jobs/"), (
             f"Redirect should go to /jobs/..., got {location}"
         )
-        # Follow the redirect to confirm the job was created.
-        response2 = client.get(location)
+        # Follow the claim redirect to confirm the job was created and the
+        # resulting secretless page is accessible by job cookie.
+        claim_response = client.get(location)
+        assert claim_response.status_code == 303
+        response2 = client.get(claim_response["Location"])
         assert response2.status_code == 200
 
         # Inspect the DB: the aspirin row must be present and processed;

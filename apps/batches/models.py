@@ -106,3 +106,27 @@ class BatchItem(models.Model):
 
     def __str__(self) -> str:
         return f"item:{self.job_id}#{self.row_order} ({self.status})"
+
+
+class BatchQuotaEvent(models.Model):
+    """DB-backed quota accounting for job creation and export attempts."""
+
+    KIND_JOB_CREATE = "job_create"
+    KIND_EXPORT_CREATE = "export_create"
+
+    kind = models.CharField(max_length=32)
+    principal = models.CharField(max_length=128)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    row_count = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "batch_quota_events"
+        indexes = [
+            models.Index(fields=["kind", "principal", "created_at"], name="quota_kind_principal_idx"),
+            models.Index(fields=["kind", "ip_address", "created_at"], name="quota_kind_ip_idx"),
+            models.Index(fields=["kind", "created_at"], name="quota_kind_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"quota:{self.kind}:{self.principal}:{self.created_at.isoformat()}"

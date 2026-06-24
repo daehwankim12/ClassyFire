@@ -199,6 +199,21 @@ class TestBaseSettingsContract:
         assert hasattr(settings, "DISK_UPLOAD_PAUSE_PERCENT")
         assert isinstance(settings.DISK_UPLOAD_PAUSE_PERCENT, int)
 
+    def test_g1_3_quota_settings_are_wired(self, settings: object) -> None:
+        quota_settings = [
+            "MAX_ROWS_PER_JOB",
+            "JOB_CREATE_RATE_LIMIT_PER_MINUTE",
+            "JOB_CREATE_DAILY_ROW_CAP",
+            "ACTIVE_JOB_CAP",
+            "EXPORT_CREATE_RATE_LIMIT_PER_MINUTE",
+            "JOB_ACCESS_COOKIE_DAYS",
+            "SHARED_ACCESS_LOGIN_FAILURE_LIMIT",
+            "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS",
+        ]
+        for setting_name in quota_settings:
+            assert hasattr(settings, setting_name)
+            assert isinstance(getattr(settings, setting_name), int)
+
     def test_seed_profile(self, settings: object) -> None:
         assert hasattr(settings, "SEED_PROFILE")
         assert settings.SEED_PROFILE in ("FULL", "LITE", "CUSTOM")

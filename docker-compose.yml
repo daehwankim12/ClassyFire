@@ -81,7 +81,9 @@ services:
       - "--bind=0.0.0.0:8000"
       - "--workers=2"
       - "--timeout=120"
-      - "--access-logfile=-"
+      # Caddy is the canonical access logger and skips secret-bearing job URLs.
+      # Keep Gunicorn access logs disabled so raw upstream paths are not emitted.
+      - "--access-logfile=/dev/null"
       - "--error-logfile=-"
     volumes:
       - static_files:/app/staticfiles
