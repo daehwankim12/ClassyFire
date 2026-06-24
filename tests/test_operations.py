@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from django.core.management import call_command
 from django.utils import timezone as dj_timezone
 
 from apps.operations.models import SeedImport, SystemEvent
@@ -423,6 +424,15 @@ def test_admin_resume_remote():
     pause_remote(actor="test")
     assert is_remote_paused() is True
     resume_remote(actor="test")
+    assert is_remote_paused() is False
+
+
+def test_admin_pause_resume_management_commands():
+    from apps.operations.admin_views import is_remote_paused
+
+    call_command("admin_pause_remote", actor="cli-test")
+    assert is_remote_paused() is True
+    call_command("admin_resume_remote", actor="cli-test")
     assert is_remote_paused() is False
 
 

@@ -28,7 +28,7 @@ from apps.core.enums import (
 from apps.remote import queue
 from apps.remote.circuit import CircuitBreaker, CircuitState
 from apps.remote.mock import MockProvider, build_query_response, build_raw
-from apps.remote.models import RemoteQuery, RemoteTask
+from apps.remote.models import RemoteQuery, RemoteQueryItem, RemoteTask
 from apps.remote.rate_limit import RateLimiter
 from apps.remote.worker import RemoteWorker
 
@@ -303,6 +303,47 @@ def test_batch_extra_without_structure_is_not_claimed(settings):
     no_struct = RemoteTask.objects.get(inchikey=IK_B)
     assert no_struct.state == TaskState.READY
     assert no_struct.lock_owner is None
+
+
+def test_poll_wait_task_already_linked_to_query_is_not_claimed_as_batch_extra(
+    settings,
+):
+    settings.REMOTE_BATCH_SIZE = 2
+    comp_a = _compound(IK_A)
+    comp_b = _compound(IK_B)
+    primary = queue.enqueue_task(IK_A, compound_id=comp_a.id, priority=10)
+    poll_task = RemoteTask.objects.create(
+        inchikey=IK_B,
+        compound=comp_b,
+        state=TaskState.POLL_WAIT,
+        next_run_at=timezone.now() - dt.timedelta(seconds=1),
+    )
+    remote_query = RemoteQuery.objects.create(
+        remote_query_id="q-existing",
+        payload_hash="existing",
+        state=QueryState.SUBMITTED,
+    )
+    RemoteQueryItem.objects.create(
+        query=remote_query,
+        task=poll_task,
+        compound=comp_b,
+        inchikey=IK_B,
+    )
+    assert primary is not None
+
+    queue.reactivate_due_tasks()
+    claimed_primary = queue.claim_task("owner")
+    assert claimed_primary is not None
+    assert claimed_primary.pk == primary.pk
+
+    extras = _worker(MockProvider(), worker_id="owner")._claim_batch_extras(
+        claimed_primary
+    )
+
+    assert extras == []
+    poll_task.refresh_from_db()
+    assert poll_task.state == TaskState.READY
+    assert poll_task.lock_owner is None
 
 
 def test_batch_submit_retryable_failure_retries_all_claimed_members(settings):
@@ -789,6 +830,23 @@ def test_every_resolution_path_pins_classification_snapshot():
     assert structure_item.classification_snapshot["query_id"] == (
         "q-structure-snapshot"
     )
+
+
+def test_worker_does_not_claim_tasks_while_remote_is_paused():
+    from apps.operations.admin_views import pause_remote
+
+    comp = _compound(IK_A)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+    pause_remote(actor="test")
+    provider = MockProvider()
+
+    processed = _worker(provider).tick()
+
+    assert processed is False
+    assert provider.entity_calls == []
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.READY
+    assert task.lock_owner is None
 
 
 # ---------------------------------------------------------------------------

@@ -327,7 +327,7 @@ def _matches_current_rows_signature(meta: dict[str, str]) -> bool:
     expected_signature = meta.get("rows_signature")
     job_id = meta.get("job_id")
     if not expected_signature or not job_id:
-        return True
+        return False
 
     job = BatchJob.objects.filter(pk=job_id).first()
     if job is None:

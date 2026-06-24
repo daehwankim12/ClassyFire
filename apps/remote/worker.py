@@ -91,6 +91,10 @@ class RemoteWorker:
 
         Returns True if a task was processed, False if the queue was idle.
         """
+        from apps.operations.admin_views import is_remote_paused
+
+        if is_remote_paused():
+            return False
         queue.recover_stale_locks(self.lease_seconds)
         queue.reactivate_due_tasks()
         task = queue.claim_task(self.worker_id)
@@ -263,6 +267,10 @@ class RemoteWorker:
                 .filter(state=TaskState.READY)
                 .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
                 .exclude(id=task.id)
+                .exclude(query_items__query__state__in=[
+                    QueryState.SUBMITTED,
+                    QueryState.POLLING,
+                ])
                 .order_by("-priority", "id")[: settings.REMOTE_BATCH_SIZE - 1]
             )
             for extra in candidates:

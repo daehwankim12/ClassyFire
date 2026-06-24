@@ -559,3 +559,20 @@ def test_export_reuse_invalidates_after_job_items_resolve():
 
     stale_download = client.get(f"/api/exports/{stale_token}")
     assert stale_download.status_code == 404
+
+
+@pytest.mark.django_db(transaction=True)
+def test_legacy_export_metadata_without_rows_signature_is_not_served():
+    from apps.batches import exports
+
+    job, secret = _create_simple_job()
+    client = Client()
+    token = _create_export_token(client, str(job.pk), secret, "csv")
+    meta_path = exports._meta_path(token)
+    meta = json.loads(meta_path.read_text())
+    meta.pop("rows_signature")
+    meta_path.write_text(json.dumps(meta))
+
+    response = client.get(f"/api/exports/{token}")
+
+    assert response.status_code == 404

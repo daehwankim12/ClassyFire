@@ -204,18 +204,18 @@ class TestAuthGateAllEndpoints:
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
     def test_get_job_status_no_auth_rejected(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
-        job, secret = create_job(rows, remote_enabled=False)
+        job, _secret = create_job(rows, remote_enabled=False)
         client = Client()
-        response = client.get(f"/api/jobs/{job.pk}?secret={secret}")
+        response = client.get(f"/api/jobs/{job.pk}")
         assert response.status_code in (401, 403)
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
     def test_get_job_items_no_auth_rejected(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
-        job, secret = create_job(rows, remote_enabled=False)
+        job, _secret = create_job(rows, remote_enabled=False)
         client = Client()
-        response = client.get(f"/api/jobs/{job.pk}/items?secret={secret}")
+        response = client.get(f"/api/jobs/{job.pk}/items")
         assert response.status_code in (401, 403)
 
     @pytest.mark.django_db(transaction=True)
@@ -1099,6 +1099,36 @@ class TestXJobSecretHeader:
             f"Expected 200 with correct X-Job-Secret header, got {response.status_code}: "
             f"{response.content}"
         )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_secret_header_allows_job_status_without_shared_bearer(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client(enforce_csrf_checks=True)
+
+        response = client.get(
+            f"/api/jobs/{job.pk}",
+            HTTP_X_JOB_SECRET=secret,
+        )
+
+        assert response.status_code == 200, response.content
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
+    def test_job_secret_header_allows_export_without_shared_bearer(self) -> None:
+        rows = list(parse_text_input(ASPIRIN_SMILES))
+        job, secret = create_job(rows, remote_enabled=False)
+        client = Client(enforce_csrf_checks=True)
+
+        response = client.post(
+            f"/api/jobs/{job.pk}/exports",
+            data=json.dumps({"format": "csv"}),
+            content_type="application/json",
+            HTTP_X_JOB_SECRET=secret,
+        )
+
+        assert response.status_code == 201, response.content
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)

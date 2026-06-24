@@ -99,11 +99,26 @@ def _check_bearer(request: HttpRequest) -> bool:
     return bool(check_password(token, stored_hash))
 
 
-def _has_token_credential(request: HttpRequest) -> bool:
-    auth_header = request.headers.get("Authorization", "")
-    return auth_header.startswith("Bearer ") or bool(
-        request.headers.get("X-Shared-Access-Token", "")
-    )
+def _job_secret_from_request(request: HttpRequest) -> str:
+    header_secret = request.headers.get("X-Job-Secret", "")
+    if header_secret:
+        return header_secret
+    return request.GET.get("secret", "")
+
+
+def _check_job_secret(request: HttpRequest, job_id: object | None) -> bool:
+    if job_id is None:
+        return False
+    secret = _job_secret_from_request(request)
+    if not secret:
+        return False
+
+    from apps.batches.models import BatchJob
+
+    job = BatchJob.objects.filter(pk=str(job_id)).only("secret_hash").first()
+    if job is None:
+        return False
+    return bool(check_password(secret, job.secret_hash))
 
 
 def _is_authenticated(request: HttpRequest, job_id: str | None = None) -> bool:
@@ -111,8 +126,11 @@ def _is_authenticated(request: HttpRequest, job_id: str | None = None) -> bool:
     if _is_dev_open():
         return True
 
-    if job_id is not None and request_has_job_access_cookie(request, job_id):
-        return True
+    if job_id is not None:
+        if request_has_job_access_cookie(request, job_id):
+            return True
+        if _check_job_secret(request, job_id):
+            return True
 
     if _check_bearer(request):
         return True
@@ -153,7 +171,8 @@ def require_csrf_for_cookie_auth(view_func: Callable) -> Callable:
     def wrapper(request: HttpRequest, *args, **kwargs):
         if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
             return view_func(request, *args, **kwargs)
-        if _is_dev_open() or _check_bearer(request):
+        job_id = _job_id_from_view_kwargs(kwargs)
+        if _is_dev_open() or _check_bearer(request) or _check_job_secret(request, job_id):
             return view_func(request, *args, **kwargs)
 
         csrf = CsrfViewMiddleware(lambda _request: HttpResponse())
@@ -208,6 +227,24 @@ def authenticate_shared_password(request: HttpRequest, password: str) -> bool:
 def request_has_shared_access(request: HttpRequest, job_id: object | None = None) -> bool:
     """Return True when request carries app-level or job-cookie credentials."""
     return _is_authenticated(request, str(job_id) if job_id is not None else None)
+
+
+def _job_id_from_view_kwargs(kwargs: dict[str, object]) -> object | None:
+    job_id = kwargs.get("job_id")
+    if job_id is not None:
+        return job_id
+
+    item_id = kwargs.get("item_id")
+    if item_id is None:
+        return None
+
+    from apps.batches.models import BatchItem
+
+    return (
+        BatchItem.objects.filter(pk=str(item_id))
+        .values_list("job_id", flat=True)
+        .first()
+    )
 
 
 def _shared_access_login_failure_key(request: HttpRequest) -> str:
