@@ -1,0 +1,63 @@
+name: release-gates
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-type-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra dev
+      - run: uv run ruff check .
+      - run: uv run mypy apps config scripts
+      - run: uv run python manage.py makemigrations --check --dry-run
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: cf_test
+          POSTGRES_USER: classyfire
+          POSTGRES_PASSWORD: classyfire
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U classyfire"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra dev
+      - run: POSTGRES_TEST_HOST=127.0.0.1 POSTGRES_TEST_PORT=55432 POSTGRES_TEST_DB=cf_test POSTGRES_TEST_USER=classyfire POSTGRES_TEST_PASSWORD=classyfire uv run python scripts/run_postgres_tests.py --reuse-db tests -q
+
+  docker-build-secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: printf 'DJANGO_SECRET_KEY=%s\nPOSTGRES_PASSWORD=%s\n' "$CLASSYFIRE_SENTINEL_SECRET" "$CLASSYFIRE_SENTINEL_SECRET" > .env
+        env:
+          CLASSYFIRE_SENTINEL_SECRET: sentinel-release-gate-secret
+      - run: docker build -t classyfire-release-gate .
+      - run: sh scripts/check_image_for_secrets.sh classyfire-release-gate
+        env:
+          CLASSYFIRE_SENTINEL_SECRET: sentinel-release-gate-secret
+
+  proxy-log-redaction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config
+
+  backup-restore-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n deploy/backup/backup.sh
+      - run: sh -n deploy/backup/restore.sh
