@@ -49,7 +49,7 @@
 #   Then activate with:
 #     python manage.py seed_activate
 # =============================================================================
-set -euo pipefail
+set -eu
 
 POSTGRES_HOST="${POSTGRES_HOST:-db}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
@@ -173,11 +173,11 @@ fi
 
 # ── Restore exports archive (optional) ────────────────────────────────────
 # Reads artifact_archives.exports from the manifest (if present).
-EXPORTS_FILE=$(awk -F'"' '/"exports"/{found=1} found && /"file"/{print $4; exit}' "${MANIFEST}" || true)
+EXPORTS_FILE=$(awk -F'"' '/"exports":/{for(i=1;i<=NF;i++) if($i=="file"){print $(i+2); exit}}' "${MANIFEST}" || true)
 if [ -n "${RESTORE_EXPORT_DIR:-}" ] && [ -n "${EXPORTS_FILE:-}" ] && [ "${EXPORTS_FILE}" != "null" ]; then
   EXPORTS_PATH="${BACKUP_DIR}/${EXPORTS_FILE}"
   if [ -f "${EXPORTS_PATH}" ]; then
-    EXPECTED_EXPORTS_CHECKSUM=$(awk -F'"' '/"exports"/{found=1} found && /"checksum"/{print $4; exit}' "${MANIFEST}" || true)
+    EXPECTED_EXPORTS_CHECKSUM=$(awk -F'"' '/"exports":/{for(i=1;i<=NF;i++) if($i=="checksum"){print $(i+2); exit}}' "${MANIFEST}" || true)
     if [ -n "${EXPECTED_EXPORTS_CHECKSUM}" ] && [ "${EXPECTED_EXPORTS_CHECKSUM}" != "null" ]; then
       echo "[restore] Verifying exports checksum for ${EXPORTS_FILE} ..."
       ACTUAL_EXPORTS_CHECKSUM=$(sha256sum "${EXPORTS_PATH}" | awk '{print $1}')
@@ -204,11 +204,11 @@ fi
 
 # ── Restore source_artifacts archive (optional) ───────────────────────────
 # Reads artifact_archives.source_artifacts from the manifest (if present).
-SOURCE_ARTIFACTS_FILE=$(awk -F'"' '/"source_artifacts"/{found=1} found && /"file"/{print $4; exit}' "${MANIFEST}" || true)
+SOURCE_ARTIFACTS_FILE=$(awk -F'"' '/"source_artifacts":/{for(i=1;i<=NF;i++) if($i=="file"){print $(i+2); exit}}' "${MANIFEST}" || true)
 if [ -n "${RESTORE_SOURCE_ARTIFACT_DIR:-}" ] && [ -n "${SOURCE_ARTIFACTS_FILE:-}" ] && [ "${SOURCE_ARTIFACTS_FILE}" != "null" ]; then
   SOURCE_ARTIFACTS_PATH="${BACKUP_DIR}/${SOURCE_ARTIFACTS_FILE}"
   if [ -f "${SOURCE_ARTIFACTS_PATH}" ]; then
-    EXPECTED_SOURCE_CHECKSUM=$(awk -F'"' '/"source_artifacts"/{found=1} found && /"checksum"/{print $4; exit}' "${MANIFEST}" || true)
+    EXPECTED_SOURCE_CHECKSUM=$(awk -F'"' '/"source_artifacts":/{for(i=1;i<=NF;i++) if($i=="checksum"){print $(i+2); exit}}' "${MANIFEST}" || true)
     if [ -n "${EXPECTED_SOURCE_CHECKSUM}" ] && [ "${EXPECTED_SOURCE_CHECKSUM}" != "null" ]; then
       echo "[restore] Verifying source_artifacts checksum for ${SOURCE_ARTIFACTS_FILE} ..."
       ACTUAL_SOURCE_CHECKSUM=$(sha256sum "${SOURCE_ARTIFACTS_PATH}" | awk '{print $1}')

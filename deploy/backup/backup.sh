@@ -32,7 +32,7 @@
 #   - sha256sum (coreutils, present in postgres:16-alpine)
 # It does NOT depend on python3.
 # =============================================================================
-set -euo pipefail
+set -eu
 
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
