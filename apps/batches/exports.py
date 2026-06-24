@@ -53,9 +53,7 @@ import hashlib
 import io
 import json
 import logging
-import os
 import secrets
-import tempfile
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timedelta
@@ -67,6 +65,7 @@ from django.contrib.auth.hashers import check_password
 from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob, ExportArtifact
+from apps.batches.storage import ArtifactStorage, get_artifact_storage
 
 if TYPE_CHECKING:
     from apps.classifications.models import ClassificationResult
@@ -118,6 +117,11 @@ _FOUND_STATUSES = frozenset([
     "FOUND_WISHART_ENTITY",
     "COMPLETE_AFTER_WISHART",
 ])
+
+
+def _artifact_storage() -> ArtifactStorage:
+    """Return export artifact storage rooted at the compatibility EXPORT_DIR."""
+    return get_artifact_storage(root=EXPORT_DIR)
 
 
 def _escape_cell(value: str | int | None) -> str:
@@ -350,16 +354,16 @@ def _write_export_to_temp(
 
     Returns ``(tmp_path, rows_signature, row_count, byte_size)``.
     """
-    EXPORT_DIR.mkdir(exist_ok=True)
+    storage = _artifact_storage()
 
     sig_hasher = _RowsSignatureHasher()
     row_count = 0
+    tmp_path: Path | None = None
 
-    # Write to a temp file in the same directory so a later os.replace is atomic.
-    fd, tmp_path_str = tempfile.mkstemp(dir=EXPORT_DIR, prefix=f".tmp.{token}.")
-    tmp_path = Path(tmp_path_str)
     try:
-        with os.fdopen(fd, "wb") as raw_fh:
+        with storage.open_atomic_write(token) as writer:
+            tmp_path = writer.path
+            raw_fh = writer.file
             if fmt in ("csv.gz", "tsv.gz"):
                 delimiter = "," if fmt == "csv.gz" else "\t"
                 with gzip.GzipFile(fileobj=raw_fh, mode="wb") as gz_fh:
@@ -423,38 +427,35 @@ def _write_export_to_temp(
             else:
                 raise ValueError(f"Unsupported export format: {fmt!r}")
 
-    except Exception:
-        _discard_temp(tmp_path)
-        raise
+        if tmp_path is None:
+            raise RuntimeError("Artifact storage did not provide a temp path")
 
-    rows_signature = sig_hasher.hexdigest()
-    byte_size = tmp_path.stat().st_size
-    return tmp_path, rows_signature, row_count, byte_size
+        rows_signature = sig_hasher.hexdigest()
+        byte_size = storage.stat(tmp_path).byte_size
+        return tmp_path, rows_signature, row_count, byte_size
+
+    except Exception:
+        if tmp_path is not None:
+            _discard_temp(tmp_path)
+        raise
 
 
 def _finalize_temp(tmp_path: Path, token: str, fmt: str) -> Path:
     """Atomically rename a finished temp file into its final EXPORT_DIR slot."""
-    dest = EXPORT_DIR / f"{token}.{fmt}"
-    os.replace(tmp_path, dest)
-    return dest
+    return _artifact_storage().commit_atomic_write(tmp_path, token, fmt)
 
 
 def _discard_temp(tmp_path: Path) -> None:
     """Remove a temp file (dedup hit or error path); best-effort."""
     try:
-        if tmp_path.exists():
-            tmp_path.unlink()
+        _artifact_storage().delete(tmp_path)
     except OSError:
         pass
 
 
 def _checksum_file(path: Path) -> str:
     """Compute SHA-256 hex digest of a file."""
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    return _artifact_storage().checksum(path)
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +463,7 @@ def _checksum_file(path: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def _meta_path(token: str) -> Path:
-    return EXPORT_DIR / f"{token}.meta.json"
+    return _artifact_storage().meta_path(token)
 
 
 def _load_meta(token: str) -> dict[str, str] | None:
@@ -481,11 +482,13 @@ def _load_meta(token: str) -> dict[str, str] | None:
         }
 
     # Fallback: legacy JSON sidecar (for tests that write it directly)
-    p = _meta_path(token)
-    if not p.exists():
+    storage = _artifact_storage()
+    p = storage.meta_path(token)
+    if not storage.exists(p):
         return None
     try:
-        result = json.loads(p.read_text())
+        with storage.open(p, "rb") as fh:
+            result = json.loads(fh.read().decode("utf-8"))
         if isinstance(result, dict):
             return {str(k): str(v) for k, v in result.items()}
         return None
@@ -521,7 +524,7 @@ def _find_existing_artifact(job_id: str, fmt: str, rows_signature: str) -> Expor
     if artifact is None:
         return None
     # Verify the export file still exists
-    if not Path(artifact.path).exists():
+    if not _artifact_storage().exists(Path(artifact.path)):
         return None
     return artifact
 
@@ -608,7 +611,9 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
         "expires_at": expires_at_iso,
         "rows_signature": rows_signature,
     }
-    _meta_path(token).write_text(json.dumps(meta_dict))
+    meta_bytes = json.dumps(meta_dict).encode("utf-8")
+    storage = _artifact_storage()
+    storage.write_bytes_atomic(storage.meta_path(token), meta_bytes)
 
     return token, expires_at_iso
 
@@ -632,6 +637,8 @@ def get_export_metadata(token: str) -> dict[str, str] | None:
 
 def get_export_path(token: str) -> Path | None:
     """Return the file path for a valid export token, or None if not found/expired."""
+    storage = _artifact_storage()
+
     # Primary path: look up ExportArtifact in DB
     artifact = ExportArtifact.objects.filter(token=token).first()
     if artifact is not None:
@@ -639,7 +646,7 @@ def get_export_path(token: str) -> Path | None:
         if artifact.expires_at <= now:
             return None
         path = Path(artifact.path)
-        if not path.exists():
+        if not storage.exists(path):
             return None
         job = BatchJob.objects.filter(pk=artifact.job_id).first()
         if job is None:
@@ -667,8 +674,8 @@ def get_export_path(token: str) -> Path | None:
     if not _matches_current_rows_signature(meta):
         return None
     fmt = meta.get("fmt", "")
-    path = EXPORT_DIR / f"{token}.{fmt}"
-    return path if path.exists() else None
+    path = storage.local_path(token, fmt)
+    return path if storage.exists(path) else None
 
 
 # ---------------------------------------------------------------------------
