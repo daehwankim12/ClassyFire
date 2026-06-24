@@ -52,7 +52,13 @@ from django.views.decorators.http import require_http_methods
 from apps.batches.exports import create_export, get_export_path
 from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
-from apps.batches.services import create_job, recompute_job_counters
+from apps.batches.services import (
+    StructureKeyMismatchError,
+    StructureSubmissionConflictError,
+    StructureSubmissionError,
+    create_job,
+    submit_structure_for_item,
+)
 from apps.core.enums import BatchItemStatus
 from apps.core.security import UploadTooLargeError, check_upload_size, require_shared_access
 
@@ -237,61 +243,25 @@ def item_structure_view(request: HttpRequest, item_id: int) -> JsonResponse:
     if not structure:
         return JsonResponse({"error": "structure is required"}, status=400)
 
-    from apps.classifications.services import LookupTier, lookup_current_classification
-    from apps.compounds.validators import normalize_row
-
-    norm = normalize_row(structure)
-    if norm.error or norm.inchikey is None:
-        return JsonResponse(
-            {"error": f"Could not parse structure: {norm.error or 'unknown'}"},
-            status=400,
-        )
-
-    if item.inchikey and norm.inchikey != item.inchikey:
+    try:
+        item = submit_structure_for_item(item.pk, structure)
+    except StructureKeyMismatchError as exc:
         # FR-015: user submitted a structure whose InChIKey doesn't match the
         # expected InChIKey.  Leave the item as NEED_STRUCTURE (retryable) and
         # return a 422 error — do NOT permanently strand it as RESULT_KEY_MISMATCH
         # (that status is reserved for remote-response mismatches, FR-018).
         return JsonResponse(
             {
-                "error": (
-                    f"Submitted InChIKey {norm.inchikey} does not match "
-                    f"expected {item.inchikey}"
-                ),
-                "submitted_inchikey": norm.inchikey,
-                "expected_inchikey": item.inchikey,
+                "error": str(exc),
+                "submitted_inchikey": exc.submitted_inchikey,
+                "expected_inchikey": exc.expected_inchikey,
             },
             status=422,
         )
-
-    resolved_inchikey = norm.inchikey
-    item.inchikey = resolved_inchikey
-
-    result = lookup_current_classification(resolved_inchikey)
-    if result is not None:
-        item.status = (
-            BatchItemStatus.FOUND_LIVE_CACHE
-            if result.tier == LookupTier.LIVE
-            else BatchItemStatus.FOUND_SEED_CACHE
-        )
-        item.save(update_fields=["status", "inchikey"])
-    elif job.remote_enabled:
-        from apps.batches.services import _get_or_create_compound, _get_or_create_remote_task
-
-        compound = _get_or_create_compound(
-            resolved_inchikey, structure, norm.canonical_smiles, norm.inchi
-        )
-        item.compound = compound
-        item.status = BatchItemStatus.PENDING_CLASSIFICATION
-        item.save(update_fields=["status", "inchikey", "compound"])
-        _get_or_create_remote_task(resolved_inchikey, compound)
-    else:
-        item.message = "Structure provided; remote classification disabled."
-        item.save(update_fields=["inchikey", "message"])
-
-    # Recompute job counters after every structure resubmit — critical for
-    # cache-hit paths (FOUND_*) where no remote fan-out ever fires.
-    recompute_job_counters(job.pk)
+    except StructureSubmissionConflictError as exc:
+        return JsonResponse({"error": str(exc)}, status=409)
+    except StructureSubmissionError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
 
     return JsonResponse({"status": item.status})
 

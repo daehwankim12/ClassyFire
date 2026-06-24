@@ -13,6 +13,8 @@ from django.db.models import Q
 
 from apps.core.enums import ACTIVE_TASK_STATES, QueryState, TaskState
 
+INCHIKEY_REGEX = r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"
+
 
 class RemoteTask(models.Model):
     """A unit of outstanding remote classification work for one InChIKey."""
@@ -51,8 +53,8 @@ class RemoteTask(models.Model):
         db_table = "remote_tasks"
         constraints = [
             models.CheckConstraint(
-                name="remote_task_inchikey_len27",
-                condition=Q(inchikey__length=27),
+                name="remote_task_inchikey_format",
+                condition=Q(inchikey__regex=INCHIKEY_REGEX),
             ),
             # Only ONE active task per InChIKey: a partial unique index over the
             # active states (everything except DONE). DONE rows do not conflict.
@@ -77,6 +79,11 @@ class RemoteTask(models.Model):
 class RemoteQuery(models.Model):
     """A single submitted ClassyFire query/batch and its polling lifecycle."""
 
+    provider = models.CharField(
+        max_length=32,
+        default="wishart",
+        help_text="Remote provider namespace for upstream query ids.",
+    )
     remote_query_id = models.TextField(
         null=True, blank=True, help_text="Upstream query id once submitted."
     )
@@ -93,6 +100,12 @@ class RemoteQuery(models.Model):
 
     class Meta:
         db_table = "remote_queries"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "remote_query_id"],
+                name="remote_query_provider_remote_id_unique",
+            ),
+        ]
         indexes = [
             models.Index(fields=["state", "next_poll_at"], name="remote_query_poll_idx"),
         ]
@@ -136,8 +149,12 @@ class RemoteQueryItem(models.Model):
         db_table = "remote_query_items"
         constraints = [
             models.CheckConstraint(
-                name="remote_query_item_inchikey_len27",
-                condition=Q(inchikey__isnull=True) | Q(inchikey__length=27),
+                name="remote_query_item_inchikey_format",
+                condition=Q(inchikey__isnull=True) | Q(inchikey__regex=INCHIKEY_REGEX),
+            ),
+            models.UniqueConstraint(
+                fields=["query", "task"],
+                name="remote_query_item_query_task_unique",
             ),
         ]
         indexes = [

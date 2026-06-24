@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
+from django.db import IntegrityError
 from django.test import Client
 
 # ---------------------------------------------------------------------------
@@ -339,33 +340,55 @@ def test_structured_miss_remote_disabled_does_not_create_remote_task():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_key_only_remote_task_gets_structure_attached_later():
-    """A later structure submission attaches to the active key-only task."""
+def test_structured_miss_does_not_create_remote_task_when_remote_disabled():
+    """Structured miss + remote disabled is delayed locally, not queued."""
     from apps.batches.services import create_job
     from apps.core.enums import BatchItemStatus
     from apps.remote.models import RemoteTask
 
-    first_job, _secret = create_job(
+    job, _secret = create_job(
+        [{"raw": ETHANOL_SMILES, "row_index": 0}],
+        remote_enabled=False,
+    )
+    item = job.items.get()
+
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.inchikey == ETHANOL_INCHIKEY
+    assert item.compound_id is not None
+    assert not RemoteTask.objects.filter(inchikey=ETHANOL_INCHIKEY).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_key_only_remote_task_gets_structure_attached_later():
+    """A later structured submission attaches compound_id to the active key task."""
+    from apps.batches.services import create_job
+    from apps.compounds.models import CompoundStructure
+    from apps.core.enums import BatchItemStatus
+    from apps.remote.models import RemoteTask
+
+    key_job, _secret = create_job(
         [{"raw": ETHANOL_INCHIKEY, "row_index": 0}],
         remote_enabled=True,
     )
-    first_item = first_job.items.get()
+    key_item = key_job.items.get()
     task = RemoteTask.objects.get(inchikey=ETHANOL_INCHIKEY)
 
-    assert first_item.status == BatchItemStatus.PENDING_CLASSIFICATION
-    assert first_item.compound is None
-    assert task.compound is None
+    assert key_item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert key_item.compound_id is None
+    assert task.compound_id is None
+    assert not CompoundStructure.objects.filter(inchikey=ETHANOL_INCHIKEY).exists()
 
-    second_job, _secret = create_job(
+    struct_job, _secret = create_job(
         [{"raw": ETHANOL_SMILES, "row_index": 0}],
         remote_enabled=True,
     )
-    second_item = second_job.items.get()
+    struct_item = struct_job.items.get()
     task.refresh_from_db()
 
-    assert second_item.status == BatchItemStatus.PENDING_CLASSIFICATION
-    assert second_item.compound is not None
-    assert task.compound_id == second_item.compound_id
+    assert struct_item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert struct_item.compound_id is not None
+    assert task.compound_id == struct_item.compound_id
+    assert CompoundStructure.objects.filter(inchikey=ETHANOL_INCHIKEY).count() == 1
 
 
 @pytest.mark.django_db(transaction=True)
@@ -625,6 +648,66 @@ def test_get_or_create_compound_already_exists_no_error():
     assert CompoundStructure.objects.filter(inchikey=ASPIRIN_INCHIKEY).count() == 1
 
 
+@pytest.mark.django_db(transaction=True)
+def test_get_or_create_compound_recovers_from_concurrent_unique_race(monkeypatch):
+    """Concurrent structure creates must converge on one unique compound row."""
+    from apps.batches import services
+    from apps.batches.services import _get_or_create_compound
+    from apps.compounds.models import CompoundStructure
+
+    CompoundStructure.objects.create(
+        inchikey=ETHANOL_INCHIKEY,
+        original_input=ETHANOL_INCHIKEY,
+    )
+
+    class FirstLookupMiss:
+        def filter(self, **_kwargs):
+            return self
+
+        def order_by(self, *_fields):
+            return self
+
+        def first(self):
+            return None
+
+    original_select_for_update = services.CompoundStructure.objects.select_for_update
+    select_for_update_calls = 0
+
+    def fake_select_for_update(*args, **kwargs):
+        nonlocal select_for_update_calls
+        select_for_update_calls += 1
+        if select_for_update_calls == 1:
+            return FirstLookupMiss()
+        return original_select_for_update(*args, **kwargs)
+
+    def raise_concurrent_unique_insert(*_args, **_kwargs):
+        raise IntegrityError("simulated concurrent unique insert")
+
+    monkeypatch.setattr(
+        services.CompoundStructure.objects,
+        "create",
+        raise_concurrent_unique_insert,
+    )
+    monkeypatch.setattr(
+        services.CompoundStructure.objects,
+        "select_for_update",
+        fake_select_for_update,
+    )
+
+    compound = _get_or_create_compound(
+        ETHANOL_INCHIKEY,
+        ETHANOL_SMILES,
+        ETHANOL_SMILES,
+        None,
+    )
+
+    assert compound is not None
+    compound = CompoundStructure.objects.get(inchikey=ETHANOL_INCHIKEY)
+    assert compound.canonical_smiles == ETHANOL_SMILES
+    assert compound.original_input == ETHANOL_SMILES
+    assert CompoundStructure.objects.filter(inchikey=ETHANOL_INCHIKEY).count() == 1
+
+
 # ---------------------------------------------------------------------------
 # Structure resubmit: job counter + status update (bug fix)
 # ---------------------------------------------------------------------------
@@ -639,12 +722,11 @@ LTRP_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"
 
 @pytest.mark.django_db(transaction=True)
 def test_api_structure_resubmit_cache_hit_updates_counters():
-    """BUG FIX: structure resubmit that resolves to a cache hit must update job counters.
+    """Structure resubmit that resolves to a cache hit must update job counters.
 
     When the submitted structure is in the seed/live cache, the item flips to
-    FOUND_SEED_CACHE/FOUND_LIVE_CACHE with NO remote fan-out.  Previously the
-    job's need_structure_count stayed too high and completed_count too low,
-    leaving the job stuck IN_PROGRESS forever.  This test asserts the fix.
+    FOUND_SEED_CACHE/FOUND_LIVE_CACHE with no remote fan-out, so counters must
+    be recomputed immediately in the resubmit path.
     """
     import json as _json
 
@@ -750,7 +832,7 @@ def test_api_structure_resubmit_pending_updates_counters():
 
 
 # ---------------------------------------------------------------------------
-# Fix #2: overlong row preserves bounded original_input + explicit message
+# Overlong row handling: preserve bounded original_input + explicit message
 # ---------------------------------------------------------------------------
 
 

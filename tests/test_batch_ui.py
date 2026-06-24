@@ -9,12 +9,15 @@ These tests cover:
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from django.test import Client
 
 from apps.batches.ingest import parse_text_input
 from apps.batches.services import create_job
 from apps.core.enums import BatchItemStatus
+from apps.core.security import MAX_STRUCTURE_LEN
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -296,6 +299,98 @@ def test_api_structure_key_mismatch_leaves_need_structure():
     assert "error" in data
 
     # Item must remain NEED_STRUCTURE (retryable), not RESULT_KEY_MISMATCH
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_api_structure_resubmit_rejects_bare_inchikey():
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.get()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+    job.remote_enabled = True
+    job.save(update_fields=["remote_enabled"])
+
+    client = Client()
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=json.dumps({"structure": GHOST_INCHIKEY, "secret": secret}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert "structure" in response.json()["error"].lower()
+
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+    assert item.compound_id is None
+
+    from apps.remote.models import RemoteTask
+
+    assert not RemoteTask.objects.filter(inchikey=GHOST_INCHIKEY).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_structure_resubmit_rejects_non_need_structure_item():
+    rows = [{"raw": CAFFEINE_SMILES, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.get()
+    assert item.status != BatchItemStatus.NEED_STRUCTURE
+
+    client = Client()
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=json.dumps({"structure": CAFFEINE_SMILES, "secret": secret}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 409
+    item.refresh_from_db()
+    assert item.status != BatchItemStatus.PENDING_CLASSIFICATION
+
+
+@pytest.mark.django_db(transaction=True)
+def test_structure_resubmit_rejects_snapshotted_item():
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.get()
+    item.classification_snapshot = {"source": "already-resolved"}
+    item.save(update_fields=["classification_snapshot"])
+
+    client = Client()
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=json.dumps({"structure": GHOST_SMILES, "secret": secret}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 409
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_structure_resubmit_rejects_oversized_structure(monkeypatch):
+    rows = [{"raw": GHOST_INCHIKEY, "row_index": 0}]
+    job, secret = create_job(rows, remote_enabled=False)
+    item = job.items.get()
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("oversized structure reached normalization")
+
+    monkeypatch.setattr("apps.batches.services.normalize_row", fail_if_called)
+
+    client = Client()
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=json.dumps({"structure": "C" * (MAX_STRUCTURE_LEN + 1), "secret": secret}),
+        content_type="application/json",
+    )
+
+    assert response.status_code == 400
+    assert "exceeds maximum length" in response.json()["error"]
     item.refresh_from_db()
     assert item.status == BatchItemStatus.NEED_STRUCTURE
 

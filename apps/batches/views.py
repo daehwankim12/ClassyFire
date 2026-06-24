@@ -20,10 +20,14 @@ from django.shortcuts import get_object_or_404, redirect, render
 
 from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
-from apps.batches.services import _get_or_create_remote_task, create_job, recompute_job_counters
-from apps.classifications.services import lookup_current_classification
+from apps.batches.services import (
+    StructureKeyMismatchError,
+    StructureSubmissionConflictError,
+    StructureSubmissionError,
+    create_job,
+    submit_structure_for_item,
+)
 from apps.compounds.models import CompoundStructure
-from apps.compounds.validators import normalize_row
 from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
     UploadTooLargeError,
@@ -67,7 +71,7 @@ def submit_view(request: HttpRequest) -> HttpResponse:
         # Handle file upload
         file = request.FILES.get("input_file")
         if file:
-            # Guard: reject oversize uploads before reading content (Fix #5).
+            # Reject oversize uploads before reading content.
             # file.size may be None when the upload size is unknown; in that
             # case we fall through and let the read proceed (no size to check).
             try:
@@ -202,57 +206,21 @@ def structure_form_view(request: HttpRequest, item_id: int, secret: str) -> Http
         if not submitted_structure:
             error = "Please enter a structure (SMILES or InChI)."
         else:
-            # FR-015 Key-match guard
-            norm = normalize_row(submitted_structure)
-
-            if norm.error or norm.inchikey is None:
-                error = f"Could not parse structure: {norm.error or 'unknown error'}"
-            elif item.inchikey and norm.inchikey != item.inchikey:
-                # Mismatch — mark and show error
+            try:
+                submit_structure_for_item(item.pk, submitted_structure)
+            except StructureKeyMismatchError as exc:
+                # Mismatch remains retryable: leave the item unchanged and show
+                # an error so the user can submit a matching structure.
                 error = (
-                    f"RESULT_KEY_MISMATCH: submitted structure InChIKey "
-                    f"({norm.inchikey}) does not match expected InChIKey "
-                    f"({item.inchikey})."
+                    f"Structure mismatch: submitted InChIKey "
+                    f"({exc.submitted_inchikey}) does not match expected InChIKey "
+                    f"({exc.expected_inchikey})."
                 )
-                # Update item status to RESULT_KEY_MISMATCH but don't save yet
-                # (spec says "show error, item status unchanged" per test)
+            except StructureSubmissionConflictError as exc:
+                return HttpResponse(str(exc), status=409)
+            except StructureSubmissionError as exc:
+                error = str(exc)
             else:
-                # Keys match (or item has no prior inchikey) — run classification lookup
-                resolved_inchikey = norm.inchikey
-                item.inchikey = resolved_inchikey
-
-                result = lookup_current_classification(resolved_inchikey)
-                if result is not None:
-                    from apps.classifications.services import LookupTier
-
-                    item.status = (
-                        BatchItemStatus.FOUND_LIVE_CACHE
-                        if result.tier == LookupTier.LIVE
-                        else BatchItemStatus.FOUND_SEED_CACHE
-                    )
-                    item.save(update_fields=["status", "inchikey"])
-                elif job.remote_enabled:
-                    # Ensure compound exists
-                    from apps.batches.services import _get_or_create_compound
-
-                    compound = _get_or_create_compound(
-                        resolved_inchikey,
-                        submitted_structure,
-                        norm.canonical_smiles,
-                        norm.inchi,
-                    )
-                    item.compound = compound
-                    item.status = BatchItemStatus.PENDING_CLASSIFICATION
-                    item.save(update_fields=["status", "inchikey", "compound"])
-                    _get_or_create_remote_task(resolved_inchikey, compound)
-                else:
-                    item.message = "Structure provided but no remote classification available."
-                    item.save(update_fields=["inchikey", "message"])
-
-                # Recompute job counters after every structure resubmit — critical
-                # for cache-hit paths (FOUND_*) where no remote fan-out fires.
-                recompute_job_counters(job.pk)
-
                 return redirect(f"/jobs/{job.pk}/{secret}/")
 
     return render(

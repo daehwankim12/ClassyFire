@@ -9,11 +9,14 @@ schedule, circuit-breaker behaviour, and REMOTE_ENABLED=false.
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
+from django.test import Client
 from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob
+from apps.batches.services import create_job
 from apps.classifications.models import ClassificationHistory, ClassyfireLive
 from apps.core.enums import (
     BatchItemStatus,
@@ -34,6 +37,8 @@ pytestmark = pytest.mark.django_db(transaction=True)
 IK_A = "RDHQFKQIGNGIED-MRVPVSSYSA-N"
 IK_B = "WQZGKKKJIJFFOK-GASJEMHNSA-N"
 IK_C = "AAAABBBBCCCCDD-EEEEFFFFFF-N"
+ETHANOL_INCHIKEY = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+ETHANOL_SMILES = "CCO"
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +186,56 @@ def test_entity_miss_no_structure_sets_need_structure():
     assert task.state == TaskState.DONE
     item = BatchItem.objects.get(job=job, inchikey=IK_C)
     assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+
+def test_need_structure_then_submit_structure_and_complete_remote_calculation():
+    job, secret = create_job(
+        [{"raw": ETHANOL_INCHIKEY, "row_index": 0}],
+        remote_enabled=True,
+    )
+    item = job.items.get()
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert item.compound_id is None
+
+    provider = MockProvider(submit_query_ids=["q-need-structure"])
+    worker = _worker(provider)
+    assert worker.tick() is True
+
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+    assert RemoteTask.objects.get(inchikey=ETHANOL_INCHIKEY).state == TaskState.DONE
+
+    client = Client()
+    response = client.post(
+        f"/api/items/{item.pk}/structure",
+        data=json.dumps({"structure": ETHANOL_SMILES, "secret": secret}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+
+    item.refresh_from_db()
+    task = RemoteTask.objects.get(
+        inchikey=ETHANOL_INCHIKEY,
+        state__in=[TaskState.READY, TaskState.LOCKED, TaskState.POLL_WAIT],
+    )
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert item.compound_id is not None
+    assert task.compound_id == item.compound_id
+
+    assert worker.tick() is True
+    task.refresh_from_db()
+    assert task.state == TaskState.POLL_WAIT
+
+    provider.poll_script["q-need-structure"] = [
+        build_query_response([build_raw(ETHANOL_INCHIKEY)])
+    ]
+    RemoteTask.objects.filter(pk=task.pk).update(next_run_at=timezone.now())
+    assert worker.tick() is True
+
+    item.refresh_from_db()
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    assert item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
 
 
 def test_entity_miss_with_structure_submits_query():
@@ -382,9 +437,9 @@ def test_multi_result_batch_resolves_every_task(settings):
     # before the fix.
     settings.REMOTE_BATCH_SIZE = 3
     job = _job()
-    for ik in (IK_A, IK_B, IK_C):
+    for row, ik in enumerate((IK_A, IK_B, IK_C)):
         comp = _compound(ik)
-        _item(job, ik, 0, compound=comp)
+        _item(job, ik, row, compound=comp)
         queue.enqueue_task(ik, compound_id=comp.id)
 
     response = build_query_response(
@@ -436,9 +491,9 @@ def test_partial_response_resolves_present_and_retries_absent(settings):
     # absent one is NOT stranded — it retries per the normal backoff rules.
     settings.REMOTE_BATCH_SIZE = 3
     job = _job()
-    for ik in (IK_A, IK_B, IK_C):
+    for row, ik in enumerate((IK_A, IK_B, IK_C)):
         comp = _compound(ik)
-        _item(job, ik, 0, compound=comp)
+        _item(job, ik, row, compound=comp)
         queue.enqueue_task(ik, compound_id=comp.id)
 
     # IK_C is missing from the response.
@@ -477,9 +532,9 @@ def test_mismatch_key_in_batch_marks_offending_task(settings):
     # that task only; the others resolve normally.
     settings.REMOTE_BATCH_SIZE = 2
     job = _job()
-    for ik in (IK_A, IK_B):
+    for row, ik in enumerate((IK_A, IK_B)):
         comp = _compound(ik)
-        _item(job, ik, 0, compound=comp)
+        _item(job, ik, row, compound=comp)
         queue.enqueue_task(ik, compound_id=comp.id)
 
     # We patch parse_results so the IK_B task is handed an entity whose key !=
