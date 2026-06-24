@@ -579,14 +579,20 @@ def test_backup_checksum_matches_file(tmp_path):
     assert manifest["checksum"] == checksum
 
 
-def test_backup_tables_listed_in_manifest(tmp_path):
+def test_backup_excludes_seed_in_manifest(tmp_path):
+    """Manifest must record the exclude pattern, not an explicit table list.
+
+    The backup now dumps the FULL database excluding classyfire_seed* rather
+    than listing tables to include.  The manifest records the exclude glob.
+    """
     from apps.operations.backup import run_backup_injectable
 
     manifest = run_backup_injectable(tmp_path, _fake_dump_fn)
-    assert "classyfire_live" in manifest["tables"]
-    assert "batch_jobs" in manifest["tables"]
-    assert "system_events" in manifest["tables"]
-    assert "classyfire_seed" not in manifest["tables"]
+    # New: manifest records the exclude pattern, not an include list.
+    assert "excludes" in manifest
+    assert "classyfire_seed" in manifest["excludes"]
+    # No explicit table list — we dump the full DB minus seed.
+    assert "tables" not in manifest
 
 
 # ---------------------------------------------------------------------------

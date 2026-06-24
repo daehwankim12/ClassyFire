@@ -3,6 +3,17 @@
 The actual pg_dump/pg_restore subprocess is isolated behind _run_dump() so
 tests can monkeypatch it without touching real binaries.
 
+Dump strategy
+─────────────
+We dump the FULL database and EXCLUDE only the rebuildable seed tables.
+The ``classyfire_seed*`` pattern covers:
+  - classyfire_seed          — base seed table (re-importable from Zenodo)
+  - classyfire_seed_v<N>     — versioned physical tables (same source)
+  - classyfire_seed_current  — view (pg_dump skips views with --exclude-table)
+
+Everything else — compounds, batch jobs/items with their submitted structures,
+remote tasks + provenance, classification live/history, operations — IS dumped.
+
 Retention policy (configurable via settings):
   - BACKUP_DAILY_COUNT   (default 7)
   - BACKUP_WEEKLY_COUNT  (default 4)
@@ -17,6 +28,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +39,7 @@ from django.conf import settings
 # Injectable subprocess boundary
 # ---------------------------------------------------------------------------
 
+
 def _run_dump(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     """Run pg_dump/pg_restore. Isolated for monkeypatching in tests."""
     return subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -35,6 +48,7 @@ def _run_dump(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _pg_dump_bin() -> str:
     return getattr(settings, "PG_DUMP_BIN", os.environ.get("PG_DUMP_BIN", "pg_dump"))
@@ -63,27 +77,15 @@ def _db_params() -> dict[str, str]:
     }
 
 
-def _backup_tables() -> list[str]:
-    tables = [
-        "classyfire_live",
-        "classification_history",
-        "batch_jobs",
-        "batch_items",
-        "remote_tasks",
-        "remote_queries",
-        "remote_query_items",
-        "chemont_nodes",
-        "seed_imports",
-        "system_events",
-    ]
-    if getattr(settings, "BACKUP_INCLUDE_SEED_TABLE", False):
-        tables.append("classyfire_seed")
-    return tables
+def _seed_exclude_pattern() -> str:
+    """Return the pg_dump --exclude-table glob pattern for seed tables."""
+    return "classyfire_seed*"
 
 
 # ---------------------------------------------------------------------------
 # Retention
 # ---------------------------------------------------------------------------
+
 
 def _classify_backup_age(ts: datetime, now: datetime) -> str:
     """Return 'daily', 'weekly', or 'monthly' bucket for a backup timestamp."""
@@ -137,6 +139,12 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
                 dump_path = backup_dir / data.get("file", "")
                 if dump_path.exists():
                     dump_path.unlink()
+                # Also prune associated media archive if present.
+                media_file = data.get("media_file") or ""
+                if media_file:
+                    media_path = backup_dir / media_file
+                    if media_path.exists():
+                        media_path.unlink()
             except (KeyError, OSError, json.JSONDecodeError):
                 pass
             try:
@@ -153,11 +161,27 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
 
 
 # ---------------------------------------------------------------------------
+# Media archive helper
+# ---------------------------------------------------------------------------
+
+
+def _archive_media(media_dir: Path, archive_path: Path) -> str | None:
+    """Create a tar.gz of media_dir at archive_path. Returns sha256 or None."""
+    if not media_dir.exists() or not any(media_dir.iterdir()):
+        return None
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(str(media_dir), arcname=media_dir.name)
+    return _sha256_file(archive_path)
+
+
+# ---------------------------------------------------------------------------
 # Core backup
 # ---------------------------------------------------------------------------
 
+
 def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
-    """Run a backup: dump, checksum, manifest, retention, log event.
+    """Run a backup: dump (excluding seed tables), archive media, checksum,
+    manifest, retention, log event.
 
     Returns the manifest dict.
     """
@@ -174,11 +198,6 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
 
     db = _db_params()
     pg_dump = _pg_dump_bin()
-    tables = _backup_tables()
-
-    table_args: list[str] = []
-    for t in tables:
-        table_args += ["-t", t]
 
     cmd = [
         pg_dump,
@@ -187,19 +206,27 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
         "-U", db["user"],
         "-d", db["name"],
         "-Fc",
+        f"--exclude-table={_seed_exclude_pattern()}",
         "-f", str(dump_path),
-        *table_args,
     ]
 
     result = _run_dump(cmd)
 
     checksum = _sha256_file(dump_path)
 
+    # Archive media (upload + export) artifacts.
+    media_dir = Path(getattr(settings, "MEDIA_ROOT", "/app/media"))
+    media_archive_filename = f"classyfire_media_{timestamp}.tar.gz"
+    media_archive_path = backup_dir / media_archive_filename
+    media_checksum = _archive_media(media_dir, media_archive_path)
+
     manifest: dict[str, Any] = {
         "timestamp": now.isoformat(),
         "file": dump_filename,
         "checksum": checksum,
-        "tables": tables,
+        "media_file": media_archive_filename if media_checksum else None,
+        "media_checksum": media_checksum,
+        "excludes": _seed_exclude_pattern(),
         "status": "ok",
         "stderr": result.stderr or "",
     }
@@ -222,7 +249,11 @@ def run_backup_injectable(
     backup_dir: Path,
     run_dump_fn: Any,
 ) -> dict[str, Any]:
-    """Same as run_backup but accepts an injectable dump function (for tests)."""
+    """Same as run_backup but accepts an injectable dump function (for tests).
+
+    run_dump_fn signature: (cmd: list[str], dump_path: Path) -> None
+    The function is responsible for writing the dump file at dump_path.
+    """
     from apps.operations.models import SystemEvent
 
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -233,11 +264,6 @@ def run_backup_injectable(
 
     db = _db_params()
     pg_dump = _pg_dump_bin()
-    tables = _backup_tables()
-
-    table_args: list[str] = []
-    for t in tables:
-        table_args += ["-t", t]
 
     cmd = [
         pg_dump,
@@ -246,8 +272,8 @@ def run_backup_injectable(
         "-U", db["user"],
         "-d", db["name"],
         "-Fc",
+        f"--exclude-table={_seed_exclude_pattern()}",
         "-f", str(dump_path),
-        *table_args,
     ]
 
     run_dump_fn(cmd, dump_path)
@@ -258,7 +284,9 @@ def run_backup_injectable(
         "timestamp": now.isoformat(),
         "file": dump_filename,
         "checksum": checksum,
-        "tables": tables,
+        "media_file": None,
+        "media_checksum": None,
+        "excludes": _seed_exclude_pattern(),
         "status": "ok",
         "stderr": "",
     }
@@ -278,8 +306,51 @@ def run_backup_injectable(
 
 
 # ---------------------------------------------------------------------------
-# Restore smoke test
+# Restore
 # ---------------------------------------------------------------------------
+
+
+def restore_from_manifest(
+    manifest: dict[str, Any],
+    backup_dir: Path,
+    target_db: str,
+    run_restore_fn: Any = None,
+) -> None:
+    """Restore a DB dump from a manifest dict into target_db.
+
+    Validates the checksum before restoring.
+    run_restore_fn: injectable for tests; signature (cmd: list, manifest: dict) -> None
+    """
+    dump_path = backup_dir / manifest["file"]
+
+    # Validate checksum before restoring.
+    actual = _sha256_file(dump_path)
+    expected = manifest.get("checksum", "")
+    if actual != expected:
+        raise ValueError(
+            f"Checksum mismatch for {manifest['file']}: "
+            f"expected {expected}, got {actual}"
+        )
+
+    db = _db_params()
+    pg_restore = _pg_restore_bin()
+
+    cmd = [
+        pg_restore,
+        "-h", db["host"],
+        "-p", db["port"],
+        "-U", db["user"],
+        "-d", target_db,
+        "--clean",
+        "--if-exists",
+        str(dump_path),
+    ]
+
+    if run_restore_fn is not None:
+        run_restore_fn(cmd, manifest)
+    else:
+        _run_dump(cmd)
+
 
 def restore_smoke_test(
     backup_dir: Path | None = None,
