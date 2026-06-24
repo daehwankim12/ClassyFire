@@ -53,11 +53,13 @@ from __future__ import annotations
 import secrets
 import uuid
 from collections.abc import Iterable
+from datetime import timedelta
 from typing import cast
 
+from django.conf import settings
 from django.contrib.auth.hashers import make_password
 from django.db import IntegrityError, transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.batches.ingest import ingest_rows
@@ -566,7 +568,7 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
     - Status is derived from current item state on every call; if pending items
       appear later, a previously COMPLETE job can return to IN_PROGRESS.
     """
-    from django.db.models import Count, Q
+    from django.db.models import Count
 
     terminal_complete = (
         BatchItemStatus.FOUND_LIVE_CACHE,
@@ -754,6 +756,38 @@ def _process_chunk(
         BatchItem.objects.bulk_update(items, _ITEM_UPDATE_FIELDS)
 
 
+class IngestLeaseLost(Exception):  # noqa: N818 - mirrors remote LeaseLost contract
+    """Raised when a fenced ingest write hits 0 rows.
+
+    A worker captures its claim owner + lease version on the in-memory ``job``
+    handle at claim time. If another worker reclaims the job (bumping
+    ``claim_lease_version``), every subsequent fenced write from the stale worker
+    matches 0 rows and raises this, so a reclaimed/crashed worker can never keep
+    writing over the new owner's state.
+    """
+
+    def __init__(self, job_pk: object) -> None:
+        super().__init__(f"ingest lease lost for batch job {job_pk}")
+        self.job_pk = job_pk
+
+
+def _fenced_job_update(job: BatchJob, **fields: object) -> None:
+    """Apply a job write fenced to the captured claim owner + lease version.
+
+    Mirrors the remote-queue lease/version fencing: the update only lands if the
+    DB row still carries the same ``claimed_by`` and ``claim_lease_version`` the
+    worker held at claim time. A stale worker (one whose job was reclaimed) hits
+    0 rows and raises :class:`IngestLeaseLost`.
+    """
+    updated = BatchJob.objects.filter(
+        pk=job.pk,
+        claimed_by=job.claimed_by,
+        claim_lease_version=job.claim_lease_version,
+    ).update(**fields)
+    if updated != 1:
+        raise IngestLeaseLost(job.pk)
+
+
 def process_job_items(job: BatchJob) -> None:
     """Run local normalization + lookup for all PENDING items in *job*.
 
@@ -773,8 +807,11 @@ def process_job_items(job: BatchJob) -> None:
     This is the SYNCHRONOUS entry point unit tests drive inline; the management
     command claims a job and calls the same path.
     """
-    BatchJob.objects.filter(pk=job.pk).update(
-        processing_state=BatchProcessingState.NORMALIZING
+    # Fenced to the claim owner+version: a reclaimed (version-bumped) job makes
+    # this FIRST write hit 0 rows and raise IngestLeaseLost before any chunk
+    # work runs.
+    _fenced_job_update(
+        job, processing_state=BatchProcessingState.NORMALIZING
     )
 
     while True:
@@ -787,8 +824,8 @@ def process_job_items(job: BatchJob) -> None:
         if not chunk:
             break
 
-        BatchJob.objects.filter(pk=job.pk).update(
-            processing_state=BatchProcessingState.LOCAL_LOOKUP
+        _fenced_job_update(
+            job, processing_state=BatchProcessingState.LOCAL_LOOKUP
         )
         _process_chunk(
             chunk,
@@ -800,8 +837,8 @@ def process_job_items(job: BatchJob) -> None:
         # A restarted worker re-queries PENDING_NORMALIZATION (the true resume
         # frontier); the cursor is the durable, language-agnostic progress marker.
         last_row_order = chunk[-1].row_order
-        BatchJob.objects.filter(pk=job.pk).update(
-            processed_through_row_order=last_row_order
+        _fenced_job_update(
+            job, processed_through_row_order=last_row_order
         )
 
     recompute_job_counters(job.pk)
@@ -822,10 +859,17 @@ def claim_job_for_processing(worker_id: str) -> BatchJob | None:
     fresh lease so any-language worker can drive the same column. Returns the
     claimed job, or None when nothing needs work.
     """
+    stale_before = timezone.now() - timedelta(
+        seconds=getattr(settings, "INGEST_CLAIM_LEASE_SECONDS", 900)
+    )
     with transaction.atomic():
+        # Claim only never-claimed jobs (claimed_by is null) or jobs whose lease
+        # has gone stale (claimed_at older than the TTL). An actively-leased job
+        # is excluded, so a job being driven by another worker cannot be stolen.
         job = (
             BatchJob.objects.select_for_update(skip_locked=True)
             .filter(processing_state__in=CLAIMABLE_PROCESSING_STATES)
+            .filter(Q(claimed_by__isnull=True) | Q(claimed_at__lt=stale_before))
             .order_by("created_at", "id")
             .first()
         )
@@ -857,8 +901,17 @@ def process_claimed_job(job: BatchJob) -> None:
     """
     try:
         process_job_items(job)
+    except IngestLeaseLost:
+        # The lease was lost mid-run: another worker now owns this job. Do NOT
+        # park it FAILED - that would clobber the new owner's state. Propagate so
+        # the caller drops this stale handle.
+        raise
     except Exception as exc:
-        BatchJob.objects.filter(pk=job.pk).update(
+        # Fence the FAILED parking write too: a worker that lost its lease while
+        # raising some OTHER error must not stomp the new owner's state. If this
+        # fenced write itself finds the lease gone, let IngestLeaseLost propagate.
+        _fenced_job_update(
+            job,
             processing_state=BatchProcessingState.FAILED,
             status=BatchJobStatus.FAILED,
             processing_error=str(exc)[:2000],

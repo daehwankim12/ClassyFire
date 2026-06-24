@@ -196,6 +196,11 @@ MAX_ROWS_PER_JOB: int = env_int("MAX_ROWS_PER_JOB", 10_000)
 # Set to False only in tests or diagnostics that need the synchronous in-request
 # pipeline.
 INGEST_DEFER_HEAVY_PROCESSING: bool = env_bool("INGEST_DEFER_HEAVY_PROCESSING", True)
+# Ingest claim lease TTL. A claimed job is reclaimable by another worker only
+# after its lease goes stale (claimed_at older than this many seconds), which
+# lets a crashed worker's job resume while an actively-leased job is protected
+# from theft. Every processing write is fenced to the claim owner+version.
+INGEST_CLAIM_LEASE_SECONDS: int = env_int("INGEST_CLAIM_LEASE_SECONDS", 900)
 JOB_CREATE_RATE_LIMIT_PER_MINUTE: int = env_int("JOB_CREATE_RATE_LIMIT_PER_MINUTE", 30)
 JOB_CREATE_DAILY_ROW_CAP: int = env_int("JOB_CREATE_DAILY_ROW_CAP", 100_000)
 ACTIVE_JOB_CAP: int = env_int("ACTIVE_JOB_CAP", 20)

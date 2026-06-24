@@ -593,7 +593,9 @@ def test_deferred_row_cap_enforced_midstream():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_true_crash_and_reclaim_resumes_without_double_processing(monkeypatch):
+def test_true_crash_and_reclaim_resumes_without_double_processing(
+    monkeypatch, settings
+):
     """Claim a job, process+commit the FIRST chunk, then simulate a crash by
     abandoning the run mid-job (job left in a claimable LOCAL_LOOKUP state with
     items still PENDING_NORMALIZATION). RE-CLAIM via the real claim path and
@@ -608,6 +610,11 @@ def test_true_crash_and_reclaim_resumes_without_double_processing(monkeypatch):
     )
     from apps.compounds.models import CompoundStructure, CompoundUsage
     from apps.core.enums import BatchItemStatus, BatchProcessingState
+
+    # Lease TTL 0 so the "crashed" worker-A's lease is immediately stale and
+    # worker-B can reclaim via the real claim path within the same test (real
+    # crash recovery would simply wait out the configured TTL).
+    settings.INGEST_CLAIM_LEASE_SECONDS = 0
 
     # 5 distinct ethanol rows (same compound) so usage count is a precise
     # double-processing detector: each row increments usage exactly once.

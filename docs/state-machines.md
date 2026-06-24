@@ -288,6 +288,16 @@ The worker CLAIMS a job needing processing via
 `created_at, id`, flips it to `PARSING` with a fresh `claim_lease_version`
 (+ `claimed_by`/`claimed_at`), then runs the chunked, checkpointed pipeline.
 
+**Claim lease TTL + stale-reclaim (mirrors the remote queue, F-07).** The claim
+query additionally filters to jobs that are either *never claimed*
+(`claimed_by IS NULL`) **or** *stale* — `claimed_at < now() - INGEST_CLAIM_LEASE_SECONDS`
+(default 900s, env `INGEST_CLAIM_LEASE_SECONDS`). A job actively being driven by
+another worker (NORMALIZING/LOCAL_LOOKUP are claimable for crash-resume) is
+therefore **not** stealable until its lease goes stale, so a live worker is never
+preempted; a genuinely crashed worker's job becomes reclaimable once the TTL
+lapses, and the reclaim bumps `claim_lease_version` so the dead holder is fenced
+out.
+
 | State | Meaning | Claimable? |
 | --- | --- | --- |
 | `UPLOADING` | Raw upload being staged (reserved; current flow persists items in-request). | yes |
@@ -325,6 +335,20 @@ reprocesses ONLY those items, never double-processing already-resolved rows. The
 synchronous entry point `process_job_items(job)` drives the identical pipeline
 inline (used by the synchronous upload mode and unit tests); `manage.py
 process_jobs` claims + drives jobs durably.
+
+**Fenced processing writes (mirrors the remote queue lease/version fencing).**
+Every job-state write the worker makes — the `NORMALIZING` transition, the
+per-chunk `LOCAL_LOOKUP` transition, the per-chunk `processed_through_row_order`
+checkpoint, and the FAILED-parking write — goes through `_fenced_job_update`,
+which only updates the row when `claimed_by` + `claim_lease_version` still match
+the values captured on the in-memory job handle at claim time. If another worker
+reclaimed the job (bumping the version), the fenced write matches **0 rows** and
+raises `IngestLeaseLost`: a stale/crashed worker can never keep checkpointing or
+park a job FAILED over the new owner's state. On `IngestLeaseLost`,
+`process_claimed_job` re-raises WITHOUT the generic FAILED-parking path (the new
+owner now drives the job), and `manage.py process_jobs` logs it and claims the
+next job rather than crashing. This is the ingest-side analogue of the remote
+queue's lease-token + `lease_version` fencing (F-07).
 
 **Two upload-route modes (`INGEST_DEFER_HEAVY_PROCESSING`).** The web
 `submit_view` and API `create_job_view` run in one of two modes, selected by the

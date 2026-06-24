@@ -19,7 +19,11 @@ from typing import Any
 
 from django.core.management.base import BaseCommand
 
-from apps.batches.services import claim_job_for_processing, process_claimed_job
+from apps.batches.services import (
+    IngestLeaseLost,
+    claim_job_for_processing,
+    process_claimed_job,
+)
 
 
 class Command(BaseCommand):
@@ -53,6 +57,17 @@ class Command(BaseCommand):
                         break
                     time.sleep(idle_sleep)
                     continue
-                process_claimed_job(job)
+                try:
+                    process_claimed_job(job)
+                except IngestLeaseLost as exc:
+                    # Another worker reclaimed this job mid-run (our lease went
+                    # stale). The new owner now drives it; drop our stale handle
+                    # and claim the next job rather than crashing the worker.
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"lease lost for job {exc.job_pk}; "
+                            "another worker took over"
+                        )
+                    )
         except KeyboardInterrupt:  # pragma: no cover - operator Ctrl-C
             self.stdout.write(self.style.WARNING("process_jobs stopping"))
