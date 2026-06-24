@@ -13,6 +13,7 @@ _LIVE_QUERY = """
         cl.classification_version,
         cl.retrieved_at,
         cl.remote_query_id,
+        cl.result_id,
         cl.labels,
         kn.name        AS kingdom_name,
         kn.chemont_id  AS kingdom_chemont_id,

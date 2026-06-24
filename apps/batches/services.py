@@ -81,6 +81,50 @@ from apps.remote.models import RemoteTask
 _OVERLONG_PREVIEW_CHARS = 200
 
 
+def _pin_resolved_classification(item: BatchItem, snapshot: dict | None) -> None:
+    """Pin ``item.resolved_classification`` from a lookup snapshot's event id.
+
+    The snapshot carries ``result_id`` — the PK of the immutable
+    ClassificationResult event that materialized the current live row. Seed-tier
+    hits have no event (``result_id`` is None) and leave the FK null; the pinned
+    ``classification_snapshot`` JSON remains the provenance for those.
+    """
+    result_id = snapshot.get("result_id") if isinstance(snapshot, dict) else None
+    item.resolved_classification_id = result_id if result_id is not None else None
+
+
+def _reconcile_resolved_classification(job: BatchJob) -> None:
+    """Pin ``resolved_classification`` for resolved items missing the FK.
+
+    The remote fan-out (apps/remote, a separate workstream) pins the
+    ``classification_snapshot`` JSON — which now carries ``result_id`` — but does
+    not set the FK directly. This batches-owned reconciliation runs inside every
+    ``recompute_job_counters`` call (which the fan-out always invokes after
+    flipping item statuses), so the FK is pinned for the Wishart-entity and
+    remote-query-complete resolution paths too. Idempotent: only fills a null FK
+    from a snapshot's event id; never overwrites or unsets a pinned event.
+    """
+    resolved_statuses = (
+        BatchItemStatus.FOUND_LIVE_CACHE,
+        BatchItemStatus.FOUND_SEED_CACHE,
+        BatchItemStatus.FOUND_WISHART_ENTITY,
+        BatchItemStatus.COMPLETE_AFTER_WISHART,
+    )
+    candidates = BatchItem.objects.filter(
+        job=job,
+        status__in=resolved_statuses,
+        resolved_classification__isnull=True,
+        classification_snapshot__isnull=False,
+    ).only("pk", "classification_snapshot")
+    for item in candidates:
+        snapshot = item.classification_snapshot
+        result_id = snapshot.get("result_id") if isinstance(snapshot, dict) else None
+        if result_id is not None:
+            BatchItem.objects.filter(
+                pk=item.pk, resolved_classification__isnull=True
+            ).update(resolved_classification_id=result_id)
+
+
 class StructureSubmissionError(ValueError):
     """User-correctable structure submission error."""
 
@@ -274,10 +318,12 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
         resolved_inchikey = norm.inchikey
         item.inchikey = resolved_inchikey
         item.classification_snapshot = None
+        item.resolved_classification_id = None
 
         result = lookup_current_classification(resolved_inchikey)
         if result is not None:
             item.classification_snapshot = classification_lookup_snapshot(result)
+            _pin_resolved_classification(item, item.classification_snapshot)
             item.status = (
                 BatchItemStatus.FOUND_LIVE_CACHE
                 if result.tier == LookupTier.LIVE
@@ -288,6 +334,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                     "status",
                     "inchikey",
                     "classification_snapshot",
+                    "resolved_classification",
                 ]
             )
         else:
@@ -308,6 +355,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                         "compound",
                         "message",
                         "classification_snapshot",
+                        "resolved_classification",
                     ]
                 )
                 _get_or_create_remote_task(resolved_inchikey, compound)
@@ -321,6 +369,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                         "compound",
                         "message",
                         "classification_snapshot",
+                        "resolved_classification",
                     ]
                 )
 
@@ -336,6 +385,7 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
     the caller is responsible for calling item.save().
     """
     item.classification_snapshot = None
+    item.resolved_classification_id = None
 
     # Step 0: Guard — reject rows whose structure string exceeds MAX_STRUCTURE_LEN.
     # This check lives here (service layer) so it covers BOTH the UI and API paths.
@@ -367,6 +417,7 @@ def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
         result = lookup_current_classification(norm.inchikey)
         if result is not None:
             item.classification_snapshot = classification_lookup_snapshot(result)
+            _pin_resolved_classification(item, item.classification_snapshot)
             if result.tier == LookupTier.LIVE:
                 return BatchItemStatus.FOUND_LIVE_CACHE
             else:
@@ -450,6 +501,8 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
         if job is None:
             return
 
+        _reconcile_resolved_classification(job)
+
         counts = BatchItem.objects.filter(job=job).aggregate(
             total=Count("pk"),
             local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
@@ -527,6 +580,7 @@ def process_job_items(job: BatchJob) -> None:
                 "message",
                 "original_input",
                 "classification_snapshot",
+                "resolved_classification",
             ]
         )
 

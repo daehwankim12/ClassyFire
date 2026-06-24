@@ -255,7 +255,46 @@ entry to either terminal state.
 
 ---
 
-## 5. Other enums (no transition graph)
+## 5. `classification_results` — append-only immutable event log (F-05/F-20)
+
+Enum: `ResultKind`. Column: `classification_results.kind`. Table:
+`classification_results`.
+
+`classification_results` is an **append-only, immutable** event log. EVERY write
+to the classification store (`write_live_result`) appends exactly ONE row — one
+`INSERT`, and the row is **never `UPDATE`d or `DELETE`d** by any code path (Python
+today, a future Go/Rust writer that talks to the same Postgres schema tomorrow).
+`classyfire_live.result` is a FK to the event that materialized the current live
+row; superseded events stay in the table forever as the audit history.
+
+### `kind` — disposition of an event relative to the live pointer at write time
+
+| `kind` | Meaning | Live effect |
+|---|---|---|
+| `APPLIED` | Materialized the current live row (claimed an empty slot). | live created, `result` → this event |
+| `SUPERSEDED` | Overwrote an existing live row (prior row archived to `classification_history` first). | live updated in place, `result` → this event |
+| `REJECTED_MISMATCH` | Source returned a different InChIKey than requested. The mismatch is **STORED, not discarded**. | none (live unchanged) |
+| `REJECTED_LOWER_PRIORITY` | A strictly higher-trust row already exists. | none |
+| `REJECTED_STALE` | Same priority but the existing live row is newer-or-equal. | none |
+
+`requested_inchikey` is the key we asked for; `returned_inchikey` (nullable) is
+the key the source returned — they differ exactly on a `REJECTED_MISMATCH` event.
+`raw_json` carries the upstream payload and `raw_checksum` is the sha256 hex of
+its canonical JSON encoding (reproducible across languages). DB CHECK constraints
+enforce the 27-char InChIKey lengths and the 64-char hex checksum.
+
+`source_artifact` (FK → `source_artifacts`) links events emitted by the
+provenance-preserving official-import path (`SourceType.LAB_OFFICIAL_IMPORT`):
+stage → validate → record immutable `SourceArtifact` (sha256 + byte_size) → emit
+immutable event(s) → advance the live pointer. `source_artifacts` is likewise
+append-only by contract.
+
+`batch_items.resolved_classification` (FK → `classification_results`) pins the
+immutable event a resolved batch item used; exports read this pinned event (or the
+pinned `classification_snapshot` JSON) and **never re-query live**, so an export is
+byte-stable even after live is later superseded.
+
+## 6. Other enums (no transition graph)
 
 - `SourceType` + `SOURCE_PRIORITY` — provenance/trust of a `classyfire_live`
   row. Priority is stored as the integer column `classyfire_live.source_priority`

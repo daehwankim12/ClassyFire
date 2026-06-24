@@ -96,6 +96,17 @@ class BatchItem(models.Model):
         blank=True,
         help_text="Pinned classification labels/provenance used by this item.",
     )
+    resolved_classification = models.ForeignKey(
+        "classifications.ClassificationResult",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="batch_items",
+        help_text=(
+            "Immutable classification event pinned to this resolved item. The "
+            "new source of truth for exports (never re-queries live)."
+        ),
+    )
 
     class Meta:
         db_table = "batch_items"
