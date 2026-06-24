@@ -7,15 +7,17 @@ check constraint.
 """
 from __future__ import annotations
 
+import importlib
 import uuid
 
 import pytest
-from django.db import IntegrityError, connection, transaction
+from django.db import IntegrityError, connection, migrations, transaction
 from django.db.utils import DataError
 
 from apps.batches.models import BatchItem, BatchJob
 from apps.chemont.models import ChemOntNode
 from apps.classifications.models import ClassyfireSeed
+from apps.compounds.models import CompoundStructure
 from apps.core.enums import (
     SOURCE_PRIORITY,
     BatchItemStatus,
@@ -23,7 +25,7 @@ from apps.core.enums import (
     SourceType,
     TaskState,
 )
-from apps.remote.models import RemoteTask
+from apps.remote.models import RemoteQuery, RemoteQueryItem, RemoteTask
 
 VALID_INCHIKEY = "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"  # aspirin, exactly 27 chars
 VALID_INCHIKEY_2 = "RYYVLZVUVIJVGH-UHFFFAOYSA-N"  # caffeine, exactly 27 chars
@@ -240,3 +242,120 @@ def test_remote_task_has_queue_columns():
 
 def test_connection_is_postgres():
     assert connection.vendor == "postgresql"
+
+
+def _assert_runpython_before_constraint(
+    migration_module: str,
+    function_name: str,
+    constraint_name: str,
+) -> None:
+    module = importlib.import_module(migration_module)
+    operations = module.Migration.operations
+    runpython_index = next(
+        i
+        for i, operation in enumerate(operations)
+        if isinstance(operation, migrations.RunPython)
+        and operation.code.__name__ == function_name
+    )
+    constraint_index = next(
+        i
+        for i, operation in enumerate(operations)
+        if isinstance(operation, migrations.AddConstraint)
+        and operation.constraint.name == constraint_name
+    )
+    assert runpython_index < constraint_index
+
+
+def test_inchikey_regex_constraints_have_migration_preflights():
+    _assert_runpython_before_constraint(
+        "apps.compounds.migrations.0002_remove_compoundstructure_compound_structure_inchikey_len27_and_more",
+        "fail_on_invalid_compound_inchikeys",
+        "compound_structure_inchikey_format",
+    )
+    _assert_runpython_before_constraint(
+        "apps.compounds.migrations.0002_remove_compoundstructure_compound_structure_inchikey_len27_and_more",
+        "fail_on_invalid_compound_inchikeys",
+        "compound_usage_inchikey_format",
+    )
+    _assert_runpython_before_constraint(
+        "apps.batches.migrations.0003_remove_batchitem_batch_item_inchikey_len27_and_more",
+        "fail_on_invalid_batch_item_inchikeys",
+        "batch_item_inchikey_format",
+    )
+    _assert_runpython_before_constraint(
+        "apps.remote.migrations.0002_remove_remotequeryitem_remote_query_item_inchikey_len27_and_more",
+        "fail_on_invalid_remote_inchikeys",
+        "remote_task_inchikey_format",
+    )
+    _assert_runpython_before_constraint(
+        "apps.remote.migrations.0002_remove_remotequeryitem_remote_query_item_inchikey_len27_and_more",
+        "fail_on_invalid_remote_inchikeys",
+        "remote_query_item_inchikey_format",
+    )
+
+
+@pytest.mark.django_db
+def test_batch_item_job_row_order_is_unique():
+    job = BatchJob.objects.create(secret_hash="x")
+    BatchItem.objects.create(job=job, row_order=0, original_input="CCO")
+
+    with pytest.raises(IntegrityError):
+        with transaction.atomic():
+            BatchItem.objects.create(job=job, row_order=0, original_input="CCC")
+
+
+@pytest.mark.django_db
+def test_compound_structure_inchikey_is_unique():
+    CompoundStructure.objects.create(
+        original_input="CCO",
+        canonical_smiles="CCO",
+        inchikey=VALID_INCHIKEY,
+    )
+
+    with pytest.raises(IntegrityError):
+        with transaction.atomic():
+            CompoundStructure.objects.create(
+                original_input="duplicate",
+                canonical_smiles="CCO",
+                inchikey=VALID_INCHIKEY,
+            )
+
+
+@pytest.mark.django_db
+def test_inchikey_check_constraint_rejects_bad_format():
+    bad_format = "BSYNRYMUTXBXSQ-UHFFFAOYSA-1"
+    with pytest.raises((IntegrityError, DataError)):
+        with transaction.atomic():
+            RemoteTask.objects.create(inchikey=bad_format, state=TaskState.READY)
+
+
+@pytest.mark.django_db
+def test_remote_query_provider_remote_id_is_unique():
+    RemoteQuery.objects.create(
+        provider="wishart",
+        remote_query_id="query-duplicate",
+        payload_hash="hash-1",
+    )
+
+    with pytest.raises(IntegrityError):
+        with transaction.atomic():
+            RemoteQuery.objects.create(
+                provider="wishart",
+                remote_query_id="query-duplicate",
+                payload_hash="hash-2",
+            )
+
+
+@pytest.mark.django_db
+def test_real_postgres_constraints_reject_duplicate_query_item():
+    query = RemoteQuery.objects.create(
+        provider="wishart",
+        remote_query_id="query-items",
+        payload_hash="hash",
+    )
+    task = RemoteTask.objects.create(inchikey=VALID_INCHIKEY, state=TaskState.READY)
+    RemoteQueryItem.objects.create(query=query, task=task, inchikey=VALID_INCHIKEY)
+
+    with pytest.raises(IntegrityError):
+        with transaction.atomic():
+            RemoteQueryItem.objects.create(query=query, task=task, inchikey=VALID_INCHIKEY)

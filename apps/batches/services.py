@@ -73,6 +73,26 @@ from apps.remote.models import RemoteTask
 _OVERLONG_PREVIEW_CHARS = 200
 
 
+class StructureSubmissionError(ValueError):
+    """User-correctable structure submission error."""
+
+
+class StructureSubmissionConflictError(StructureSubmissionError):
+    """The target batch item is no longer eligible for structure submission."""
+
+
+class StructureKeyMismatchError(StructureSubmissionError):
+    """Submitted structure normalized to a different InChIKey than expected."""
+
+    def __init__(self, submitted_inchikey: str, expected_inchikey: str) -> None:
+        self.submitted_inchikey = submitted_inchikey
+        self.expected_inchikey = expected_inchikey
+        super().__init__(
+            f"Submitted InChIKey {submitted_inchikey} does not match "
+            f"expected {expected_inchikey}"
+        )
+
+
 def _generate_secret() -> tuple[str, str]:
     """Return (plaintext_secret, secret_hash).
 
@@ -99,22 +119,7 @@ def _get_or_create_compound(
     if canonical_smiles is None and inchi is None:
         return None
 
-    with transaction.atomic():
-        compound = (
-            CompoundStructure.objects.select_for_update()
-            .filter(inchikey=inchikey)
-            .order_by("created_at", "pk")
-            .first()
-        )
-        if compound is None:
-            return CompoundStructure.objects.create(
-                inchikey=inchikey,
-                original_input=original_input,
-                original_smiles=canonical_smiles,
-                canonical_smiles=canonical_smiles,
-                inchi=inchi,
-            )
-
+    def fill_missing_structure(compound: CompoundStructure) -> CompoundStructure:
         if not compound.canonical_smiles and not compound.inchi:
             compound.original_input = original_input
             compound.original_smiles = canonical_smiles
@@ -129,6 +134,31 @@ def _get_or_create_compound(
                 ]
             )
         return compound
+
+    with transaction.atomic():
+        compound = (
+            CompoundStructure.objects.select_for_update()
+            .filter(inchikey=inchikey)
+            .order_by("created_at", "pk")
+            .first()
+        )
+        if compound is not None:
+            return fill_missing_structure(compound)
+
+        try:
+            with transaction.atomic():
+                return CompoundStructure.objects.create(
+                    inchikey=inchikey,
+                    original_input=original_input,
+                    original_smiles=canonical_smiles,
+                    canonical_smiles=canonical_smiles,
+                    inchi=inchi,
+                )
+        except IntegrityError:
+            compound = CompoundStructure.objects.select_for_update().get(
+                inchikey=inchikey
+            )
+            return fill_missing_structure(compound)
 
 
 def _update_usage(inchikey: str) -> None:
@@ -165,10 +195,10 @@ def _get_or_create_remote_task(
     ).first()
     if existing is not None:
         if compound is not None and existing.compound_id is None:
-            RemoteTask.objects.filter(pk=existing.pk, compound__isnull=True).update(
-                compound=compound
+            RemoteTask.objects.filter(pk=existing.pk, compound_id__isnull=True).update(
+                compound_id=compound.pk
             )
-            existing.refresh_from_db(fields=["compound"])
+            existing.refresh_from_db(fields=["compound_id"])
         return existing
 
     # No active task found — create one in a savepoint.
@@ -181,10 +211,114 @@ def _get_or_create_remote_task(
             )
     except IntegrityError:
         # A concurrent create beat us; fetch the winner.
-        return RemoteTask.objects.filter(
+        existing = RemoteTask.objects.filter(
             inchikey=inchikey,
             state__in=ACTIVE_TASK_STATES,
         ).get()
+        if compound is not None and existing.compound_id is None:
+            RemoteTask.objects.filter(pk=existing.pk, compound_id__isnull=True).update(
+                compound_id=compound.pk
+            )
+            existing.refresh_from_db(fields=["compound_id"])
+        return existing
+
+
+def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
+    """Submit a missing structure for a NEED_STRUCTURE item.
+
+    All item state transitions happen while holding a row lock so stale form/API
+    submissions cannot overwrite a concurrent resolution.
+    """
+    try:
+        check_structure_length(structure)
+    except RowTooLongError as exc:
+        raise StructureSubmissionError(str(exc)) from exc
+
+    norm = normalize_row(structure)
+    if norm.error or norm.inchikey is None:
+        raise StructureSubmissionError(
+            f"Could not parse structure: {norm.error or 'unknown'}"
+        )
+    if norm.canonical_smiles is None and norm.inchi is None:
+        raise StructureSubmissionError(
+            "Structure submission must include a parseable SMILES or InChI structure."
+        )
+
+    with transaction.atomic():
+        item = (
+            BatchItem.objects.select_for_update()
+            .select_related("job")
+            .get(pk=item_id)
+        )
+        job = item.job
+
+        if item.status != BatchItemStatus.NEED_STRUCTURE:
+            raise StructureSubmissionConflictError(
+                "Structure can only be submitted for items that need a structure."
+            )
+        if item.classification_snapshot is not None:
+            raise StructureSubmissionConflictError(
+                "Item already has a classification snapshot."
+            )
+        if item.inchikey and norm.inchikey != item.inchikey:
+            raise StructureKeyMismatchError(norm.inchikey, item.inchikey)
+
+        resolved_inchikey = norm.inchikey
+        item.inchikey = resolved_inchikey
+        item.classification_snapshot = None
+
+        result = lookup_current_classification(resolved_inchikey)
+        if result is not None:
+            item.classification_snapshot = classification_lookup_snapshot(result)
+            item.status = (
+                BatchItemStatus.FOUND_LIVE_CACHE
+                if result.tier == LookupTier.LIVE
+                else BatchItemStatus.FOUND_SEED_CACHE
+            )
+            item.save(
+                update_fields=[
+                    "status",
+                    "inchikey",
+                    "classification_snapshot",
+                ]
+            )
+        else:
+            compound = _get_or_create_compound(
+                resolved_inchikey,
+                structure,
+                norm.canonical_smiles,
+                norm.inchi,
+            )
+            item.compound = compound
+            if job.remote_enabled:
+                item.status = BatchItemStatus.PENDING_CLASSIFICATION
+                item.message = None
+                item.save(
+                    update_fields=[
+                        "status",
+                        "inchikey",
+                        "compound",
+                        "message",
+                        "classification_snapshot",
+                    ]
+                )
+                _get_or_create_remote_task(resolved_inchikey, compound)
+            else:
+                item.status = BatchItemStatus.REMOTE_DELAYED
+                item.message = "Structure provided; remote classification disabled."
+                item.save(
+                    update_fields=[
+                        "status",
+                        "inchikey",
+                        "compound",
+                        "message",
+                        "classification_snapshot",
+                    ]
+                )
+
+    recompute_job_counters(item.job_id)
+    item.refresh_from_db()
+    return item
 
 
 def _process_item(item: BatchItem, *, remote_enabled: bool) -> BatchItemStatus:
@@ -282,7 +416,8 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
     - COMPLETE when remote_pending == 0  (no in-flight remote work remains)
     - NEED_STRUCTURE items do NOT block COMPLETE; they await user input and are
       shown separately via need_structure_count.
-    - A job that is already COMPLETE is never regressed back to IN_PROGRESS.
+    - Status is derived from current item state on every call; if pending items
+      appear later, a previously COMPLETE job can return to IN_PROGRESS.
     """
     from django.db.models import Count, Q
 
@@ -328,9 +463,8 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
     # Status: COMPLETE when no item is in-flight (remote_pending == 0).
     # NEED_STRUCTURE items await user input — they don't block COMPLETE.
     # The status is always derived from ground-truth item counts; this function
-    # is the authoritative recompute so we do NOT apply a "never regress" guard
-    # here — if the DB shows pending items, the job IS in-progress regardless
-    # of its previous status.
+    # is the authoritative recompute, so current pending items make the job
+    # IN_PROGRESS regardless of its previous status.
     from datetime import datetime as _datetime
 
     completed_at: _datetime | None

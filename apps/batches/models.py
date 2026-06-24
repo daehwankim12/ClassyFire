@@ -8,6 +8,8 @@ from django.db.models import Q
 
 from apps.core.enums import BatchItemStatus, BatchJobStatus, DetectedInputType
 
+INCHIKEY_REGEX = r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"
+
 
 class BatchJob(models.Model):
     """A single uploaded batch, identified by an unguessable UUID.
@@ -46,7 +48,11 @@ class BatchJob(models.Model):
 
 
 class BatchItem(models.Model):
-    """One input row of a batch. Row order is preserved; duplicates are allowed."""
+    """One input row of a batch.
+
+    ``row_order`` is unique within a job to preserve a stable input position;
+    duplicate ``original_input`` values are still allowed as separate rows.
+    """
 
     job = models.ForeignKey(
         BatchJob, on_delete=models.CASCADE, related_name="items"
@@ -95,8 +101,12 @@ class BatchItem(models.Model):
         db_table = "batch_items"
         constraints = [
             models.CheckConstraint(
-                name="batch_item_inchikey_len27",
-                condition=Q(inchikey__isnull=True) | Q(inchikey__length=27),
+                name="batch_item_inchikey_format",
+                condition=Q(inchikey__isnull=True) | Q(inchikey__regex=INCHIKEY_REGEX),
+            ),
+            models.UniqueConstraint(
+                fields=["job", "row_order"],
+                name="batch_item_job_row_order_unique",
             ),
         ]
         indexes = [

@@ -4,6 +4,8 @@ from __future__ import annotations
 from django.db import models
 from django.db.models import Q
 
+INCHIKEY_REGEX = r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"
+
 
 class CompoundStructure(models.Model):
     """A parsed chemical structure, keyed conceptually by its InChIKey.
@@ -16,7 +18,9 @@ class CompoundStructure(models.Model):
     original_smiles = models.TextField(null=True, blank=True)
     canonical_smiles = models.TextField(null=True, blank=True)
     inchi = models.TextField(null=True, blank=True)
-    inchikey = models.CharField(max_length=27, help_text="Full 27-char InChIKey.")
+    inchikey = models.CharField(
+        max_length=27, unique=True, help_text="Full 27-char InChIKey."
+    )
     parse_metadata = models.JSONField(
         default=dict, blank=True, help_text="RDKit parse details / warnings as JSONB."
     )
@@ -26,12 +30,9 @@ class CompoundStructure(models.Model):
         db_table = "compound_structures"
         constraints = [
             models.CheckConstraint(
-                name="compound_structure_inchikey_len27",
-                condition=Q(inchikey__length=27),
+                name="compound_structure_inchikey_format",
+                condition=Q(inchikey__regex=INCHIKEY_REGEX),
             ),
-        ]
-        indexes = [
-            models.Index(fields=["inchikey"], name="compound_inchikey_idx"),
         ]
 
     def __str__(self) -> str:
@@ -53,8 +54,8 @@ class CompoundUsage(models.Model):
         db_table = "compound_usage"
         constraints = [
             models.CheckConstraint(
-                name="compound_usage_inchikey_len27",
-                condition=Q(inchikey__length=27),
+                name="compound_usage_inchikey_format",
+                condition=Q(inchikey__regex=INCHIKEY_REGEX),
             ),
         ]
 
