@@ -289,11 +289,11 @@ def restore_round_trip():
         _psql(
             SRC_DB,
             f"INSERT INTO remote_tasks "
-            "(inchikey, compound_id, state, priority, attempt, created_at, updated_at) "
+            "(inchikey, compound_id, state, priority, attempt, lease_version, created_at, updated_at) "
             "VALUES ("
             f"  '{VALID_IK_ASPIRIN}', "
             f"  (SELECT id FROM compound_structures WHERE inchikey='{VALID_IK_ASPIRIN}'), "
-            "  'READY', 0, 0, NOW(), NOW()"
+            "  'READY', 0, 0, 0, NOW(), NOW()"
             ") ON CONFLICT DO NOTHING;",
         )
 
