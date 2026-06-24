@@ -100,6 +100,14 @@ class SourceArtifact(models.Model):
         max_length=64, help_text="SHA-256 hex digest of the raw artifact bytes."
     )
     byte_size = models.BigIntegerField(help_text="Size of the raw artifact in bytes.")
+    storage_key = models.TextField(
+        null=True, blank=True,
+        help_text="Storage key (relative path) where the raw artifact bytes are persisted.",
+    )
+    content_sha256 = models.CharField(
+        max_length=64, null=True, blank=True,
+        help_text="SHA-256 hex digest of the stored content bytes (mirrors checksum).",
+    )
     metadata = models.JSONField(
         null=True, blank=True, help_text="Provenance metadata as JSONB."
     )
@@ -214,6 +222,15 @@ class ClassificationResult(models.Model):
                 name="classification_result_raw_checksum_hex64",
                 condition=Q(raw_checksum__regex=r"^[0-9a-f]{64}$"),
             ),
+            models.CheckConstraint(
+                name="classification_result_requested_inchikey_format",
+                condition=Q(requested_inchikey__regex=r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"),
+            ),
+            models.CheckConstraint(
+                name="classification_result_returned_inchikey_format",
+                condition=Q(returned_inchikey__isnull=True)
+                | Q(returned_inchikey__regex=r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"),
+            ),
         ]
         indexes = [
             models.Index(
@@ -281,6 +298,10 @@ class ClassyfireLive(models.Model):
                 name="classyfire_live_inchikey_len27",
                 condition=Q(inchikey__length=27),
             ),
+            models.CheckConstraint(
+                name="classyfire_live_inchikey_format",
+                condition=Q(inchikey__regex=r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"),
+            ),
             models.UniqueConstraint(
                 fields=["inchikey"], name="classyfire_live_unique_current"
             ),
@@ -313,6 +334,10 @@ class ClassificationHistory(models.Model):
             models.CheckConstraint(
                 name="classification_history_inchikey_len27",
                 condition=Q(inchikey__length=27),
+            ),
+            models.CheckConstraint(
+                name="classification_history_inchikey_format",
+                condition=Q(inchikey__regex=r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"),
             ),
         ]
         indexes = [
