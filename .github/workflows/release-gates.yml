@@ -45,7 +45,7 @@ jobs:
         env:
           CLASSYFIRE_SENTINEL_SECRET: sentinel-release-gate-secret
       - run: docker build -t classyfire-release-gate .
-      - run: sh scripts/check_image_for_secrets.sh classyfire-release-gate
+      - run: bash scripts/check_image_for_secrets.sh classyfire-release-gate
         env:
           CLASSYFIRE_SENTINEL_SECRET: sentinel-release-gate-secret
 
