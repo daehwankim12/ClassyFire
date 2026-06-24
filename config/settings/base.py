@@ -167,6 +167,14 @@ REMOTE_BATCH_SIZE: int = env_int("REMOTE_BATCH_SIZE", 25)
 REMOTE_POLL_MIN_SECONDS: int = env_int("REMOTE_POLL_MIN_SECONDS", 60)
 REMOTE_MAX_CONCURRENCY: int = env_int("REMOTE_MAX_CONCURRENCY", 2)
 REMOTE_TIMEOUT_SECONDS: int = env_int("REMOTE_TIMEOUT_SECONDS", 45)
+# F-06: an in-doubt PENDING submission intent (crash after POST / before commit)
+# is aged out to FAILED — freeing the (provider, payload_hash) idempotency key so
+# exactly ONE genuine re-POST may occur — once EITHER it has been reconciled this
+# many times OR it has existed for this many seconds, whichever comes first.
+REMOTE_SUBMISSION_RECONCILE_MAX: int = env_int("REMOTE_SUBMISSION_RECONCILE_MAX", 3)
+REMOTE_SUBMISSION_TTL_SECONDS: int = env_int(
+    "REMOTE_SUBMISSION_TTL_SECONDS", 3600
+)
 
 # ---------------------------------------------------------------------------
 # Upload / retention

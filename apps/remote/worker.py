@@ -27,7 +27,7 @@ import json
 import logging
 import socket
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Protocol
 
 from django.conf import settings
@@ -295,11 +295,6 @@ class RemoteWorker:
         ).hexdigest()
 
     def _submit_batch(self, task: RemoteTask) -> None:
-        if not self.rate_limiter.submit.allow():
-            queue.defer_task(task, delay_seconds=5)
-            fanout.mark_items_delayed(task.inchikey)
-            return
-
         # Batch this task with other READY tasks that have a structure, up to
         # REMOTE_BATCH_SIZE. The dedup index guarantees one task per inchikey.
         batch = [task]
@@ -320,8 +315,9 @@ class RemoteWorker:
 
         # --- F-06: transactional submission outbox + idempotency -------------
         # Reconcile against any existing live (PENDING/SUBMITTED) intent for this
-        # exact payload BEFORE writing intent or POSTing — a crash between a
-        # prior POST and its commit left an authoritative record we must honour.
+        # exact payload BEFORE drawing a submit token or POSTing (MINOR-1) — a
+        # crash between a prior POST and its commit left an authoritative record
+        # we must honour, and an in-doubt re-park must NOT burn a global token.
         existing = (
             RemoteSubmission.objects.filter(
                 provider=PROVIDER,
@@ -333,6 +329,14 @@ class RemoteWorker:
         )
         if existing is not None:
             self._reconcile_submission(existing, members)
+            return
+
+        # No existing intent → this is a genuine first/fresh submit. Only NOW
+        # draw a global submit token.
+        if not self.rate_limiter.submit.allow():
+            for member in members:
+                queue.defer_task(member, delay_seconds=5)
+                fanout.mark_items_delayed(member.inchikey)
             return
 
         # Persist INTENT (PENDING) BEFORE the network call. The partial-UNIQUE on
@@ -431,7 +435,12 @@ class RemoteWorker:
             return
 
         self.circuit.record_success()
-        # --- success: link query + flip submission in ONE transaction --------
+        # --- success: DURABLE-FIRST ordering (IMPORTANT-2) -------------------
+        # Step 1: persist the already-POSTed remote_query_id durably — create the
+        # RemoteQuery, flip the submission to SUBMITTED, link query items, and
+        # record the attempt in ONE transaction. This is fence-free (no
+        # lease-conditional writes) so it CANNOT roll back on a member's stolen
+        # lease; the remote_query_id is captured even if every member is lost.
         poll_at = timezone.now() + timedelta(
             seconds=settings.REMOTE_POLL_MIN_SECONDS
         )
@@ -457,18 +466,41 @@ class RemoteWorker:
                 remote_query_id=submit.remote_query_id,
             )
             for member in members:
-                RemoteQueryItem.objects.create(
+                RemoteQueryItem.objects.get_or_create(
                     query=query,
                     task=member,
-                    compound=member.compound,
-                    inchikey=member.inchikey,
+                    defaults={
+                        "compound": member.compound,
+                        "inchikey": member.inchikey,
+                    },
                 )
+
+        # Step 2: park each member in POLL_WAIT, tolerating a per-member
+        # LeaseLost. A member whose lease was stolen mid-batch is SKIPPED (left
+        # for its new owner / reclaim) rather than aborting the whole batch — the
+        # durable query link above means its result is NOT lost: whoever owns the
+        # task next finds the RemoteQueryItem and polls the submitted query.
+        self._park_members_poll_wait(members, poll_at)
+
+    def _park_members_poll_wait(
+        self, members: list[RemoteTask], poll_at: datetime
+    ) -> None:
+        """POLL_WAIT-park members, skipping any whose lease was lost (F-07)."""
+        for member in members:
+            try:
                 queue.transition(
                     member,
                     TaskState.POLL_WAIT,
                     next_run_at=poll_at,
                     lock_owner=None,
                     locked_at=None,
+                )
+            except LeaseLost:
+                logger.warning(
+                    "member %s (inchikey=%s) lease lost during POLL_WAIT park; "
+                    "skipping — its query link is durable and it is re-claimable",
+                    member.pk,
+                    member.inchikey,
                 )
 
     def _reconcile_submission(
@@ -478,11 +510,13 @@ class RemoteWorker:
 
         * SUBMITTED with a linked query → re-link any unlinked members to that
           query and park them in POLL_WAIT (recover a crash that committed the
-          POST result but left tasks unparked).
+          POST result but left tasks unparked). Per-member LeaseLost is tolerated.
         * PENDING (in-doubt: POST may have hit the provider but never committed)
-          → do NOT re-POST. Re-park members for a later retry; an operator/
-          reconcile job resolves in-doubt intents. The crucial invariant: no
-          second POST is issued on this tick.
+          → do NOT re-POST on this tick. Bump ``reconcile_attempts``; once it
+          exceeds the cap OR the intent's TTL has elapsed, AGE IT OUT to FAILED
+          (freeing the idempotency key) so a single genuine re-POST may occur on
+          a later tick. The crucial invariant: no second POST is issued WHILE the
+          key is still live — only after it is freed.
         """
         poll_at = timezone.now() + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS)
         if submission.state == SubmissionState.SUBMITTED and submission.query_id:
@@ -497,20 +531,56 @@ class RemoteWorker:
                             "inchikey": member.inchikey,
                         },
                     )
-                    queue.transition(
-                        member,
-                        TaskState.POLL_WAIT,
-                        next_run_at=poll_at,
-                        lock_owner=None,
-                        locked_at=None,
-                    )
+            self._park_members_poll_wait(members, poll_at)
             return
-        # PENDING in-doubt: avoid a second POST; re-park for retry.
-        logger.warning(
-            "reconcile: in-doubt PENDING submission %s; not re-POSTing", submission.pk
+
+        # PENDING in-doubt: avoid a second POST while the key is live; age out.
+        attempts = submission.reconcile_attempts + 1
+        ttl = timedelta(seconds=settings.REMOTE_SUBMISSION_TTL_SECONDS)
+        age = timezone.now() - submission.created_at
+        aged_out = (
+            attempts > settings.REMOTE_SUBMISSION_RECONCILE_MAX or age >= ttl
         )
+        submission.reconcile_attempts = attempts
+        if aged_out:
+            submission.state = SubmissionState.FAILED
+            submission.detail = (
+                f"aged-out in-doubt PENDING after {attempts} reconcile(s), "
+                f"age={age.total_seconds():.0f}s; key freed for one re-POST"
+            )
+            submission.save(
+                update_fields=[
+                    "state",
+                    "detail",
+                    "reconcile_attempts",
+                    "updated_at",
+                ]
+            )
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="AGED_OUT",
+                raw_payload=None,
+                remote_query_id=submission.remote_query_id,
+                detail=submission.detail,
+            )
+            logger.warning(
+                "reconcile: aged out in-doubt PENDING submission %s -> FAILED "
+                "(key freed for exactly one re-POST)",
+                submission.pk,
+            )
+        else:
+            submission.save(update_fields=["reconcile_attempts", "updated_at"])
+            logger.warning(
+                "reconcile: in-doubt PENDING submission %s (attempt %s/%s); "
+                "not re-POSTing yet",
+                submission.pk,
+                attempts,
+                settings.REMOTE_SUBMISSION_RECONCILE_MAX,
+            )
+        # Re-park members for a later tick regardless (a freed key lets the next
+        # tick genuinely re-POST; a still-live key reconciles again).
         for member in members:
-            queue.defer_task(member, delay_seconds=self.lease_seconds)
+            queue.defer_task(member, delay_seconds=5)
             fanout.mark_items_delayed(member.inchikey)
 
     @staticmethod

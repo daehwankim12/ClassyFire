@@ -309,10 +309,22 @@ PENDING ─success─▶ SUBMITTED      (links remote_query in ONE txn)
         ─failure─▶ FAILED         (key freed for a later retry)
 ```
 
-Protocol: write `PENDING` intent → POST → on success flip to `SUBMITTED` +
-create `remote_query` + items in ONE transaction. On reconcile (a pre-existing
-live row found for the key): if `SUBMITTED`, re-link tasks to the existing query;
-if `PENDING` (in-doubt), do NOT re-POST — re-park for retry.
+Protocol: write `PENDING` intent → POST → **durable-first** success path: create
+`remote_query`, flip the submission to `SUBMITTED`, and link `remote_query_items`
+in ONE fence-free transaction (the `remote_query_id` is captured even if a member
+lease is later lost); THEN park members in `POLL_WAIT` in a separate step that
+tolerates a per-member `LeaseLost` (a stolen member is skipped + left for reclaim
+— its durable query link means the result is not lost). On reconcile (a
+pre-existing live row found for the key): if `SUBMITTED`, re-link tasks to the
+existing query; if `PENDING` (in-doubt), do NOT re-POST.
+
+**Aging out in-doubt `PENDING` (liveness):** each in-doubt reconcile bumps
+`reconcile_attempts`. Once it exceeds `REMOTE_SUBMISSION_RECONCILE_MAX` OR the
+intent is older than `REMOTE_SUBMISSION_TTL_SECONDS`, it is flipped to `FAILED`
+(freeing the `(provider, payload_hash)` key) so EXACTLY ONE genuine re-POST can
+occur on a later tick — never a second POST while the key is still live. The
+operator command `manage.py reconcile_submissions [--fail ID | --fail-aged]`
+lists and force-resolves in-doubt intents.
 
 ---
 
@@ -324,8 +336,8 @@ Shared across ALL workers so N processes obey ONE breaker.
 | State | Meaning |
 | --- | --- |
 | `CLOSED` | Healthy; remote calls allowed. |
-| `OPEN` | Tripped after `consecutive_failures >= threshold`; calls skipped (tasks DEFERRED). |
-| `HALF_OPEN` | Cool-down elapsed; a SINGLE probe is in flight. |
+| `OPEN` | Tripped after `consecutive_failures >= threshold`; calls skipped (tasks DEFERRED). Stays OPEN (the observable `state`) until a worker actually claims the probe — cool-down elapsing alone does not report HALF_OPEN. |
+| `HALF_OPEN` | A SINGLE probe is in flight (one worker won the conditional flip). |
 
 ```
 CLOSED ─failures≥threshold─▶ OPEN

@@ -1337,6 +1337,185 @@ def test_crash_after_post_before_commit_does_not_double_submit(monkeypatch):
     assert len(provider.submit_calls) == 1, "must NOT POST a second time"
 
 
+def test_in_doubt_pending_ages_out_and_allows_exactly_one_repost(settings):
+    # IMPORTANT-1: an in-doubt PENDING intent must not hold the key forever. After
+    # the reconcile cap it ages out to FAILED (freeing the key), enabling EXACTLY
+    # ONE genuine re-POST — and NO second POST before the key is freed.
+    settings.REMOTE_SUBMISSION_RECONCILE_MAX = 2
+    settings.REMOTE_SUBMISSION_TTL_SECONDS = 999999  # cap, not TTL, triggers here
+
+    comp = _compound(IK_A)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    provider = MockProvider(submit_query_ids=["q-doubt"])
+    worker = _worker(provider)
+
+    # Simulate the in-doubt window: a committed PENDING intent with no query, for
+    # the exact payload the worker will build for IK_A.
+    structures = [(IK_A, comp.canonical_smiles)]
+    payload = worker._canonical_payload(structures)
+    payload_hash = worker._payload_hash(payload)
+    RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash=payload_hash,
+        state="PENDING",
+        request_payload=payload,
+    )
+
+    # Reconcile attempts up to the cap: NO re-POST while the key is live.
+    for i in range(settings.REMOTE_SUBMISSION_RECONCILE_MAX):
+        RemoteTask.objects.filter(inchikey=IK_A).update(
+            state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+        )
+        worker.tick()
+        assert provider.submit_calls == [], f"must not re-POST on reconcile {i + 1}"
+        assert RemoteSubmission.objects.get().state == "PENDING"
+
+    # One more reconcile exceeds the cap -> ages the intent out to FAILED.
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+    )
+    worker.tick()
+    assert RemoteSubmission.objects.filter(state="FAILED").count() == 1
+    assert provider.submit_calls == [], "aging tick itself must not re-POST"
+
+    # NOW the key is free: the next tick performs exactly ONE genuine re-POST.
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+    )
+    worker.tick()
+    assert len(provider.submit_calls) == 1, "exactly one re-POST after key freed"
+    # A fresh live SUBMITTED intent now exists alongside the aged-out FAILED one.
+    assert RemoteSubmission.objects.filter(state="SUBMITTED").count() == 1
+    assert RemoteSubmission.objects.filter(state="FAILED").count() == 1
+
+
+def test_in_doubt_pending_ages_out_by_ttl(settings):
+    # Aging also triggers on TTL (not just the reconcile cap).
+    settings.REMOTE_SUBMISSION_RECONCILE_MAX = 999
+    settings.REMOTE_SUBMISSION_TTL_SECONDS = 60
+
+    comp = _compound(IK_A)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+    worker = _worker(MockProvider(submit_query_ids=["q-ttl"]))
+
+    structures = [(IK_A, comp.canonical_smiles)]
+    payload = worker._canonical_payload(structures)
+    sub = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash=worker._payload_hash(payload),
+        state="PENDING",
+        request_payload=payload,
+    )
+    # Backdate creation beyond the TTL.
+    RemoteSubmission.objects.filter(pk=sub.pk).update(
+        created_at=timezone.now() - dt.timedelta(seconds=120)
+    )
+
+    RemoteTask.objects.filter(inchikey=IK_A).update(
+        state=TaskState.READY, next_run_at=None
+    )
+    worker.tick()
+    sub.refresh_from_db()
+    assert sub.state == "FAILED"
+
+
+def test_mid_batch_lease_lost_preserves_query_id_and_reclaims_member(
+    settings, monkeypatch
+):
+    # IMPORTANT-2: if a member's POLL_WAIT transition is fenced out (LeaseLost)
+    # AFTER the POST, the durable query/submission must survive (remote_query_id
+    # not lost) and the skipped member must remain re-claimable.
+    settings.REMOTE_BATCH_SIZE = 2
+    comp_a = _compound(IK_A)
+    comp_b = _compound(IK_B)
+    queue.enqueue_task(IK_A, compound_id=comp_a.id, priority=10)
+    queue.enqueue_task(IK_B, compound_id=comp_b.id)
+
+    provider = MockProvider(submit_query_ids=["q-durable"])
+    worker = _worker(provider)
+
+    import apps.remote.worker as worker_mod
+
+    real_transition = worker_mod.queue.transition
+
+    def steal_b_lease(member, state, **fields):
+        # Simulate a concurrent reclaim of IK_B between the POST and its park:
+        # bump its lease_version so the fenced transition matches 0 rows.
+        if member.inchikey == IK_B:
+            RemoteTask.objects.filter(pk=member.pk).update(
+                lease_version=member.lease_version + 5
+            )
+        return real_transition(member, state, **fields)
+
+    monkeypatch.setattr(worker_mod.queue, "transition", steal_b_lease)
+
+    worker.tick()  # entity MISS for IK_A + batch submit (A primary, B extra)
+
+    # The POST happened once and the remote_query_id is DURABLE.
+    assert len(provider.submit_calls) == 1
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == "SUBMITTED"
+    assert submission.remote_query_id == "q-durable"
+    query = RemoteQuery.objects.get(remote_query_id="q-durable")
+    # Both members' query items were durably linked (results not lost).
+    assert query.items.count() == 2
+
+    # IK_A parked normally; IK_B's park was fenced out — it is NOT in POLL_WAIT
+    # but remains re-claimable (its durable query link lets the next owner poll).
+    task_a = RemoteTask.objects.get(inchikey=IK_A)
+    assert task_a.state == TaskState.POLL_WAIT
+    task_b = RemoteTask.objects.get(inchikey=IK_B)
+    assert task_b.state != TaskState.DONE  # not stranded as resolved
+    # A fresh claim can still pick IK_B up (e.g. after reactivation).
+    RemoteTask.objects.filter(inchikey=IK_B).update(
+        state=TaskState.READY, next_run_at=None, lock_owner=None, locked_at=None
+    )
+    assert queue.claim_task("new-owner") is not None
+
+
+# ---------------------------------------------------------------------------
+# F-06: operator reconcile command
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_submissions_command_lists_in_doubt(capsys):
+    from django.core.management import call_command
+
+    RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="a" * 64,
+        state="PENDING",
+        request_payload={"x": 1},
+    )
+    RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="b" * 64,
+        state="SUBMITTED",
+        request_payload={"x": 2},
+    )
+
+    call_command("reconcile_submissions")
+    out = capsys.readouterr().out
+    assert "In-doubt PENDING submissions (1)" in out
+    assert "aaaaaaaaaaaa" in out
+    assert "bbbbbbbbbbbb" not in out  # SUBMITTED is not in-doubt
+
+
+def test_reconcile_submissions_command_force_fail_frees_key():
+    from django.core.management import call_command
+
+    sub = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="c" * 64,
+        state="PENDING",
+        request_payload={"x": 3},
+    )
+    call_command("reconcile_submissions", "--fail", str(sub.pk))
+    sub.refresh_from_db()
+    assert sub.state == "FAILED"
+
+
 def test_submit_retryable_failure_frees_idempotency_key():
     # A retryable submit failure flips the intent to FAILED so the key can be
     # reused by a later retry (no permanent block).
@@ -1483,13 +1662,27 @@ def test_db_circuit_half_open_single_probe():
     assert DbCircuitBreaker().state == CircuitState.CLOSED
 
 
+def test_db_circuit_state_reports_open_until_probe_won():
+    # MINOR-2: state reports the TRUE persisted state — OPEN until a probe is
+    # actually claimed via allow(), not merely because cooldown elapsed.
+    breaker = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
+    breaker.record_failure()  # OPEN (cooldown already elapsed, reset_timeout=0)
+    assert breaker.state == CircuitState.OPEN, "no probe claimed yet -> OPEN"
+    assert breaker.cooldown_elapsed() is True
+    assert breaker.allow() is True  # this worker wins + claims the probe
+    assert breaker.state == CircuitState.HALF_OPEN  # now truly half-open
+
+
 def test_db_circuit_half_open_failure_reopens():
     breaker = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
     breaker.record_failure()  # OPEN
-    assert breaker.state == CircuitState.HALF_OPEN  # winner promoted
+    assert breaker.allow() is True  # claim the probe -> HALF_OPEN
+    assert breaker.state == CircuitState.HALF_OPEN
     breaker.record_failure()  # probe fails -> re-OPEN
     row = RemoteCircuit.objects.get()
     assert row.state == CircuitState.OPEN
+    # MINOR-3: consecutive_failures is set consistently (>= threshold) on reopen.
+    assert row.consecutive_failures >= breaker.failure_threshold
 
 
 def test_worker_uses_db_circuit_and_defers_when_open():

@@ -62,25 +62,28 @@ class DbCircuitBreaker:
 
     @property
     def state(self) -> CircuitState:
-        """Current shared state as persisted (no side effects).
+        """Current shared state EXACTLY as persisted (no side effects).
 
-        Reads the row without attempting the half-open promotion — call
-        :meth:`allow` to attempt (and win) the single probe. The state DOES
-        lazily report HALF_OPEN once the cool-down has elapsed so observers can
-        see the circuit is eligible to probe.
+        Reports the real DB row state: it stays ``OPEN`` until a worker actually
+        wins the probe via :meth:`allow` (which flips the row to ``HALF_OPEN``).
+        It does NOT pre-emptively report HALF_OPEN just because the cool-down has
+        elapsed — only an in-flight, claimed probe is HALF_OPEN, so observers see
+        the truthful circuit state.
         """
+        return CircuitState(self._row().state)
+
+    def cooldown_elapsed(self) -> bool:
+        """Whether an OPEN circuit's cool-down has elapsed (probe eligible)."""
         from datetime import timedelta
 
         from django.utils import timezone
 
         row = self._row()
-        if (
+        return (
             row.state == CircuitState.OPEN
             and row.opened_at is not None
             and row.opened_at <= timezone.now() - timedelta(seconds=self.reset_timeout)
-        ):
-            return CircuitState.HALF_OPEN
-        return CircuitState(row.state)
+        )
 
     def allow(self) -> bool:
         """Whether THIS worker may attempt a remote call right now.
@@ -143,9 +146,21 @@ class DbCircuitBreaker:
             )
             if row.state == CircuitState.HALF_OPEN:
                 # A failure during the half-open probe immediately re-opens.
+                # Set consecutive_failures consistently (>= threshold) so the
+                # counter never goes stale below the trip line while OPEN.
                 row.state = CircuitState.OPEN
                 row.opened_at = timezone.now()
-                row.save(update_fields=["state", "opened_at", "updated_at"])
+                row.consecutive_failures = max(
+                    self.failure_threshold, row.consecutive_failures + 1
+                )
+                row.save(
+                    update_fields=[
+                        "state",
+                        "opened_at",
+                        "consecutive_failures",
+                        "updated_at",
+                    ]
+                )
                 return
             RemoteCircuit.objects.filter(pk=row.pk).update(
                 consecutive_failures=F("consecutive_failures") + 1

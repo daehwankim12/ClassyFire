@@ -231,6 +231,14 @@ class RemoteSubmission(models.Model):
     request_payload = models.JSONField(
         help_text="Canonical request payload submitted to the provider (JSONB).",
     )
+    reconcile_attempts = models.IntegerField(
+        default=0,
+        help_text=(
+            "How many times an in-doubt PENDING intent has been reconciled "
+            "without resolving. Past the cap (or TTL) the intent is aged out to "
+            "FAILED so exactly one genuine re-POST may occur."
+        ),
+    )
     detail = models.TextField(
         null=True, blank=True, help_text="Failure detail when FAILED."
     )
