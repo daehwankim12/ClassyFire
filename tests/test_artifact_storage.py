@@ -25,6 +25,23 @@ def _create_simple_job():
     return create_job(rows, remote_enabled=False)
 
 
+def test_local_artifact_storage_save_bytes_roundtrip(tmp_path: Path):
+    """save_bytes writes data atomically; the stored bytes are byte-for-byte identical."""
+    from apps.batches.storage import LocalArtifactStorage
+
+    storage = LocalArtifactStorage(tmp_path)
+    payload = b"source artifact content\n"
+    key = "abc123def456.json"
+
+    stored_path = storage.save_bytes(key, payload)
+
+    assert stored_path == tmp_path / key
+    assert storage.exists(stored_path)
+    with storage.open(stored_path, "rb") as fh:
+        assert fh.read() == payload
+    assert storage.checksum(stored_path) == hashlib.sha256(payload).hexdigest()
+
+
 def test_local_artifact_storage_atomic_write_stat_open_and_delete(tmp_path: Path):
     from apps.batches.storage import LocalArtifactStorage
 

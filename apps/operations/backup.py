@@ -178,9 +178,15 @@ def validate_artifact_dir(value: str, *, backup_dir: Path, label: str) -> Path:
     forbidden = {Path("/").resolve(), Path.cwd().resolve(), backup_root}
     if path in forbidden:
         raise BackupConfigurationError(f"{label} artifact path is unsafe: {path}")
+    # Reject if backup_root is inside path (artifact dir contains backup output).
     if backup_root == path or backup_root.is_relative_to(path):
         raise BackupConfigurationError(
             f"{label} artifact path contains backup output: {path}"
+        )
+    # Reject if path is nested inside backup_root (artifact dir is inside backup output dir).
+    if path.is_relative_to(backup_root):
+        raise BackupConfigurationError(
+            f"{label} artifact path is nested inside backup output dir: {path}"
         )
     return path
 

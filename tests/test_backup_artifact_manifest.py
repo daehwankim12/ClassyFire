@@ -11,10 +11,15 @@ def test_compose_backup_mounts_export_and_source_volumes():
 
 @pytest.mark.django_db
 def test_python_backup_manifest_lists_artifact_archives(tmp_path, settings, monkeypatch):
-    settings.BACKUP_DIR = str(tmp_path)
-    settings.MEDIA_ROOT = str(tmp_path / "media")
-    settings.EXPORT_DIR = str(tmp_path / "export_files")
-    settings.SOURCE_ARTIFACT_DIR = str(tmp_path / "source_artifacts")
+    # Artifact dirs must NOT be nested inside backup_dir (validate_artifact_dir rejects that).
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    settings.BACKUP_DIR = str(backup_dir)
+    settings.MEDIA_ROOT = str(app_root / "media")
+    settings.EXPORT_DIR = str(app_root / "export_files")
+    settings.SOURCE_ARTIFACT_DIR = str(app_root / "source_artifacts")
     Path(settings.MEDIA_ROOT).mkdir()
     Path(settings.EXPORT_DIR).mkdir()
     Path(settings.SOURCE_ARTIFACT_DIR).mkdir()
@@ -26,7 +31,7 @@ def test_python_backup_manifest_lists_artifact_archives(tmp_path, settings, monk
 
     from apps.operations.backup import run_backup_injectable
 
-    manifest = run_backup_injectable(tmp_path, fake_dump)
+    manifest = run_backup_injectable(backup_dir, fake_dump)
 
     assert manifest["artifact_archives"]["exports"]["checksum"]
     assert manifest["artifact_archives"]["source_artifacts"]["checksum"]
