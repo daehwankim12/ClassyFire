@@ -135,6 +135,7 @@ class WishartDirectProvider:
                 status=EntityLookupStatus.RETRYABLE_ERROR,
                 inchikey=inchikey,
                 detail=str(exc),
+                raw_text=f"{exc.__class__.__name__}: {exc}",
             )
         headers = _safe_headers(resp)
         raw_text = resp.text
@@ -243,7 +244,9 @@ class WishartDirectProvider:
             # though the local response was lost. Surface it as AMBIGUOUS so the
             # worker parks the intent UNKNOWN (key held) and NEVER auto-resubmits
             # the same payload — re-POSTing could duplicate the submission (F-06).
-            raise AmbiguousSubmissionError(str(exc)) from exc
+            raise AmbiguousSubmissionError(
+                str(exc), raw_text=f"{exc.__class__.__name__}: {exc}"
+            ) from exc
         headers = _safe_headers(resp)
         raw_text = resp.text
         outcome = classify_http_status(resp.status_code)
@@ -308,7 +311,11 @@ class WishartDirectProvider:
         try:
             resp = self._client().get(url)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
-            return PollResult(status=PollStatus.RETRYABLE_ERROR, detail=str(exc))
+            return PollResult(
+                status=PollStatus.RETRYABLE_ERROR,
+                detail=str(exc),
+                raw_text=f"{exc.__class__.__name__}: {exc}",
+            )
         headers = _safe_headers(resp)
         raw_text = resp.text
         outcome = classify_http_status(resp.status_code)

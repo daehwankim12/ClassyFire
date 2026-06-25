@@ -323,6 +323,19 @@ def test_every_remote_outcome_records_complete_attempt(
     assert attempt.request_inchikey == task.inchikey
     assert attempt.raw_body_text is not None
     assert attempt.raw_body_sha256 is not None
+    # Timeout/transport paths must record the exception class name so the attempt
+    # is auditable (not the literal JSON null/"null" that omitting raw_text yields).
+    if case_name == "timeout":
+        assert attempt.raw_body_text != "null", (
+            f"{operation}/timeout raw_body_text must not be 'null'"
+        )
+        # The exception class name (e.g. "ConnectTimeout" or "ConnectError") must
+        # appear verbatim so the attempt is unambiguously attributable to a
+        # transport/timeout failure.
+        assert "Connect" in attempt.raw_body_text, (
+            f"{operation}/timeout raw_body_text should contain exception class name, "
+            f"got {attempt.raw_body_text!r}"
+        )
     if operation in {"SUBMIT", "POLL"}:
         assert attempt.request_payload_hash is not None
     if operation == "SUBMIT":
