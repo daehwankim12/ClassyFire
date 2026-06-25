@@ -51,7 +51,6 @@ from django.views.decorators.http import require_http_methods
 
 from apps.batches.exports import (
     create_export_for_authorized_job,
-    get_export_metadata,
     get_export_path,
 )
 from apps.batches.ingest import parse_text_input
@@ -408,17 +407,18 @@ def create_export_view(request: HttpRequest, job_id: str) -> JsonResponse:
 def download_export_view(
     request: HttpRequest,
     token: str,
-) -> FileResponse | HttpResponseNotFound | JsonResponse:
-    """GET /api/exports/{token} — download an export by token."""
-    meta = get_export_metadata(token)
-    job_id = meta.get("job_id") if meta is not None else None
-    if not request_has_shared_access(request, job_id):
-        return JsonResponse(
-            {"error": "Authentication required."},
-            status=401,
-            headers={"WWW-Authenticate": 'Bearer realm="ClassyFire"'},
-        )
+) -> FileResponse | HttpResponseNotFound:
+    """GET /api/exports/{token} — download an export by capability token.
 
+    The token is a 256-bit ``secrets.token_urlsafe(32)`` value, issued only to an
+    authenticated ``create_export`` call, job-scoped and expiring. A valid,
+    non-expired token IS the authorization: the file is served on the token
+    alone — no ``?secret=``, header, cookie, or session is required. This lets a
+    browser download via a plain link with no secret in the URL.
+
+    Unknown or expired tokens return 404 (not 401/403) so the response never
+    reveals the auth model or whether a token exists.
+    """
     path = get_export_path(token)
     if path is None:
         return HttpResponseNotFound("Export not found or expired.")

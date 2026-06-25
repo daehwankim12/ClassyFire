@@ -253,10 +253,17 @@ class TestAuthGateAllEndpoints:
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
-    def test_get_export_no_auth_rejected(self) -> None:
+    def test_get_export_unknown_token_is_404(self) -> None:
+        """Export download authorizes on the capability token alone.
+
+        An unknown token returns 404 (not 401/403): the response must not reveal
+        the auth model or whether a token exists. A valid token IS the
+        authorization — see tests/test_export_token_capability.py for the
+        positive path.
+        """
         client = Client()
         response = client.get("/api/exports/fake-token-xyz")
-        assert response.status_code in (401, 403)
+        assert response.status_code == 404
 
 
 # ===========================================================================
