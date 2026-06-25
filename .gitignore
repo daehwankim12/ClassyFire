@@ -98,3 +98,6 @@ yarn-error.log
 
 # Server-side generated export artifacts (runtime)
 export_cache/
+
+# Gate 6: official source-artifact storage (dev default SOURCE_ARTIFACT_DIR)
+source_artifacts/
