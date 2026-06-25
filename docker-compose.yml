@@ -36,6 +36,9 @@ volumes:
   export_files:
   # Gate-6 T-4: source artifacts (Zenodo JSON files) on a dedicated volume.
   source_artifacts:
+  # H-04: raw upload spool shared between web (writer) and ingest-worker (reader).
+  # Without this named volume the two containers each see their own empty /app/uploads.
+  uploads:
 
 # ---------------------------------------------------------------------------
 # Networks
@@ -119,6 +122,8 @@ services:
       - export_files:/app/export_files
       # Gate-6 T-4: source artifact volume for Zenodo JSON files
       - source_artifacts:/app/source_artifacts
+      # H-04: upload spool volume — web spools raw uploads here before the worker reads them
+      - uploads:/app/uploads
     networks:
       - internal
       - external
@@ -177,6 +182,8 @@ services:
       - export_files:/app/export_files
       # Gate-6 T-4: source artifact volume
       - source_artifacts:/app/source_artifacts
+      # H-04: upload spool volume — ingest-worker reads spooled files written by web
+      - uploads:/app/uploads
     networks:
       - internal
       - external
@@ -199,6 +206,8 @@ services:
       - media_files:/app/media
       # Gate-2 WS-E (F-12): access export files for pruning
       - export_files:/app/export_files
+      # H-04: upload spool volume — cleanup reaps stale upload temps
+      - uploads:/app/uploads
     networks:
       - internal
     depends_on:
@@ -221,6 +230,8 @@ services:
       - media_files:/app/media:ro
       - export_files:/app/export_files:ro
       - source_artifacts:/app/source_artifacts:ro
+      # H-04: upload spool volume — backup.sh reads UPLOAD_DIR for artifact archiving
+      - uploads:/app/uploads:ro
       - backup_data:/backups
     networks:
       - internal
