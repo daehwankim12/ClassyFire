@@ -66,6 +66,7 @@ from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob, ExportArtifact
 from apps.batches.storage import ArtifactStorage, get_artifact_storage
+from apps.operations.models import SystemEvent
 
 if TYPE_CHECKING:
     from apps.classifications.models import ClassificationResult
@@ -458,6 +459,11 @@ def _checksum_file(path: Path) -> str:
     return _artifact_storage().checksum(path)
 
 
+def _artifact_file_checksum_matches(path: Path, artifact: ExportArtifact) -> bool:
+    """Return True iff the on-disk file's SHA-256 matches the stored artifact checksum."""
+    return _checksum_file(path) == artifact.checksum
+
+
 # ---------------------------------------------------------------------------
 # Legacy sidecar helpers (kept for backward compatibility)
 # ---------------------------------------------------------------------------
@@ -662,6 +668,17 @@ def get_export_path(token: str) -> Path | None:
             # e.g. an item resolving, without changing the count).
             current_sig = _compute_rows_signature(job)
             if current_sig != artifact.rows_signature:
+                return None
+            if not _artifact_file_checksum_matches(path, artifact):
+                SystemEvent.objects.create(
+                    category="SECURITY",
+                    event_type="export_checksum_mismatch",
+                    payload={
+                        "artifact_id": artifact.pk,
+                        "token_prefix": artifact.token[:8],
+                        "path": str(path),
+                    },
+                )
                 return None
             return path
         # Count changed → definitely stale.
