@@ -674,7 +674,10 @@ def stage_job_under_quota(
 
             used_rows = (
                 BatchQuotaEvent.objects.filter(
-                    kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                    kind__in=[
+                        BatchQuotaEvent.KIND_JOB_CREATE,
+                        BatchQuotaEvent.KIND_JOB_ROWS,
+                    ],
                     created_at__gte=day_ago,
                     principal=principal,
                 ).aggregate(total=Sum("row_count"))["total"]

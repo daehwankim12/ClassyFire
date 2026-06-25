@@ -954,6 +954,7 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
     day_ago = timezone.now() - timedelta(days=1)
 
     from apps.batches.models import BatchQuotaEvent
+    from apps.core.security import _acquire_quota_advisory_lock
 
     try:
         with transaction.atomic():
@@ -974,6 +975,31 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
                 content_type=locked_job.upload_content_type or "",
             )
             row_count = ingest_rows(locked_job, row_iter, max_rows=max_rows)
+
+            # H-05: serialize the daily-cap critical section PER PRINCIPAL.
+            # Two workers staging two DIFFERENT jobs for the SAME principal lock
+            # different job rows via _lock_owned_job (no contention), so without
+            # this both would read the SAME used_rows, both pass the cap check,
+            # and both commit -> the cap is exceeded. Acquire a per-principal
+            # transaction-scoped advisory lock here, AFTER the slow ingest_rows
+            # parse (which stays concurrent across workers) and JUST BEFORE the
+            # used_rows read, so only the fast cap-check + KIND_JOB_ROWS insert
+            # is serialized. The pg xact lock auto-releases at commit/rollback.
+            #
+            # Lock ordering: this worker takes the job-row lock (_lock_owned_job)
+            # THEN this advisory lock. The request path takes the advisory lock
+            # THEN INSERTs a NEW BatchJob (it never SELECT...FOR UPDATEs an
+            # existing job row while holding the advisory lock), so there is no
+            # opposite-order holder -> no deadlock. Two same-principal workers
+            # contend only on this advisory key; the holder never waits on the
+            # other's job row -> no circular wait. After acquiring the lock the
+            # second worker re-reads used_rows and now SEES the first worker's
+            # committed KIND_JOB_ROWS, so the cap is enforced correctly.
+            _acquire_quota_advisory_lock(
+                BatchQuotaEvent.KIND_JOB_CREATE,
+                f"principal:{locked_job.remote_principal}",
+                "",
+            )
 
             # Daily row cap: re-check against the principal's last-24h usage now
             # that the real row count is known (the in-request quota event was
