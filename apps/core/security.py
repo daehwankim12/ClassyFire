@@ -42,7 +42,6 @@ from typing import TYPE_CHECKING
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
 from django.core import signing
-from django.core.cache import cache
 from django.db import connection, transaction
 from django.db.models import Sum
 from django.http import HttpRequest, HttpResponse, JsonResponse
@@ -261,31 +260,125 @@ def _job_id_from_view_kwargs(kwargs: dict[str, object]) -> object | None:
     )
 
 
-def _shared_access_login_failure_key(request: HttpRequest) -> str:
-    ip_digest = hashlib.sha256(_client_ip(request).encode("utf-8")).hexdigest()
+def throttle_key_for_ip(ip_address: str) -> str:
+    """Return the stable, DB-stored throttle key for a client IP address.
+
+    The raw IP is hashed so the ``login_throttles`` table never stores client
+    addresses in the clear.
+    """
+    ip_digest = hashlib.sha256(ip_address.encode("utf-8")).hexdigest()
     return f"classyfire:shared-access-login-failures:{ip_digest}"
+
+
+def _shared_access_login_failure_key(request: HttpRequest) -> str:
+    return throttle_key_for_ip(_client_ip(request))
+
+
+def _login_throttle_limit() -> int:
+    """Resolve the shared-access login failure cap.
+
+    Prefers the canonical ``SHARED_ACCESS_LOGIN_MAX_FAILURES`` setting and falls
+    back to the legacy ``SHARED_ACCESS_LOGIN_FAILURE_LIMIT`` name so existing
+    deployments and tests that set only the legacy name keep working.
+    """
+    if hasattr(settings, "SHARED_ACCESS_LOGIN_MAX_FAILURES"):
+        return int(settings.SHARED_ACCESS_LOGIN_MAX_FAILURES)
+    return int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_LIMIT", 5))
+
+
+def _login_throttle_window_seconds() -> int:
+    if hasattr(settings, "SHARED_ACCESS_LOGIN_WINDOW_SECONDS"):
+        return int(settings.SHARED_ACCESS_LOGIN_WINDOW_SECONDS)
+    return int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS", 300))
+
+
+def record_failed_login_attempt(ip_address: str) -> bool:
+    """Atomically record one failed login for *ip_address* (DB-backed).
+
+    Returns ``True`` iff THIS call is the one that CROSSES the failure threshold
+    (i.e. moved the shared counter from below the cap to exactly the cap). This
+    "crossing" semantics is what makes the throttle's atomicity observable: under
+    concurrency, ``select_for_update`` serialises the increments so that across N
+    racing callers exactly one observes the crossing (returns True). Callers that
+    only need to know whether the IP is *currently* blocked must use
+    :func:`is_shared_access_login_throttled` / :func:`_ip_is_login_throttled`,
+    which read ``failure_count >= limit``.
+    """
+    from django.db import IntegrityError
+
+    from apps.core.models import LoginThrottle
+
+    limit = _login_throttle_limit()
+    if limit < 0:
+        return False
+
+    key = throttle_key_for_ip(ip_address)
+    now = timezone.now()
+    window = timedelta(seconds=_login_throttle_window_seconds())
+
+    # Phase 1: ensure the row EXISTS and is committed, in its own savepoint.
+    # Doing the create separately means a unique-constraint race between racing
+    # workers raises IntegrityError HERE (rolled back to this savepoint only) and
+    # never poisons the lock+increment transaction below. Without this split the
+    # losing INSERTs of a concurrent get_or_create abort the whole transaction in
+    # PostgreSQL, silently dropping those workers' increments (lost updates).
+    try:
+        with transaction.atomic():
+            LoginThrottle.objects.create(
+                key=key, failure_count=0, window_started_at=now
+            )
+    except IntegrityError:
+        pass  # Row already created by a concurrent worker — fine.
+
+    # Phase 2: lock the now-guaranteed row and increment atomically. The
+    # select_for_update serialises concurrent workers so increments cannot be
+    # lost and exactly one worker observes the threshold-crossing.
+    with transaction.atomic():
+        row = LoginThrottle.objects.select_for_update().get(key=key)
+        if row.window_started_at <= now - window:
+            row.failure_count = 0
+            row.window_started_at = now
+        row.failure_count += 1
+        row.save(update_fields=["failure_count", "window_started_at", "updated_at"])
+        # Crossing semantics: True only on the call that hits the cap exactly.
+        return row.failure_count == limit
+
+
+def _ip_is_login_throttled(ip_address: str) -> bool:
+    """Return True when *ip_address* is currently blocked (DB-backed gate read)."""
+    from apps.core.models import LoginThrottle
+
+    limit = _login_throttle_limit()
+    if limit < 0:
+        return False
+
+    key = throttle_key_for_ip(ip_address)
+    now = timezone.now()
+    window = timedelta(seconds=_login_throttle_window_seconds())
+    row = LoginThrottle.objects.filter(key=key).only(
+        "failure_count", "window_started_at"
+    ).first()
+    if row is None:
+        return False
+    if row.window_started_at <= now - window:
+        # The window has fully elapsed: the recorded failures no longer count.
+        return False
+    return row.failure_count >= limit
 
 
 def is_shared_access_login_throttled(request: HttpRequest) -> bool:
     """Return True when repeated failed shared-password attempts hit the cap."""
-    limit = int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_LIMIT", 5))
-    if limit < 0:
-        return False
-    return int(cache.get(_shared_access_login_failure_key(request), 0) or 0) >= limit
+    return _ip_is_login_throttled(_client_ip(request))
 
 
 def record_shared_access_login_failure(request: HttpRequest) -> None:
-    limit = int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_LIMIT", 5))
-    if limit < 0:
-        return
-    key = _shared_access_login_failure_key(request)
-    window = int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS", 300))
-    count = int(cache.get(key, 0) or 0) + 1
-    cache.set(key, count, timeout=max(1, window))
+    record_failed_login_attempt(_client_ip(request))
 
 
 def clear_shared_access_login_failures(request: HttpRequest) -> None:
-    cache.delete(_shared_access_login_failure_key(request))
+    from apps.core.models import LoginThrottle
+
+    LoginThrottle.objects.filter(key=_shared_access_login_failure_key(request)).delete()
 
 
 # ---------------------------------------------------------------------------

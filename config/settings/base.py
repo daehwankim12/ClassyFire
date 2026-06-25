@@ -144,6 +144,16 @@ SHARED_ACCESS_LOGIN_FAILURE_LIMIT: int = env_int(
 SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS: int = env_int(
     "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS", 300
 )
+# DB-backed shared login throttle (apps.core.models.LoginThrottle). These are
+# the canonical names the throttle reads; the legacy *_FAILURE_LIMIT /
+# *_FAILURE_WINDOW_SECONDS names above are honoured as a fallback for backward
+# compatibility (see apps.core.security._login_throttle_limit/_window).
+SHARED_ACCESS_LOGIN_MAX_FAILURES: int = env_int(
+    "SHARED_ACCESS_LOGIN_MAX_FAILURES", SHARED_ACCESS_LOGIN_FAILURE_LIMIT
+)
+SHARED_ACCESS_LOGIN_WINDOW_SECONDS: int = env_int(
+    "SHARED_ACCESS_LOGIN_WINDOW_SECONDS", SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS
+)
 
 # ---------------------------------------------------------------------------
 # Seeding

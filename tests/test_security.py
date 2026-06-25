@@ -662,10 +662,11 @@ class TestResultUrlSecret:
         assert client.session.get("pre_login_marker") == "kept"
         assert client.session.get(SHARED_ACCESS_SESSION_KEY) is True
 
+    @pytest.mark.django_db(transaction=True)
     @override_settings(
         SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
-        SHARED_ACCESS_LOGIN_FAILURE_LIMIT=2,
-        SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS=60,
+        SHARED_ACCESS_LOGIN_MAX_FAILURES=2,
+        SHARED_ACCESS_LOGIN_WINDOW_SECONDS=60,
     )
     def test_shared_password_login_throttles_repeated_failures(self) -> None:
         client = Client(enforce_csrf_checks=True)

@@ -209,6 +209,8 @@ class TestBaseSettingsContract:
             "JOB_ACCESS_COOKIE_DAYS",
             "SHARED_ACCESS_LOGIN_FAILURE_LIMIT",
             "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS",
+            "SHARED_ACCESS_LOGIN_MAX_FAILURES",
+            "SHARED_ACCESS_LOGIN_WINDOW_SECONDS",
         ]
         for setting_name in quota_settings:
             assert hasattr(settings, setting_name)
