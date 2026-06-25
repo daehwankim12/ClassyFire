@@ -515,3 +515,15 @@ records the explicit HTTP `classification` (`FOUND`/`SUCCESS`/`RUNNING`/
 `COMPLETE`/`RETRYABLE`/`AUTH_FAILURE`/`NOT_FOUND`/`PROTOCOL_ERROR`/`PERMANENT`),
 `http_status`, and the `raw_payload` of that attempt — so failures are auditable
 and an unmapped status is never silently treated as success.
+
+## Remote Ambiguous Submit
+
+Any error raised after a `/queries` POST is attempted and before a provider query id is durably recorded is ambiguous. The worker must park the `RemoteSubmission` in `UNKNOWN`, keep the `(provider, payload_hash)` live unique slot, and never send the same payload again unless an operator explicitly marks the submission failed after verifying non-acceptance.
+
+## Remote Claim Identity
+
+Remote workers process a `TaskClaim`, not a freshly loaded `RemoteTask`, when applying side effects. A claim is the tuple `(task_id, worker_id, lease_version, lease_token)` captured at claim time. Result application must verify this tuple against the row locked with `SELECT FOR UPDATE` before writing attempts, classification events, fan-out, query state, or task terminal state.
+
+## Ingest Claim Identity
+
+Ingest workers process an `IngestJobClaim`, the tuple `(job_id, worker_id, claim_lease_version)`. All database side effects for one chunk are written inside a transaction that locks the job row and verifies this tuple before updating compound usage, remote task rows, batch item rows, budget rows, and the job checkpoint.
