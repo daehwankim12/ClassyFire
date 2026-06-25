@@ -15,6 +15,17 @@ class RemoteBudgetExceededError(ValueError):
     """Raised when a principal has exhausted the configured remote budget."""
 
 
+def validate_remote_budget_settings() -> None:
+    """Raise RuntimeError if the remote budget is disabled in a non-DEBUG environment.
+
+    Call this at application startup (e.g. AppConfig.ready) to catch a
+    missing/zero REMOTE_DAILY_BUDGET_PER_PRINCIPAL before any requests are served.
+    """
+    limit = int(getattr(settings, "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", 100))
+    if not getattr(settings, "DEBUG", False) and limit <= 0:
+        raise RuntimeError("A positive remote budget is required in production")
+
+
 def normalize_principal(principal: str | None) -> str:
     value = (principal or "system").strip()
     return value[:128] if value else "system"

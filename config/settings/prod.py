@@ -94,6 +94,8 @@ STORAGES = {
 # BASE_DIR/export_cache which remains unchanged for local development.
 # ---------------------------------------------------------------------------
 
+from django.core.exceptions import ImproperlyConfigured  # noqa: E402
+
 from apps.core.settings import env_str as _env_str  # noqa: E402
 
 EXPORT_DIR = _env_str("EXPORT_DIR", "/app/export_files")
@@ -124,3 +126,14 @@ LOGGING = {
         "level": env_str("DJANGO_LOG_LEVEL", "WARNING"),
     },
 }
+
+# ---------------------------------------------------------------------------
+# H-05: Remote budget guard — a non-positive budget in production is a
+# misconfiguration that must fail loudly at startup.
+# ---------------------------------------------------------------------------
+
+if REMOTE_DAILY_BUDGET_PER_PRINCIPAL <= 0:  # noqa: F405
+    raise ImproperlyConfigured(
+        "A positive production remote budget is required"
+        " (REMOTE_DAILY_BUDGET_PER_PRINCIPAL must be > 0 in production)"
+    )

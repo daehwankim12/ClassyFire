@@ -176,7 +176,7 @@ REMOTE_SUBMISSION_TTL_SECONDS: int = env_int(
     "REMOTE_SUBMISSION_TTL_SECONDS", 3600
 )
 REMOTE_DAILY_BUDGET_PER_PRINCIPAL: int = env_int(
-    "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", -1
+    "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", 100
 )
 
 # ---------------------------------------------------------------------------
