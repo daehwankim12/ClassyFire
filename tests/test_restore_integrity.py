@@ -836,3 +836,61 @@ def test_retention_prunes_media_archive_too(tmp_path):
     remaining_media = list(tmp_path.glob("classyfire_media_*.tar.gz"))
     assert len(remaining_manifests) == 7, f"Expected 7 manifests, got {len(remaining_manifests)}"
     assert len(remaining_media) == 7, f"Expected 7 media archives, got {len(remaining_media)}"
+
+
+def test_retention_prunes_artifact_archives(tmp_path):
+    """apply_retention must delete artifact_archives (exports, source_artifacts)
+    for pruned manifests, not just the legacy media_file field.
+
+    This is a regression test: pre-fix, the exports/source_artifacts .tar.gz
+    files would survive pruning and accumulate as orphans.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from apps.operations.backup import apply_retention
+
+    now = datetime.now(tz=UTC)
+    # Create 8 daily manifests (all < 7 days old) — the oldest (index 7)
+    # should be pruned, along with its artifact archives.
+    for i in range(8):
+        ts = now - timedelta(hours=i * 2)
+        stem = f"cf_{i:03d}"
+        # The .dump file.
+        (tmp_path / f"{stem}.dump").write_bytes(b"x")
+        # New-style artifact_archives: exports + source_artifacts.
+        exports_file = f"classyfire_exports_{stem}.tar.gz"
+        source_file = f"classyfire_source_artifacts_{stem}.tar.gz"
+        (tmp_path / exports_file).write_bytes(b"e")
+        (tmp_path / source_file).write_bytes(b"s")
+        manifest = {
+            "timestamp": ts.isoformat(),
+            "file": f"{stem}.dump",
+            "checksum": "abc",
+            "excludes": "classyfire_seed*",
+            "status": "ok",
+            "artifact_archives": {
+                "exports": {"file": exports_file, "checksum": "ee"},
+                "source_artifacts": {"file": source_file, "checksum": "ss"},
+            },
+        }
+        (tmp_path / f"{stem}.manifest.json").write_text(json.dumps(manifest))
+
+    apply_retention(tmp_path, now=now)
+
+    remaining_manifests = list(tmp_path.glob("*.manifest.json"))
+    remaining_exports = list(tmp_path.glob("classyfire_exports_*.tar.gz"))
+    remaining_source = list(tmp_path.glob("classyfire_source_artifacts_*.tar.gz"))
+
+    assert len(remaining_manifests) == 7, (
+        f"Expected 7 manifests after pruning, got {len(remaining_manifests)}"
+    )
+    # The 8th (oldest) manifest's artifact archives must be deleted.
+    assert len(remaining_exports) == 7, (
+        f"Expected 7 exports archives after pruning, got {len(remaining_exports)} "
+        f"(orphan exports archive was not cleaned up)"
+    )
+    assert len(remaining_source) == 7, (
+        f"Expected 7 source_artifacts archives after pruning, got {len(remaining_source)} "
+        f"(orphan source_artifacts archive was not cleaned up)"
+    )

@@ -139,12 +139,25 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
                 dump_path = backup_dir / data.get("file", "")
                 if dump_path.exists():
                     dump_path.unlink()
-                # Also prune associated media archive if present.
-                media_file = data.get("media_file") or ""
-                if media_file:
-                    media_path = backup_dir / media_file
-                    if media_path.exists():
-                        media_path.unlink()
+                # Collect archive files to delete, starting with the legacy
+                # media_file field (old manifests only have this).
+                legacy_media = data.get("media_file") or ""
+                archives_to_delete: set[str] = set()
+                if legacy_media:
+                    archives_to_delete.add(legacy_media)
+                # Also prune every archive in artifact_archives (new manifests).
+                # Each entry is {"file": "...tar.gz", "checksum": "..."}.
+                for entry in (data.get("artifact_archives") or {}).values():
+                    try:
+                        fname = entry["file"]
+                        if fname:
+                            archives_to_delete.add(fname)
+                    except (KeyError, TypeError):
+                        pass
+                for fname in archives_to_delete:
+                    archive_path = backup_dir / fname
+                    if archive_path.exists():
+                        archive_path.unlink()
             except (KeyError, OSError, json.JSONDecodeError):
                 pass
             try:
