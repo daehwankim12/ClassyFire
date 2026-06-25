@@ -194,8 +194,11 @@ class WishartDirectProvider:
         try:
             raw = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
+            # A 2xx whose body is not valid JSON is a PROTOCOL violation, never a
+            # transient/retryable condition: the response is structurally broken,
+            # so surface PROTOCOL_ERROR (the raw body is preserved for audit).
             return EntityLookupResult(
-                status=EntityLookupStatus.RETRYABLE_ERROR,
+                status=EntityLookupStatus.PROTOCOL_ERROR,
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"malformed body: {exc}",
@@ -354,8 +357,12 @@ class WishartDirectProvider:
         try:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
+            # A 2xx poll body that is not valid JSON is a PROTOCOL violation, not a
+            # transient condition: never treat it as RUNNING/COMPLETE. Surface
+            # PROTOCOL_ERROR with the raw body preserved for audit.
             return PollResult(
-                status=PollStatus.RETRYABLE_ERROR,
+                status=PollStatus.PROTOCOL_ERROR,
+                http_status=resp.status_code,
                 detail=f"malformed body: {exc}",
                 raw_text=raw_text,
                 safe_headers=headers,

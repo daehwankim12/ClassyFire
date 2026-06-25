@@ -320,6 +320,21 @@ class RemoteWorker:
         # so a malformed request can never trigger a calculation. Be explicit (do
         # not fall through on an unexpected status) so future statuses fail loud.
         if result.status in (EntityLookupStatus.NOT_FOUND, EntityLookupStatus.MISS):
+            # Record the entity-miss attempt for a COMPLETE audit trail (F-05):
+            # every entity outcome leaves a row, even a genuine cache miss that
+            # routes onward to a structure submit. ``str(result.status)`` records
+            # NOT_FOUND (HTTP 404) or MISS (provider-agnostic) verbatim.
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification=str(result.status),
+                raw_payload=result.raw_json,
+                http_status=result.http_status,
+                detail=result.detail,
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
+            )
             self._handle_entity_miss(task)
             return
 
@@ -902,6 +917,7 @@ class RemoteWorker:
                         query=query,
                         http_status=poll.http_status,
                         remote_query_id=remote_query_id,
+                        request_payload_hash=query.payload_hash,
                         detail=poll.detail,
                         task=locked,
                         request_inchikey=locked.inchikey,
@@ -931,6 +947,7 @@ class RemoteWorker:
                         query=query,
                         http_status=poll.http_status,
                         remote_query_id=remote_query_id,
+                        request_payload_hash=query.payload_hash,
                         detail=poll.detail,
                         task=locked,
                         request_inchikey=locked.inchikey,
@@ -959,6 +976,7 @@ class RemoteWorker:
                         query=query,
                         http_status=poll.http_status,
                         remote_query_id=remote_query_id,
+                        request_payload_hash=query.payload_hash,
                         detail=poll.detail,
                         task=locked,
                         request_inchikey=locked.inchikey,
@@ -986,6 +1004,7 @@ class RemoteWorker:
                         query=query,
                         http_status=poll.http_status,
                         remote_query_id=remote_query_id,
+                        request_payload_hash=query.payload_hash,
                         task=locked,
                         request_inchikey=locked.inchikey,
                         raw_body_text=poll.raw_text,
@@ -1022,6 +1041,7 @@ class RemoteWorker:
                     query=query,
                     http_status=poll.http_status,
                     remote_query_id=remote_query_id,
+                    request_payload_hash=query.payload_hash,
                     task=locked,
                     request_inchikey=locked.inchikey,
                     raw_body_text=poll.raw_text,
@@ -1276,13 +1296,55 @@ class RemoteWorker:
         current classification. Fan-out marks waiting items RESULT_KEY_MISMATCH and
         the task ends DONE — all under the F-07 fence, so a STALE worker writes
         NOTHING (the rejected event included).
+
+        A dedicated ``RESULT_KEY_MISMATCH`` RemoteAttempt is recorded inside the
+        SAME fenced transaction (carrying the returned key that triggered the
+        rejection), so the audit trail names the mismatch outcome explicitly and
+        the rejected ClassificationResult event + its attempt commit atomically
+        with the lease check.
         """
-        self._apply_result_with_fence(
-            claim,
-            query=query,
-            norm=norm,
-            final_status=BatchItemStatus.RESULT_KEY_MISMATCH,
-        )
+        with transaction.atomic():
+            locked = queue.lock_owned_claim(claim)
+            self._record_attempt(
+                RemoteAttempt.OPERATION_POLL
+                if query is not None
+                else RemoteAttempt.OPERATION_ENTITY,
+                classification="RESULT_KEY_MISMATCH",
+                raw_payload=norm.raw_json,
+                query=query,
+                remote_query_id=query.remote_query_id if query is not None else None,
+                request_payload_hash=query.payload_hash if query is not None else None,
+                detail=(
+                    f"result key mismatch: requested {locked.inchikey}, "
+                    f"returned {norm.inchikey}"
+                ),
+                task=locked,
+                request_inchikey=locked.inchikey,
+                returned_inchikey=norm.inchikey,
+            )
+            outcome = write_live_result(
+                locked.inchikey,
+                norm,
+                source_type=(
+                    SourceType.WISHART_LIVE_QUERY
+                    if query is not None
+                    else SourceType.WISHART_LIVE_ENTITY
+                ),
+                remote_query_id=query.remote_query_id if query is not None else None,
+                retrieved_at=(
+                    query.submitted_at if query is not None else timezone.now()
+                ),
+            )
+            # The returned key differs from the requested key, so the writer MUST
+            # have appended a REJECTED_MISMATCH event and left the live pointer
+            # untouched. Assert the contract rather than trusting it silently.
+            assert not outcome.applied, "mismatch must never advance the live pointer"
+            fanout.fan_out_result(
+                locked.inchikey, BatchItemStatus.RESULT_KEY_MISMATCH
+            )
+            queue.transition_locked(
+                locked, TaskState.DONE, lock_owner=None, locked_at=None
+            )
 
     def _structure_for(self, task: RemoteTask) -> str | None:
         """Return a submittable structure (SMILES/InChI) for the task, if any."""
