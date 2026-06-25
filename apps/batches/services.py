@@ -929,13 +929,21 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
     A row-count-quota violation rolls the staged rows back and raises
     :class:`QuotaExceededError`; the caller parks the job terminal-FAILED.
 
+    Claim-fenced (H-01): the exists-check, ``ingest_rows``, the daily-cap query,
+    the quota event, and the ``UPLOADING → PARSING`` state transition ALL run
+    inside ONE ``transaction.atomic()`` that FIRST locks + verifies the captured
+    claim via :func:`_lock_owned_job`. A stale worker (its job reclaimed, lease
+    version bumped) raises :class:`IngestLeaseLost` BEFORE any write, so it can
+    never commit rows/quota for a job it no longer owns; concurrent stagers
+    serialize on the locked job row, so the ``exists()`` race that produced
+    duplicate rows / ``(job, row_order)`` collisions is closed.
+
     Idempotent: a job whose artifact was already staged (items exist) is skipped,
     so a worker that crashed after committing rows but before finishing
-    normalization re-enters here and resumes without double-staging.
+    normalization re-enters here, locks the row, sees items exist, and returns
+    (state already PARSING because rows + state committed atomically).
     """
     if not job.upload_artifact_path:
-        return
-    if BatchItem.objects.filter(job_id=job.pk).exists():
         return
 
     claim = claim or claim_from_job(job)
@@ -949,12 +957,23 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
 
     try:
         with transaction.atomic():
+            # Lock + verify the claim FIRST: a stale worker (job reclaimed)
+            # raises IngestLeaseLost here, before any row/quota write, and
+            # concurrent stagers serialize on this locked row.
+            locked_job = _lock_owned_job(claim)
+
+            # Re-check under the lock: a concurrent stager that won the race
+            # already committed rows + flipped state, so this worker returns
+            # without double-staging.
+            if BatchItem.objects.filter(job_id=locked_job.pk).exists():
+                return
+
             row_iter = iter_uploaded_records_from_path(
                 artifact,
-                original_name=job.upload_original_name or artifact.name,
-                content_type=job.upload_content_type or "",
+                original_name=locked_job.upload_original_name or artifact.name,
+                content_type=locked_job.upload_content_type or "",
             )
-            row_count = ingest_rows(job, row_iter, max_rows=max_rows)
+            row_count = ingest_rows(locked_job, row_iter, max_rows=max_rows)
 
             # Daily row cap: re-check against the principal's last-24h usage now
             # that the real row count is known (the in-request quota event was
@@ -963,7 +982,7 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
                 BatchQuotaEvent.objects.filter(
                     kind=BatchQuotaEvent.KIND_JOB_CREATE,
                     created_at__gte=day_ago,
-                    principal=job.remote_principal,
+                    principal=locked_job.remote_principal,
                 ).aggregate(total=Sum("row_count"))["total"]
                 or 0
             )
@@ -973,20 +992,22 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
 
             BatchQuotaEvent.objects.create(
                 kind=BatchQuotaEvent.KIND_JOB_CREATE,
-                principal=job.remote_principal,
+                principal=locked_job.remote_principal,
                 ip_address="",
                 row_count=row_count,
             )
+
+            # Flip UPLOADING → PARSING in the SAME transaction as the rows +
+            # quota event, so a worker that re-enters after a committed stage
+            # sees both items and the advanced state atomically.
+            locked_job.processing_state = BatchProcessingState.PARSING
+            locked_job.claimed_at = timezone.now()
+            locked_job.save(update_fields=["processing_state", "claimed_at"])
     except RowCapExceededError as exc:
         raise QuotaExceededError(
             f"Job has more than {exc.max_rows} rows; the maximum is {exc.max_rows}."
         ) from exc
 
-    _fenced_claim_update(
-        claim,
-        processing_state=BatchProcessingState.PARSING,
-        claimed_at=timezone.now(),
-    )
     job.processing_state = BatchProcessingState.PARSING
 
 
