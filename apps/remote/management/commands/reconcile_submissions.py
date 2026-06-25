@@ -2,27 +2,28 @@
 
 A ``RemoteSubmission`` left in ``PENDING`` after a crash between the provider
 POST and its local commit is "in-doubt": the POST may or may not have reached the
-provider. The worker ages such intents out automatically (cap / TTL), but this
-command lets an operator inspect and force-resolve them.
+provider. The worker ages such intents into ``UNKNOWN`` automatically (cap / TTL),
+but this command lets an operator inspect them and explicitly PARK a stuck
+``PENDING`` intent as ``UNKNOWN``.
+
+UNKNOWN is a LIVE state — it HOLDS the ``(provider, payload_hash)`` idempotency
+key — so parking NEVER frees the key and the worker NEVER auto-resubmits the same
+payload. The ONLY command path that frees a key is ``resolve_submission
+--mark-failed``, which requires the submission to already be ``UNKNOWN`` and
+records the operator's verified non-acceptance decision.
 
 Usage::
 
     # List in-doubt PENDING intents (default).
     manage.py reconcile_submissions
 
-    # Force a specific in-doubt intent to FAILED (frees the idempotency key so a
-    # single genuine re-POST can occur on the next worker tick).
-    manage.py reconcile_submissions --fail <submission_id>
-
-    # Force every in-doubt PENDING intent older than the TTL to FAILED.
-    manage.py reconcile_submissions --fail-aged
+    # Move a specific in-doubt PENDING intent to UNKNOWN (key stays HELD).
+    manage.py reconcile_submissions --park-unknown <submission_id>
 """
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
-from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
@@ -31,30 +32,22 @@ from apps.remote.models import RemoteSubmission
 
 
 class Command(BaseCommand):
-    help = "List or force-resolve in-doubt PENDING remote submission intents."
+    help = "List or park in-doubt PENDING remote submission intents as UNKNOWN."
 
     def add_arguments(self, parser: Any) -> None:
         parser.add_argument(
-            "--fail",
+            "--park-unknown",
             type=int,
             default=None,
             metavar="ID",
-            help="Force the given PENDING submission id to FAILED (frees its key).",
-        )
-        parser.add_argument(
-            "--fail-aged",
-            action="store_true",
-            help="Force every PENDING intent older than the TTL to FAILED.",
+            help="Move a PENDING in-doubt submission to UNKNOWN without freeing its key.",
         )
 
     def handle(self, *args: Any, **options: Any) -> None:
         pending = RemoteSubmission.objects.filter(state=SubmissionState.PENDING)
 
-        if options["fail"] is not None:
-            self._fail_one(options["fail"])
-            return
-        if options["fail_aged"]:
-            self._fail_aged(pending)
+        if options["park_unknown"] is not None:
+            self._park_unknown(options["park_unknown"])
             return
         self._list(pending)
 
@@ -72,7 +65,7 @@ class Command(BaseCommand):
                 f"age={age:.0f}s"
             )
 
-    def _fail_one(self, submission_id: int) -> None:
+    def _park_unknown(self, submission_id: int) -> None:
         try:
             sub = RemoteSubmission.objects.get(
                 pk=submission_id, state=SubmissionState.PENDING
@@ -81,24 +74,11 @@ class Command(BaseCommand):
             raise CommandError(
                 f"No PENDING submission with id={submission_id}."
             ) from exc
-        sub.state = SubmissionState.FAILED
-        sub.detail = "operator forced FAILED via reconcile_submissions --fail"
+        sub.state = SubmissionState.UNKNOWN
+        sub.detail = "operator parked PENDING intent as UNKNOWN via reconcile_submissions"
         sub.save(update_fields=["state", "detail", "updated_at"])
         self.stdout.write(
             self.style.SUCCESS(
-                f"Submission {submission_id} -> FAILED (idempotency key freed)."
+                f"Submission {submission_id} -> UNKNOWN (idempotency key held)."
             )
-        )
-
-    def _fail_aged(self, pending: Any) -> None:
-        cutoff = timezone.now() - timedelta(
-            seconds=settings.REMOTE_SUBMISSION_TTL_SECONDS
-        )
-        aged = pending.filter(created_at__lte=cutoff)
-        count = aged.update(
-            state=SubmissionState.FAILED,
-            detail="operator forced FAILED (aged) via reconcile_submissions",
-        )
-        self.stdout.write(
-            self.style.SUCCESS(f"Aged out {count} PENDING submission(s) to FAILED.")
         )

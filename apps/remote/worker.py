@@ -52,6 +52,7 @@ from apps.remote.models import (
     RemoteTask,
 )
 from apps.remote.provider import (
+    AmbiguousSubmissionError,
     AuthProviderError,
     EntityLookupStatus,
     NonRetryableProviderError,
@@ -425,6 +426,39 @@ class RemoteWorker:
 
         try:
             submit = self.provider.submit_structures(structures)
+        except AmbiguousSubmissionError as exc:
+            # The POST may have reached the provider (transport error after the
+            # request left): provider acceptance is UNKNOWN. PARK the intent as
+            # UNKNOWN — a LIVE state that KEEPS HOLDING the idempotency key — so
+            # the worker NEVER auto-resubmits the same (provider, payload_hash)
+            # (F-06). MUST NOT call _fail_submission() (which would free the key
+            # and allow a duplicate POST). An operator resolves it out-of-band
+            # via resolve_submission.
+            self.circuit.record_failure()
+            detail = (
+                "provider acceptance unknown after submit transport error; "
+                "automatic re-submit is blocked"
+            )
+            self._record_attempt(
+                RemoteAttempt.OPERATION_SUBMIT,
+                classification="UNKNOWN_ACCEPTANCE",
+                raw_payload=None,
+                detail=f"{detail}: {exc}",
+                task=task,
+                submission=submission,
+                request_inchikey=task.inchikey,
+                request_payload_hash=payload_hash,
+                http_status=exc.http_status,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
+            )
+            submission.state = SubmissionState.UNKNOWN
+            submission.detail = detail
+            submission.save(update_fields=["state", "detail", "updated_at"])
+            for member in members:
+                queue.defer_task(member, delay_seconds=self.lease_seconds)
+                fanout.mark_items_delayed(member.inchikey)
+            return
         except RetryableProviderError as exc:
             self.circuit.record_failure()
             self._record_attempt(

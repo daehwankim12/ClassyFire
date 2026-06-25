@@ -1504,7 +1504,11 @@ def test_reconcile_submissions_command_lists_in_doubt(capsys):
     assert "bbbbbbbbbbbb" not in out  # SUBMITTED is not in-doubt
 
 
-def test_reconcile_submissions_command_force_fail_frees_key():
+def test_reconcile_submissions_command_park_unknown_holds_key():
+    # F-06: reconcile_submissions NEVER frees an idempotency key. --park-unknown
+    # moves a PENDING in-doubt intent to UNKNOWN (a LIVE state that KEEPS HOLDING
+    # the key) so the worker can never auto-resubmit the same payload. Only
+    # resolve_submission --mark-failed (from UNKNOWN) frees a key.
     from django.core.management import call_command
 
     sub = RemoteSubmission.objects.create(
@@ -1513,9 +1517,9 @@ def test_reconcile_submissions_command_force_fail_frees_key():
         state="PENDING",
         request_payload={"x": 3},
     )
-    call_command("reconcile_submissions", "--fail", str(sub.pk))
+    call_command("reconcile_submissions", "--park-unknown", str(sub.pk))
     sub.refresh_from_db()
-    assert sub.state == "FAILED"
+    assert sub.state == "UNKNOWN"
 
 
 def test_submit_retryable_failure_frees_idempotency_key():

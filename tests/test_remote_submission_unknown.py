@@ -209,3 +209,50 @@ def test_resolve_submission_refuses_non_unknown_submission():
 def test_resolve_submission_unknown_id_errors():
     with pytest.raises(CommandError, match="No RemoteSubmission"):
         call_command("resolve_submission", "--submission-id", "999999", "--mark-failed")
+
+
+# ---------------------------------------------------------------------------
+# operator command: reconcile_submissions --park-unknown
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_park_unknown_moves_pending_to_unknown_without_freeing_key():
+    """``--park-unknown`` moves a PENDING intent to UNKNOWN; the key stays HELD.
+
+    Parking is the ONLY thing reconcile_submissions does to a live intent — it
+    never frees the idempotency key (that is resolve_submission --mark-failed's
+    job, and only from UNKNOWN). UNKNOWN is a live state, so a re-park raises a
+    CommandError (no PENDING row remains) rather than re-parking or freeing it.
+    """
+    sub = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="f" * 64,
+        state=SubmissionState.PENDING,
+        request_payload={"query_type": "STRUCTURE", "structures": []},
+    )
+
+    call_command("reconcile_submissions", "--park-unknown", str(sub.pk))
+
+    sub.refresh_from_db()
+    assert sub.state == SubmissionState.UNKNOWN
+    assert sub.detail and "parked" in sub.detail
+    # The key is still held: the row is UNKNOWN (a live state), not FAILED.
+    assert RemoteSubmission.objects.filter(
+        provider="wishart",
+        payload_hash="f" * 64,
+        state__in=[s.value for s in SubmissionState.live_states()],
+    ).exists()
+
+
+def test_reconcile_park_unknown_refuses_non_pending():
+    """``--park-unknown`` only acts on PENDING; a missing PENDING row errors."""
+    sub = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="a" * 64,
+        state=SubmissionState.UNKNOWN,
+        request_payload={"x": 1},
+    )
+    with pytest.raises(CommandError, match="No PENDING submission"):
+        call_command("reconcile_submissions", "--park-unknown", str(sub.pk))
+    sub.refresh_from_db()
+    assert sub.state == SubmissionState.UNKNOWN  # untouched

@@ -43,6 +43,7 @@ from apps.remote.contract import (
 )
 from apps.remote.mock import parse_wishart_payload, parse_wishart_results
 from apps.remote.provider import (
+    AmbiguousSubmissionError,
     AuthProviderError,
     EntityLookupResult,
     EntityLookupStatus,
@@ -235,7 +236,11 @@ class WishartDirectProvider:
         try:
             resp = self._client().post(url, json=payload)
         except (httpx.TimeoutException, httpx.TransportError) as exc:
-            raise RetryableProviderError(str(exc)) from exc
+            # The POST may have reached (and been accepted by) the provider even
+            # though the local response was lost. Surface it as AMBIGUOUS so the
+            # worker parks the intent UNKNOWN (key held) and NEVER auto-resubmits
+            # the same payload — re-POSTing could duplicate the submission (F-06).
+            raise AmbiguousSubmissionError(str(exc)) from exc
         headers = _safe_headers(resp)
         raw_text = resp.text
         outcome = classify_http_status(resp.status_code)

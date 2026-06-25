@@ -220,6 +220,18 @@ class RetryableProviderError(ProviderError):
         self.retry_after = retry_after
 
 
+class AmbiguousSubmissionError(ProviderError):
+    """A submit POST may have reached the provider; automatic retry is forbidden.
+
+    Raised when a ``/queries`` POST fails AFTER the request may have been sent
+    (timeout / transport error): the provider could have ACCEPTED the submission
+    even though the local response was lost. The worker must NOT auto-resubmit
+    the same ``(provider, payload_hash)`` (that would duplicate the upstream
+    submission, F-06); instead it parks the intent in ``UNKNOWN`` (key held) for
+    operator reconciliation.
+    """
+
+
 class NonRetryableProviderError(ProviderError):
     """A permanent failure (invalid structure, definite 4xx input error)."""
 

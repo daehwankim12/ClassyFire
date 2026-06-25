@@ -469,9 +469,11 @@ holding the `(provider, payload_hash)` key, so the worker NEVER auto-re-POSTs.
 An operator resolves it out-of-band with
 `manage.py resolve_submission --submission-id ID (--remote-query-id QID |
 --mark-failed)`: confirm acceptance → `SUBMITTED` (links the now-known query), or
-verify non-acceptance → `FAILED` (frees the key for a genuine re-POST). The older
-`manage.py reconcile_submissions [--fail ID | --fail-aged]` still lists and
-force-resolves `PENDING` intents.
+verify non-acceptance → `FAILED` (frees the key for a genuine re-POST).
+`manage.py reconcile_submissions --park-unknown ID` only moves a `PENDING`
+intent to `UNKNOWN` (the key stays held); it can NOT free a key. No age-based
+or count-based path force-frees a key — `resolve_submission --mark-failed`
+(which requires `state == UNKNOWN`) is the ONLY key-freeing command.
 
 ---
 
