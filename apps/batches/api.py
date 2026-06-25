@@ -167,6 +167,13 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
     file = None
     if is_multipart:
         file = request.FILES.get("input_file")
+        # Reject an ambiguous submission that provides BOTH a file and pasted
+        # text: spooling only the file would silently drop the pasted text.
+        if file is not None and text_input.strip():
+            return JsonResponse(
+                {"error": "Provide either pasted text or a file upload, not both."},
+                status=400,
+            )
         if file is not None:
             try:
                 check_upload_size(file.size if file.size is not None else 0)

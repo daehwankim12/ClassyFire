@@ -81,6 +81,15 @@ def submit_view(request: HttpRequest) -> HttpResponse:
         # file.size may be None when the upload size is unknown; in that case we
         # fall through and let the spool stream enforce MAX_UPLOAD_MB mid-write.
         file = request.FILES.get("input_file")
+        # Reject an ambiguous submission that provides BOTH a file and pasted
+        # text: spooling only the file would silently drop the pasted text.
+        if file is not None and text_input.strip():
+            return render(
+                request,
+                "batches/submit.html",
+                {"error": "Provide either pasted text or a file upload, not both."},
+                status=400,
+            )
         if file:
             try:
                 check_upload_size(file.size if file.size is not None else 0)
