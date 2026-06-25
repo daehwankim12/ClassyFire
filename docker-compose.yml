@@ -186,19 +186,15 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  # ── Cleanup (one-shot, manual profile) ───────────────────────────────────
+  # ── Cleanup (scheduled loop, runs by default) ────────────────────────────
   cleanup:
     build: .
-    restart: "no"
-    profiles: ["ops"]
+    restart: unless-stopped
     env_file: .env
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.prod
       POSTGRES_HOST: db
-    command:
-      - python
-      - manage.py
-      - cleanup_expired
+    command: ["sh", "-c", "while true; do python manage.py cleanup_expired; sleep 86400; done"]
     volumes:
       - media_files:/app/media
       # Gate-2 WS-E (F-12): access export files for pruning
@@ -206,8 +202,6 @@ services:
     networks:
       - internal
     depends_on:
-      db:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
 
