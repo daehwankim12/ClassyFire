@@ -1,6 +1,6 @@
 # Safe Remediation Results
 
-Branch: `safe-production-remediation` (HEAD 7b50b54)
+Branch: `safe-production-remediation` (HEAD cbffd80)
 Verified: 2026-06-25
 
 | Check | Result | Evidence |
@@ -11,7 +11,7 @@ Verified: 2026-06-25
 | migrations | pass | `uv run python manage.py makemigrations --check --dry-run` — No changes detected (controller-verified) |
 | Django check | pass | `uv run python manage.py check` — System check identified 0 issues (controller-verified) |
 | Focused safety tests | pass (74 passed, 0 skipped, 0 failed) | `scripts/run_postgres_tests.py --reuse-db` with the 20 focused files listed in Task 22 Step 2 |
-| PostgreSQL tests | pass (753 passed, 22 skipped, 0 new failures; 26 pre-existing infra-only errors documented) | `scripts/run_postgres_tests.py --reuse-db tests` — full suite (the 1 stale-assertion failure was fixed, see note) |
+| PostgreSQL tests | pass (757 passed, 22 skipped, 0 new failures; 26 pre-existing infra-only errors documented) | `scripts/run_postgres_tests.py --reuse-db tests` — full suite (the 1 stale-assertion failure was fixed, see note) |
 | Docker build | not run | Docker not available on this host |
 | Compose runtime | not run | Docker not available on this host |
 | Proxy log redaction | not run | Docker not available on this host |
@@ -69,3 +69,9 @@ An independent static review after the initial SHIP found 4 real holes the whole
 - **F4 (Medium):** backup retention orphaned export/source_artifact archives. Fixed: `b7f19da` (+`7b50b54` hardening).
 
 Full suite after fixes: 753 passed / 22 skipped / 0 new failures / 26 pre-existing infra-only errors.
+
+**Second/third review rounds (after the four above):**
+- **Per-minute rate limit double-count (Medium):** spooled jobs wrote two `job_create` events; the per-minute limiter counted both (~halved throughput). Fixed: `365c08b` (worker accounting event → distinct `KIND_JOB_ROWS`; per-minute count sees one reservation/job; daily-cap sums both kinds).
+- **Worker daily row-cap race (High, H-05):** the worker-side daily-row-cap held only the per-job lock, so two workers staging different jobs for one principal could both pass the cap. Fixed: `cbffd80` (per-principal `pg_advisory_xact_lock` around the cap-check + insert; multiprocess race test).
+
+Final full-suite certification @ cbffd80: 757 passed / 22 skipped / 0 non-pre-existing failures / 26 pre-existing infra-only errors.
