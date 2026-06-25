@@ -60,8 +60,13 @@ jobs:
           SHARED_ACCESS_PASSWORD_HASH: pbkdf2_sha256$1000000$sentinel$HcS2C1kMIEVvE6bXKqJtV3J3W1Id0s9UiB57QjXaXoY=
           NGROK_DOMAIN: localhost
       - run: CLASSYFIRE_BASE_URL=http://127.0.0.1 CLASSYFIRE_SENTINEL_SECRET=sentinel-release-gate-secret bash scripts/exercise_secret_routes.sh
-      - run: docker compose logs > compose.log
-      - run: bash scripts/check_proxy_logs_for_secrets.sh compose.log sentinel-release-gate-secret sentinel-django-secret
+      - run: |
+          docker compose logs > compose.log
+          docker compose logs ngrok-agent >> compose.log || true
+          find . -path '*caddy*log*' -type f -print -exec cat {} \; >> compose.log || true
+      - run: bash scripts/check_proxy_logs_for_secrets.sh compose.log sentinel-job-secret sentinel-upload-filename sentinel-django-secret "$CLASSYFIRE_SENTINEL_SECRET"
+        env:
+          CLASSYFIRE_SENTINEL_SECRET: sentinel-release-gate-secret
       - if: always()
         run: docker compose down -v
 

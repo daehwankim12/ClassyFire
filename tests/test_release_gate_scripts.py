@@ -35,3 +35,15 @@ def test_secret_scan_scripts_fail_on_missing_args():
     assert "set -euo pipefail" in log_script
     assert "CLASSYFIRE_SENTINEL_SECRET" in image_script
     assert "CLASSYFIRE_SENTINEL_SECRET" in log_script
+
+
+def test_secret_route_exerciser_hits_sensitive_routes():
+    script = Path("scripts/exercise_secret_routes.sh").read_text()
+    for needle in [
+        "?secret=",
+        "X-Job-Secret",
+        "/claim/",
+        "/api/exports/",
+        "sentinel-upload-filename",
+    ]:
+        assert needle in script
