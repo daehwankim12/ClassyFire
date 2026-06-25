@@ -1,6 +1,6 @@
 # Safe Remediation Results
 
-Branch: `safe-production-remediation` (HEAD 899bb9c)
+Branch: `safe-production-remediation` (HEAD 7b50b54)
 Verified: 2026-06-25
 
 | Check | Result | Evidence |
@@ -11,7 +11,7 @@ Verified: 2026-06-25
 | migrations | pass | `uv run python manage.py makemigrations --check --dry-run` — No changes detected (controller-verified) |
 | Django check | pass | `uv run python manage.py check` — System check identified 0 issues (controller-verified) |
 | Focused safety tests | pass (74 passed, 0 skipped, 0 failed) | `scripts/run_postgres_tests.py --reuse-db` with the 20 focused files listed in Task 22 Step 2 |
-| PostgreSQL tests | pass (748 passed, 22 skipped, 0 new failures; 26 pre-existing infra-only errors documented) | `scripts/run_postgres_tests.py --reuse-db tests` — full suite (the 1 stale-assertion failure was fixed, see note) |
+| PostgreSQL tests | pass (753 passed, 22 skipped, 0 new failures; 26 pre-existing infra-only errors documented) | `scripts/run_postgres_tests.py --reuse-db tests` — full suite (the 1 stale-assertion failure was fixed, see note) |
 | Docker build | not run | Docker not available on this host |
 | Compose runtime | not run | Docker not available on this host |
 | Proxy log redaction | not run | Docker not available on this host |
@@ -59,3 +59,13 @@ which require Docker and MUST be run in CI before claiming full production safet
 - Image layer secret scan (`scripts/check_image_for_secrets.sh`)
 
 Do NOT merge to a production release branch until these Docker/runtime/restore-smoke rows pass.
+
+## Independent re-review findings (post-initial-review) — all FIXED
+
+An independent static review after the initial SHIP found 4 real holes the whole-branch review missed; all fixed + re-reviewed SHIP:
+- **F1 (Critical, F-06):** a 2xx submit with an unreadable body/query-id freed the idempotency key → duplicate re-POST. Fixed: `70c87f2` (→ AmbiguousSubmissionError → park UNKNOWN, key held).
+- **F3 (High, H-01):** spooled-upload staging committed rows/quota before the claim fence. Fixed: `f71db78` (stage_spooled_upload under `_lock_owned_job`).
+- **F2 (High, H-04):** text/paste was still parsed + BatchItem-inserted in-request. Fixed: `adea02b` (text now spooled → deferred to worker).
+- **F4 (Medium):** backup retention orphaned export/source_artifact archives. Fixed: `b7f19da` (+`7b50b54` hardening).
+
+Full suite after fixes: 753 passed / 22 skipped / 0 new failures / 26 pre-existing infra-only errors.
