@@ -132,3 +132,33 @@ def test_query_complete_does_not_silently_skip_unowned_sibling(query_complete_ha
     query.refresh_from_db()
     assert item_b.apply_state == "APPLIED"
     assert query.state == QueryState.COMPLETE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stale_pending_owner_park_cannot_clobber_applied_member(
+    query_complete_harness,
+):
+    query, task_a, task_b = query_complete_harness.make_two_member_query()
+    RemoteQueryItem.objects.filter(query=query, task=task_a).update(
+        apply_state="APPLIED",
+        applied_at=timezone.now(),
+        apply_detail="already applied",
+    )
+    RemoteQueryItem.objects.filter(query=query, task=task_b).update(
+        apply_state="APPLIED",
+        applied_at=timezone.now(),
+        apply_detail="applied by owner",
+    )
+
+    stale_member_b = RemoteTask.objects.get(pk=task_b.pk)
+    stale_member_b.lock_owner = "worker-b"
+    worker = query_complete_harness._worker("worker-a")
+
+    worker._park_member_pending_owner(query, stale_member_b)
+    worker._complete_query_if_terminal(query)
+
+    item_b = RemoteQueryItem.objects.get(query=query, task=task_b)
+    query.refresh_from_db()
+    assert item_b.apply_state == "APPLIED"
+    assert item_b.apply_detail == "applied by owner"
+    assert query.state == QueryState.COMPLETE

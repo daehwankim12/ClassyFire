@@ -1151,6 +1151,11 @@ class RemoteWorker:
         poll/apply completes it. A member with no entity in the response retries
         and is left in a non-terminal apply state.
         """
+        member_claim = self._member_claim(member, claim)
+        if member_claim is None:
+            # Owned by a different worker (or unlockable): defer to its owner.
+            self._park_member_pending_owner(query, member)
+            return
         # A member already in a terminal apply state was resolved by a prior poll
         # (possibly by another worker); do not re-apply it.
         if (
@@ -1159,18 +1164,15 @@ class RemoteWorker:
             .exists()
         ):
             return
-        member_claim = self._member_claim(member, claim)
-        if member_claim is None:
-            # Owned by a different worker (or unlockable): defer to its owner.
-            self._park_member_pending_owner(query, member)
-            return
         self._dispatch_resolved(member_claim, member, query, norm)
 
     def _park_member_pending_owner(
         self, query: RemoteQuery, member: RemoteTask
     ) -> None:
         owner = member.lock_owner or "no worker"
-        RemoteQueryItem.objects.filter(query=query, task=member).update(
+        RemoteQueryItem.objects.filter(query=query, task=member).exclude(
+            apply_state__in=["APPLIED", "MISMATCH", "FAILED"]
+        ).update(
             apply_state="PENDING_OWNER",
             apply_detail=f"owned by {owner}; deferred to owner",
         )

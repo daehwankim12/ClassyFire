@@ -79,23 +79,27 @@ def remote_result_harness():
     return _RemoteResultHarness()
 
 
+def _query_with_submitted_at(
+    remote_query_id: str, payload_hash: str, submitted_at: dt.datetime
+) -> RemoteQuery:
+    query = RemoteQuery.objects.create(
+        remote_query_id=remote_query_id,
+        payload_hash=payload_hash,
+    )
+    RemoteQuery.objects.filter(pk=query.pk).update(submitted_at=submitted_at)
+    query.refresh_from_db(fields=["submitted_at"])
+    return query
+
+
 @pytest.mark.django_db(transaction=True)
 def test_older_query_completing_late_does_not_supersede_newer_result(
     remote_result_harness,
 ):
-    # NOTE: RemoteQuery.submitted_at is auto_now_add, so submit ORDER is fixed by
-    # creation order — older first, newer second — and the explicit datetimes are
-    # advisory. The harness applies the NEWER result first, then the LATE older
-    # one, proving freshness follows submitted_at, not apply/wall-clock order.
-    older = RemoteQuery.objects.create(
-        remote_query_id="older",
-        payload_hash="olderhash",
-        submitted_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    older = _query_with_submitted_at(
+        "older", "olderhash", dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
     )
-    newer = RemoteQuery.objects.create(
-        remote_query_id="newer",
-        payload_hash="newerhash",
-        submitted_at=dt.datetime(2026, 1, 2, tzinfo=dt.UTC),
+    newer = _query_with_submitted_at(
+        "newer", "newerhash", dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
     )
     assert older.submitted_at < newer.submitted_at
 
@@ -107,3 +111,25 @@ def test_older_query_completing_late_does_not_supersede_newer_result(
     stale_event = ClassificationResult.objects.latest("id")
     assert stale_event.kind == ResultKind.REJECTED_STALE
     assert stale_event.source_type == SourceType.WISHART_LIVE_QUERY
+
+
+@pytest.mark.django_db(transaction=True)
+def test_newer_query_completing_after_older_supersedes_live_result(
+    remote_result_harness,
+):
+    older = _query_with_submitted_at(
+        "older", "olderhash", dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    )
+    newer = _query_with_submitted_at(
+        "newer", "newerhash", dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+    )
+    assert older.submitted_at < newer.submitted_at
+
+    remote_result_harness.apply_query_result(older, IK, kingdom="Organic compounds")
+    remote_result_harness.apply_query_result(newer, IK, kingdom="Organic compounds")
+
+    live = ClassyfireLive.objects.get(inchikey=IK)
+    assert live.remote_query_id == "newer"
+    newer_event = ClassificationResult.objects.latest("id")
+    assert newer_event.kind != ResultKind.REJECTED_STALE
+    assert newer_event.source_type == SourceType.WISHART_LIVE_QUERY
