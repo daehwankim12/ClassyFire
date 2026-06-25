@@ -20,7 +20,6 @@ from django.db.models import Count, Q, QuerySet
 from django.http import HttpRequest, HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 
-from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import (
     StructureKeyMismatchError,
@@ -28,7 +27,6 @@ from apps.batches.services import (
     StructureSubmissionError,
     submit_structure_for_item,
 )
-from apps.batches.upload import iter_combined_rows
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, BatchJobStatus
 from apps.core.security import (
@@ -38,7 +36,6 @@ from apps.core.security import (
     require_shared_access_web,
     set_job_access_cookie,
     spool_upload_under_quota,
-    stage_job_under_quota,
 )
 
 PAGE_SIZE = 100
@@ -101,11 +98,13 @@ def submit_view(request: HttpRequest) -> HttpResponse:
                     status=413,
                 )
 
-        # H-04: a FILE upload is atomically SPOOLED to a durable artifact and the
-        # job is created in UPLOADING — NO parsing/RDKit/BatchItem creation in the
-        # request. The durable `process_jobs` worker parses the artifact later.
-        # A pure TEXT paste (no file) stays on the lightweight streaming-stage
-        # path (it only bulk-inserts rows; never touches RDKit in-request).
+        # H-04: BOTH a FILE upload and a TEXT paste are atomically SPOOLED to a
+        # durable artifact and the job is created in UPLOADING — NO
+        # parsing/RDKit/BatchItem creation in the request (the gate requires
+        # returning BEFORE parsing/creating rows). The durable `process_jobs`
+        # worker parses the artifact later via the claim-fenced
+        # `stage_spooled_upload`, where the row-count caps (and bounded scanner)
+        # are enforced.
         if file:
             job, plaintext_secret, quota_error = spool_upload_under_quota(
                 request,
@@ -113,14 +112,11 @@ def submit_view(request: HttpRequest) -> HttpResponse:
                 remote_enabled=remote_enabled,
             )
         else:
-            row_iter = iter_combined_rows(
-                parse_text_input(text_input),
-                None,
-            )
-            job, plaintext_secret, quota_error = stage_job_under_quota(
+            job, plaintext_secret, quota_error = spool_upload_under_quota(
                 request,
-                row_iter,
+                text_input,
                 remote_enabled=remote_enabled,
+                is_text=True,
             )
         if quota_error is not None:
             quota_payload = json.loads(quota_error.content.decode("utf-8"))

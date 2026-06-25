@@ -470,11 +470,16 @@ def test_bulk_lookup_runs_single_query_for_chunk(monkeypatch):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_deferred_post_returns_immediately_items_pending():
-    """(a) The HTTP POST always returns 202 WITHOUT running heavy work:
-    items are still PENDING_NORMALIZATION and the job is not COMPLETE."""
+def test_deferred_post_returns_immediately_items_pending(settings, tmp_path):
+    """(a) The HTTP POST always returns 202 WITHOUT running heavy work.
+
+    H-04: a TEXT submit now spools to a durable artifact and returns 202 in a
+    claimable UPLOADING state with ZERO BatchItems in-request (parsing/row
+    creation is deferred to the worker, like a file upload), not COMPLETE."""
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
+
     from apps.batches.models import BatchItem, BatchJob
-    from apps.core.enums import BatchItemStatus, BatchJobStatus, BatchProcessingState
+    from apps.core.enums import BatchJobStatus, BatchProcessingState
 
     client = Client()
     resp = client.post(
@@ -485,12 +490,11 @@ def test_deferred_post_returns_immediately_items_pending():
     assert resp.status_code == 202, resp.content
     job = BatchJob.objects.get(pk=resp.json()["job_id"])
 
-    # HTTP did NOT block on normalization: the item is staged, not resolved.
-    item = BatchItem.objects.filter(job=job).get()
-    assert item.status == BatchItemStatus.PENDING_NORMALIZATION
-    assert item.inchikey is None
-    # Job is parked in a claimable parsing state, not yet COMPLETE.
-    assert job.processing_state == BatchProcessingState.PARSING
+    # HTTP did NOT parse: no rows materialized, the artifact is spooled instead.
+    assert BatchItem.objects.filter(job=job).count() == 0
+    assert job.upload_artifact_path
+    # Job is parked in a claimable UPLOADING state, not yet COMPLETE.
+    assert job.processing_state == BatchProcessingState.UPLOADING
     assert job.status == BatchJobStatus.PENDING
 
 
@@ -597,11 +601,21 @@ def test_deferred_route_does_not_materialize_whole_upload(monkeypatch):
 
 
 @pytest.mark.django_db(transaction=True)
-@override_settings(INGEST_DEFER_HEAVY_PROCESSING=True, MAX_ROWS_PER_JOB=5)
-def test_deferred_row_cap_enforced_midstream():
-    """The deferred staging path enforces MAX_ROWS_PER_JOB mid-stream (413) and
-    does not persist a partial job."""
-    from apps.batches.models import BatchJob
+def test_deferred_row_cap_enforced_midstream(settings, tmp_path):
+    """Over-cap input is rejected and its rows rolled back.
+
+    H-04: the text submit now spools to a durable artifact and returns 202 in
+    UPLOADING (no in-request parsing). MAX_ROWS_PER_JOB is enforced when the
+    WORKER stages the spooled artifact: ingest_rows raises RowCapExceededError
+    -> stage_spooled_upload raises QuotaExceededError -> process_claimed_job
+    parks the job terminal-FAILED with the staged rows rolled back."""
+    settings.INGEST_DEFER_HEAVY_PROCESSING = True
+    settings.MAX_ROWS_PER_JOB = 5
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
+
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import run_pending_jobs
+    from apps.core.enums import BatchJobStatus, BatchProcessingState
 
     text = "\n".join([ASPIRIN_SMILES] * 20)
     client = Client()
@@ -610,9 +624,21 @@ def test_deferred_row_cap_enforced_midstream():
         data=json.dumps({"text_input": text, "remote_enabled": "false"}),
         content_type="application/json",
     )
-    assert resp.status_code == 413, resp.content
-    # No job persisted (rolled back).
-    assert BatchJob.objects.count() == 0
+    # In-request: job staged in UPLOADING, NO rows parsed (row cap is deferred).
+    assert resp.status_code == 202, resp.content
+    job = BatchJob.objects.get(pk=resp.json()["job_id"])
+    assert job.processing_state == BatchProcessingState.UPLOADING
+    assert BatchItem.objects.filter(job=job).count() == 0
+
+    # Worker stages: the row cap fires and parks the job terminal-FAILED with
+    # the over-cap rows rolled back (no partial job persisted).
+    run_pending_jobs("cap-worker", max_jobs=1)
+
+    job.refresh_from_db()
+    assert job.status == BatchJobStatus.FAILED
+    assert job.processing_state == BatchProcessingState.FAILED
+    assert BatchItem.objects.filter(job=job).count() == 0
+    assert str(settings.MAX_ROWS_PER_JOB) in (job.processing_error or "")
 
 
 # ---------------------------------------------------------------------------

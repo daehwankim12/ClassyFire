@@ -13,17 +13,25 @@ import io
 import pytest
 
 from apps.batches.models import BatchJob
-from apps.core.enums import BatchItemStatus, BatchProcessingState
+from apps.core.enums import BatchProcessingState
 
 
 @pytest.mark.django_db
-def test_api_create_job_stages_without_processing(client, monkeypatch, settings):
+def test_api_create_job_stages_without_processing(client, monkeypatch, settings, tmp_path):
+    # H-04: a TEXT submit now spools to a durable artifact and returns 202 in
+    # UPLOADING with ZERO BatchItems in-request (parsing/row creation is deferred
+    # to the worker, exactly like a file upload). The request must NOT parse.
     settings.INGEST_DEFER_HEAVY_PROCESSING = True
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
 
-    def fail_if_called(job):
-        raise AssertionError("HTTP route must not process job items inline")
+    def fail_if_parsed(*args, **kwargs):
+        raise AssertionError("HTTP route must not parse rows or create BatchItems")
 
-    monkeypatch.setattr("apps.batches.services.process_job_items", fail_if_called)
+    monkeypatch.setattr(
+        "apps.core.security.create_job_records_streaming",
+        fail_if_parsed,
+        raising=False,
+    )
 
     response = client.post(
         "/api/jobs",
@@ -34,20 +42,34 @@ def test_api_create_job_stages_without_processing(client, monkeypatch, settings)
 
     assert response.status_code == 202
     job = BatchJob.objects.get(pk=response.json()["job_id"])
-    assert job.processing_state == BatchProcessingState.PARSING
-    assert list(job.items.values_list("status", flat=True)) == [
-        BatchItemStatus.PENDING_NORMALIZATION
-    ]
+    assert job.processing_state == BatchProcessingState.UPLOADING
+    assert job.items.count() == 0
+    assert job.upload_artifact_path
+
+    # Driving the worker stages the spooled text into rows and advances state.
+    from apps.batches.services import run_pending_jobs
+
+    run_pending_jobs("test-worker", max_jobs=1)
+
+    job.refresh_from_db()
+    assert job.processing_state != BatchProcessingState.UPLOADING
+    assert job.items.count() == 1
 
 
 @pytest.mark.django_db
-def test_html_submit_stages_without_processing(client, monkeypatch, settings):
+def test_html_submit_stages_without_processing(client, monkeypatch, settings, tmp_path):
+    # H-04: same deferred contract for the HTML submit route.
     settings.INGEST_DEFER_HEAVY_PROCESSING = True
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
 
-    def fail_if_called(job):
-        raise AssertionError("HTML route must not process job items inline")
+    def fail_if_parsed(*args, **kwargs):
+        raise AssertionError("HTML route must not parse rows or create BatchItems")
 
-    monkeypatch.setattr("apps.batches.services.process_job_items", fail_if_called)
+    monkeypatch.setattr(
+        "apps.core.security.create_job_records_streaming",
+        fail_if_parsed,
+        raising=False,
+    )
 
     response = client.post(
         "/",
@@ -63,10 +85,17 @@ def test_html_submit_stages_without_processing(client, monkeypatch, settings):
     job_id = parts[1]
 
     job = BatchJob.objects.get(pk=job_id)
-    assert job.processing_state == BatchProcessingState.PARSING
-    assert list(job.items.values_list("status", flat=True)) == [
-        BatchItemStatus.PENDING_NORMALIZATION
-    ]
+    assert job.processing_state == BatchProcessingState.UPLOADING
+    assert job.items.count() == 0
+    assert job.upload_artifact_path
+
+    from apps.batches.services import run_pending_jobs
+
+    run_pending_jobs("test-worker", max_jobs=1)
+
+    job.refresh_from_db()
+    assert job.processing_state != BatchProcessingState.UPLOADING
+    assert job.items.count() == 1
 
 
 @pytest.mark.django_db

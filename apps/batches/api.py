@@ -53,7 +53,6 @@ from apps.batches.exports import (
     create_export_for_authorized_job,
     get_export_path,
 )
-from apps.batches.ingest import parse_text_input
 from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import (
     StructureKeyMismatchError,
@@ -62,7 +61,6 @@ from apps.batches.services import (
     submit_structure_for_item,
 )
 from apps.batches.storage import get_artifact_storage
-from apps.batches.upload import iter_combined_rows
 from apps.core.enums import BatchItemStatus
 from apps.core.security import (
     UploadTooLargeError,
@@ -73,7 +71,6 @@ from apps.core.security import (
     require_shared_access,
     reserve_export_create_quota,
     spool_upload_under_quota,
-    stage_job_under_quota,
 )
 
 
@@ -180,11 +177,12 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
             except UploadTooLargeError as exc:
                 return JsonResponse({"error": str(exc)}, status=413)
 
-    # H-04: a FILE upload is atomically SPOOLED to a durable artifact and the job
-    # is created in UPLOADING — NO parsing/RDKit/BatchItem creation in the request
-    # (returns 202 BEFORE any parsing). The durable `process_jobs` worker parses
-    # the artifact later. A pure JSON/text paste (no file) stays on the
-    # lightweight streaming-stage path, which only bulk-inserts rows in-request.
+    # H-04: BOTH a FILE upload and a JSON/text paste are atomically SPOOLED to a
+    # durable artifact and the job is created in UPLOADING — NO
+    # parsing/RDKit/BatchItem creation in the request (returns 202 BEFORE any
+    # parsing). The durable `process_jobs` worker parses the artifact later via
+    # the claim-fenced `stage_spooled_upload`, where the row-count caps (and
+    # bounded scanner) are enforced.
     if file is not None:
         job, plaintext_secret, quota_error = spool_upload_under_quota(
             request,
@@ -192,14 +190,11 @@ def create_job_view(request: HttpRequest) -> JsonResponse:
             remote_enabled=remote_enabled,
         )
     else:
-        row_iter = iter_combined_rows(
-            parse_text_input(text_input),
-            None,
-        )
-        job, plaintext_secret, quota_error = stage_job_under_quota(
+        job, plaintext_secret, quota_error = spool_upload_under_quota(
             request,
-            row_iter,
+            text_input,
             remote_enabled=remote_enabled,
+            is_text=True,
         )
     if quota_error is not None:
         return quota_error

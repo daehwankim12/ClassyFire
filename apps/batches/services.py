@@ -1136,6 +1136,18 @@ def process_claimed_job(job: BatchJob) -> None:
         # park it FAILED - that would clobber the new owner's state. Propagate so
         # the caller drops this stale handle.
         raise
+    except QuotaExceededError as exc:
+        # A spooled upload exceeded a row-count cap at worker staging time (H-04
+        # deferred enforcement). This is an EXPECTED terminal outcome, not a
+        # worker crash: park the job terminal-FAILED (claim-fenced) and return
+        # cleanly so the worker loop keeps draining other jobs.
+        _fenced_claim_update(
+            claim,
+            processing_state=BatchProcessingState.FAILED,
+            status=BatchJobStatus.FAILED,
+            processing_error=str(exc)[:2000],
+        )
+        return
     except Exception as exc:
         # Fence the FAILED parking write too: a worker that lost its lease while
         # raising some OTHER error must not stomp the new owner's state. If this
