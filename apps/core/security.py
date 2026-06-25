@@ -108,10 +108,16 @@ def _check_bearer(request: HttpRequest) -> bool:
 
 
 def _job_secret_from_request(request: HttpRequest) -> str:
-    header_secret = request.headers.get("X-Job-Secret", "")
-    if header_secret:
-        return header_secret
-    return request.GET.get("secret", "")
+    """Return the per-job secret from the X-Job-Secret header only.
+
+    Query-string secrets (``?secret=``) are NOT accepted: a secret in the URL
+    leaks into access logs, browser history, and Referer headers. This is the
+    single chokepoint feeding ``_check_job_secret`` / ``_is_authenticated`` /
+    ``request_has_shared_access`` / ``require_csrf_for_cookie_auth``, so dropping
+    the query fallback here removes query-secret acceptance from EVERY job-scoped
+    route at once.
+    """
+    return request.headers.get("X-Job-Secret", "")
 
 
 def _check_job_secret(request: HttpRequest, job_id: object | None) -> bool:
