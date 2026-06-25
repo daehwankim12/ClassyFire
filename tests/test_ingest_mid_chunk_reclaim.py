@@ -12,7 +12,6 @@ from apps.compounds.models import CompoundUsage
 from apps.core.enums import BatchItemStatus, BatchProcessingState
 from apps.remote.models import RemoteBudgetLedger, RemoteTask
 
-
 INCHIKEY = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
 
 

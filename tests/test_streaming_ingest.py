@@ -629,7 +629,7 @@ def test_true_crash_and_reclaim_resumes_without_double_processing(
     items still PENDING_NORMALIZATION). RE-CLAIM via the real claim path and
     assert the job completes with NO double-processing: usage counts, compounds,
     and job counters are all correct with no duplicates."""
-    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.models import BatchItem
     from apps.batches.services import (
         _commit_prepared_chunk,
         _prepare_chunk,
