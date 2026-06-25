@@ -188,6 +188,14 @@ class RemoteQueryItem(models.Model):
                 fields=["query", "task"],
                 name="remote_query_item_query_task_unique",
             ),
+            # One member per (query, inchikey): a stale worker cannot re-link a
+            # query member it does not own, and the positional pairing in
+            # _apply_query_result stays unambiguous (F-07).
+            models.UniqueConstraint(
+                fields=["query", "inchikey"],
+                condition=Q(inchikey__isnull=False),
+                name="remote_query_item_query_inchikey_unique",
+            ),
         ]
         indexes = [
             models.Index(fields=["query"], name="remote_query_item_query_idx"),

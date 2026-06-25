@@ -347,6 +347,25 @@ def test_remote_query_provider_remote_id_is_unique():
 
 
 @pytest.mark.django_db
+def test_remote_query_item_query_inchikey_unique():
+    """A second item with the same (query, inchikey) is rejected, even with a
+    different task (e.g. task=None), so a stale worker cannot re-link a member."""
+    query = RemoteQuery.objects.create(
+        provider="wishart",
+        remote_query_id="query-ik-unique",
+        payload_hash="hash",
+    )
+    task = RemoteTask.objects.create(inchikey=VALID_INCHIKEY, state=TaskState.READY)
+    RemoteQueryItem.objects.create(query=query, task=task, inchikey=VALID_INCHIKEY)
+
+    with pytest.raises(IntegrityError):
+        with transaction.atomic():
+            RemoteQueryItem.objects.create(
+                query=query, task=None, inchikey=VALID_INCHIKEY
+            )
+
+
+@pytest.mark.django_db
 def test_real_postgres_constraints_reject_duplicate_query_item():
     query = RemoteQuery.objects.create(
         provider="wishart",

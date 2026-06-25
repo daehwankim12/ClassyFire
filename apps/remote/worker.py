@@ -153,8 +153,9 @@ class RemoteWorker:
         task = queue.claim_task(self.worker_id)
         if task is None:
             return False
+        claim = queue.claim_from_task(task)
         try:
-            self.process(task)
+            self.process(task, claim=claim)
         except LeaseLost:
             # Our lease was reclaimed mid-flight by another worker (F-07). Abort
             # without overwriting the new owner's state. The reclaim already
@@ -166,8 +167,17 @@ class RemoteWorker:
             )
         return True
 
-    def process(self, task: RemoteTask) -> None:
-        """Process a single claimed task to its next state."""
+    def process(
+        self, task: RemoteTask, *, claim: queue.TaskClaim | None = None
+    ) -> None:
+        """Process a single claimed task to its next state.
+
+        ``claim`` is the IMMUTABLE lease snapshot captured at claim time (F-07).
+        When not supplied we derive it FROM THE PASSED ``task`` object's current
+        fields — we never re-fetch the row to build it, because the whole point
+        is that the snapshot may already be stale relative to the live row.
+        """
+        claim = claim or queue.claim_from_task(task)
         if not settings.REMOTE_ENABLED:
             # Remote disabled: do NOT make any remote call. Park the task so the
             # queue keeps accumulating without losing work.
@@ -181,18 +191,29 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
 
-        queue.transition(task, TaskState.RUNNING)
+        try:
+            queue.transition(task, TaskState.RUNNING)
+        except LeaseLost:
+            # Lease stolen before we even started: a fresh worker owns the row.
+            # Abort WITHOUT writing anything — do not overwrite the new owner's
+            # state. (tick() also guards this; process() is called directly too.)
+            logger.warning(
+                "lease lost at RUNNING for task %s (inchikey=%s); aborting",
+                task.pk,
+                task.inchikey,
+            )
+            return
         # Already-submitted task resumed at its poll window: poll it.
         if task.query_items.filter(query__state__in=[
             QueryState.SUBMITTED, QueryState.POLLING
         ]).exists():
-            self._poll_task(task)
+            self._poll_task(task, claim)
         else:
-            self._entity_first(task)
+            self._entity_first(task, claim)
 
     # -- entity-first flow -------------------------------------------------
 
-    def _entity_first(self, task: RemoteTask) -> None:
+    def _entity_first(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
         if not self.rate_limiter.entity.allow():
             queue.defer_task(task, delay_seconds=5)
             fanout.mark_items_delayed(task.inchikey)
@@ -282,10 +303,10 @@ class RemoteWorker:
                 safe_headers=result.safe_headers,
             )
             if not self._key_matches(task.inchikey, norm.inchikey):
-                self._handle_key_mismatch(task, norm, query=None)
+                self._handle_key_mismatch(claim, norm, query=None)
                 return
             self._apply_result_with_fence(
-                task,
+                claim,
                 query=None,
                 norm=norm,
                 final_status=BatchItemStatus.FOUND_WISHART_ENTITY,
@@ -824,7 +845,7 @@ class RemoteWorker:
 
     # -- poll flow ---------------------------------------------------------
 
-    def _poll_task(self, task: RemoteTask) -> None:
+    def _poll_task(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
         item = (
             task.query_items.filter(
                 query__state__in=[QueryState.SUBMITTED, QueryState.POLLING]
@@ -864,46 +885,63 @@ class RemoteWorker:
 
         poll = self.provider.poll_query(remote_query_id)
 
+        # EVERY poll-outcome write (attempt rows + query state + task transition)
+        # is fenced behind the IMMUTABLE claim (F-07): we row-lock the task and
+        # re-assert the lease against the claim snapshot BEFORE writing anything.
+        # A stale worker whose lease was stolen raises LeaseLost here and writes
+        # NOTHING — no attempt, no query.state, no transition.
         if poll.status == PollStatus.RETRYABLE_ERROR:
             self.circuit.record_failure()
-            self._record_attempt(
-                RemoteAttempt.OPERATION_POLL,
-                classification="RETRYABLE",
-                raw_payload=poll.raw_json,
-                query=query,
-                http_status=poll.http_status,
-                remote_query_id=remote_query_id,
-                detail=poll.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=poll.raw_text,
-                safe_headers=poll.safe_headers,
-            )
-            if poll.retry_after is not None:
-                queue.retry_after_override(task, poll.retry_after)
-            else:
-                queue.schedule_retry(task)
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
+                    self._record_attempt(
+                        RemoteAttempt.OPERATION_POLL,
+                        classification="RETRYABLE",
+                        raw_payload=poll.raw_json,
+                        query=query,
+                        http_status=poll.http_status,
+                        remote_query_id=remote_query_id,
+                        detail=poll.detail,
+                        task=locked,
+                        request_inchikey=locked.inchikey,
+                        raw_body_text=poll.raw_text,
+                        safe_headers=poll.safe_headers,
+                    )
+                    if poll.retry_after is not None:
+                        queue.retry_after_override(locked, poll.retry_after)
+                    else:
+                        queue.schedule_retry(locked)
+            except LeaseLost:
+                self._log_poll_lease_lost(task, "RETRYABLE")
+                return
             fanout.mark_items_delayed(task.inchikey)
             return
 
         if poll.status == PollStatus.AUTH_FAILURE:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
             self.circuit.record_failure()
-            self._record_attempt(
-                RemoteAttempt.OPERATION_POLL,
-                classification="AUTH_FAILURE",
-                raw_payload=poll.raw_json,
-                query=query,
-                http_status=poll.http_status,
-                remote_query_id=remote_query_id,
-                detail=poll.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=poll.raw_text,
-                safe_headers=poll.safe_headers,
-            )
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
+                    self._record_attempt(
+                        RemoteAttempt.OPERATION_POLL,
+                        classification="AUTH_FAILURE",
+                        raw_payload=poll.raw_json,
+                        query=query,
+                        http_status=poll.http_status,
+                        remote_query_id=remote_query_id,
+                        detail=poll.detail,
+                        task=locked,
+                        request_inchikey=locked.inchikey,
+                        raw_body_text=poll.raw_text,
+                        safe_headers=poll.safe_headers,
+                    )
+                    queue.defer_task(locked, delay_seconds=self.lease_seconds)
+            except LeaseLost:
+                self._log_poll_lease_lost(task, "AUTH_FAILURE")
+                return
             logger.error("remote poll AUTH_FAILURE (operator action): %s", poll.detail)
-            queue.defer_task(task, delay_seconds=self.lease_seconds)
             fanout.mark_items_delayed(task.inchikey)
             return
 
@@ -911,75 +949,108 @@ class RemoteWorker:
             # NOT_FOUND (query absent) or unmapped status: never treat as
             # COMPLETE. Surface + retry rather than silently resolving (F-10).
             self.circuit.record_failure()
-            self._record_attempt(
-                RemoteAttempt.OPERATION_POLL,
-                classification=str(poll.status),
-                raw_payload=poll.raw_json,
-                query=query,
-                http_status=poll.http_status,
-                remote_query_id=remote_query_id,
-                detail=poll.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=poll.raw_text,
-                safe_headers=poll.safe_headers,
-            )
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
+                    self._record_attempt(
+                        RemoteAttempt.OPERATION_POLL,
+                        classification=str(poll.status),
+                        raw_payload=poll.raw_json,
+                        query=query,
+                        http_status=poll.http_status,
+                        remote_query_id=remote_query_id,
+                        detail=poll.detail,
+                        task=locked,
+                        request_inchikey=locked.inchikey,
+                        raw_body_text=poll.raw_text,
+                        safe_headers=poll.safe_headers,
+                    )
+                    queue.schedule_retry(locked)
+            except LeaseLost:
+                self._log_poll_lease_lost(task, str(poll.status))
+                return
             logger.error("remote poll %s: %s", poll.status, poll.detail)
-            queue.schedule_retry(task)
             fanout.mark_items_delayed(task.inchikey)
             return
 
         self.circuit.record_success()
 
         if poll.status == PollStatus.RUNNING:
-            self._record_attempt(
-                RemoteAttempt.OPERATION_POLL,
-                classification="RUNNING",
-                raw_payload=poll.raw_json,
-                query=query,
-                http_status=poll.http_status,
-                remote_query_id=remote_query_id,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=poll.raw_text,
-                safe_headers=poll.safe_headers,
-            )
-            query.state = QueryState.POLLING
-            query.next_poll_at = timezone.now() + timedelta(
-                seconds=settings.REMOTE_POLL_MIN_SECONDS
-            )
-            query.save(update_fields=["state", "next_poll_at"])
-            queue.transition(
-                task,
-                TaskState.POLL_WAIT,
-                next_run_at=query.next_poll_at,
-                lock_owner=None,
-                locked_at=None,
-            )
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
+                    self._record_attempt(
+                        RemoteAttempt.OPERATION_POLL,
+                        classification="RUNNING",
+                        raw_payload=poll.raw_json,
+                        query=query,
+                        http_status=poll.http_status,
+                        remote_query_id=remote_query_id,
+                        task=locked,
+                        request_inchikey=locked.inchikey,
+                        raw_body_text=poll.raw_text,
+                        safe_headers=poll.safe_headers,
+                    )
+                    query.state = QueryState.POLLING
+                    query.next_poll_at = timezone.now() + timedelta(
+                        seconds=settings.REMOTE_POLL_MIN_SECONDS
+                    )
+                    query.save(update_fields=["state", "next_poll_at"])
+                    queue.transition_locked(
+                        locked,
+                        TaskState.POLL_WAIT,
+                        next_run_at=query.next_poll_at,
+                        lock_owner=None,
+                        locked_at=None,
+                    )
+            except LeaseLost:
+                self._log_poll_lease_lost(task, "RUNNING")
             return
 
-        # COMPLETE
+        # COMPLETE: record the poll attempt + flip query.state to COMPLETE only
+        # if THIS worker still owns the lease, then dispatch each member under its
+        # own fence. If the initial claim is lost, abort BEFORE query.state=COMPLETE
+        # so a stale worker never advances the query the fresh owner now drives.
         raw = poll.raw_json or {}
-        self._record_attempt(
-            RemoteAttempt.OPERATION_POLL,
-            classification="COMPLETE",
-            raw_payload=raw,
-            query=query,
-            http_status=poll.http_status,
-            remote_query_id=remote_query_id,
-            task=task,
-            request_inchikey=task.inchikey,
-            raw_body_text=poll.raw_text,
-            safe_headers=poll.safe_headers,
+        try:
+            with transaction.atomic():
+                locked = queue.lock_owned_claim(claim)
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_POLL,
+                    classification="COMPLETE",
+                    raw_payload=raw,
+                    query=query,
+                    http_status=poll.http_status,
+                    remote_query_id=remote_query_id,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=poll.raw_text,
+                    safe_headers=poll.safe_headers,
+                )
+                query.state = QueryState.COMPLETE
+                query.raw_response = raw
+                query.completed_at = timezone.now()
+                query.save(update_fields=["state", "raw_response", "completed_at"])
+        except LeaseLost:
+            self._log_poll_lease_lost(task, "COMPLETE")
+            return
+        self._apply_query_result(claim, task, query, raw)
+
+    @staticmethod
+    def _log_poll_lease_lost(task: RemoteTask, outcome: str) -> None:
+        logger.warning(
+            "lease lost on poll %s for task %s (inchikey=%s); aborting write",
+            outcome,
+            task.pk,
+            task.inchikey,
         )
-        query.state = QueryState.COMPLETE
-        query.raw_response = raw
-        query.completed_at = timezone.now()
-        query.save(update_fields=["state", "raw_response", "completed_at"])
-        self._apply_query_result(task, query, raw)
 
     def _apply_query_result(
-        self, task: RemoteTask, query: RemoteQuery, raw: dict
+        self,
+        claim: queue.TaskClaim,
+        task: RemoteTask,
+        query: RemoteQuery,
+        raw: dict,
     ) -> None:
         """Resolve EVERY task batched into this completed query.
 
@@ -1025,7 +1096,10 @@ class RemoteWorker:
             # Clean one-entity-per-task response: pair positionally and validate
             # each pair's key, so a wrong-key slot surfaces as a mismatch.
             for member, norm in zip(members, results, strict=True):
-                self._dispatch_resolved(member, query, norm)
+                member_claim = self._member_claim(member, claim)
+                if member_claim is None:
+                    continue
+                self._dispatch_resolved(member_claim, member, query, norm)
             return
 
         # Partial / ragged response: resolve by InChIKey, retry the absent.
@@ -1033,10 +1107,59 @@ class RemoteWorker:
             norm.inchikey: norm for norm in results if norm.inchikey is not None
         }
         for member in members:
-            self._dispatch_resolved(member, query, by_key.get(member.inchikey))
+            member_claim = self._member_claim(member, claim)
+            if member_claim is None:
+                continue
+            self._dispatch_resolved(
+                member_claim, member, query, by_key.get(member.inchikey)
+            )
+
+    def _member_claim(
+        self, member: RemoteTask, claim: queue.TaskClaim
+    ) -> queue.TaskClaim | None:
+        """The fencing claim to use for a batched member (F-07).
+
+        The polled task reuses the IMMUTABLE entry claim. A SIBLING gets a claim
+        snapshotted from its OWN current lease (``_claim_for_member_if_owned``);
+        :func:`queue.lock_owned_claim` then re-asserts that snapshot at write
+        time, so we resolve a sibling only if its lease is unchanged since we read
+        it. If a CONCURRENT worker has stolen the sibling's lease between read and
+        write, the apply raises LeaseLost and the sibling is SKIPPED for THIS
+        task — never corrupted; its durable RemoteQueryItem link means a later
+        task (Task 15 makes the skip durable) re-resolves it from the COMPLETE
+        query.
+
+        Adaptation vs the brief: the brief gated siblings on
+        ``member.lock_owner == self.worker_id``, but in THIS tree batch siblings
+        are parked POLL_WAIT with the lock RELEASED (lock_owner=None) before the
+        query is polled, so that gate would wrongly strand every legitimate batch
+        sibling. Snapshotting the member's actual lease + the lock_owned_claim
+        fence is the equivalent of the pre-refactor ``lock_owned_task(member)``
+        guard (row-lock + lease self-consistency) and keeps batch resolution
+        correct without ever writing an unowned-but-concurrently-stolen sibling.
+        """
+        if member.pk == claim.task_id:
+            return claim
+        return self._claim_for_member_if_owned(member)
+
+    def _claim_for_member_if_owned(
+        self, member: RemoteTask
+    ) -> queue.TaskClaim | None:
+        """Snapshot a batch sibling's CURRENT lease into a claim (F-07).
+
+        Returns the claim built from the member's live lease fields. The actual
+        ownership decision is deferred to :func:`queue.lock_owned_claim` at write
+        time, which raises LeaseLost (→ skip) if a concurrent worker changed the
+        lease after we read the member. Returns None only if the member has no pk
+        (cannot be locked/fenced).
+        """
+        if member.pk is None:
+            return None
+        return queue.claim_from_task(member)
 
     def _dispatch_resolved(
         self,
+        claim: queue.TaskClaim,
         task: RemoteTask,
         query: RemoteQuery,
         norm: NormalizedClassification | None,
@@ -1044,14 +1167,26 @@ class RemoteWorker:
         if norm is None:
             # No entity for this task's InChIKey: unresolved miss → retry per the
             # normal backoff rules rather than leaving it parked in POLL_WAIT.
-            queue.schedule_retry(task)
+            # Fence the retry so a stale worker never re-parks a stolen task.
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
+                    queue.schedule_retry(locked)
+            except LeaseLost:
+                logger.warning(
+                    "lease lost dispatching miss-retry for task %s (inchikey=%s); "
+                    "skipping",
+                    task.pk,
+                    task.inchikey,
+                )
+                return
             fanout.mark_items_delayed(task.inchikey)
             return
         if not self._key_matches(task.inchikey, norm.inchikey):
-            self._handle_key_mismatch(task, norm, query=query)
+            self._handle_key_mismatch(claim, norm, query=query)
             return
         self._apply_result_with_fence(
-            task,
+            claim,
             query=query,
             norm=norm,
             final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
@@ -1061,7 +1196,7 @@ class RemoteWorker:
 
     def _apply_result_with_fence(
         self,
-        task: RemoteTask,
+        claim: queue.TaskClaim,
         *,
         query: RemoteQuery | None,
         norm: NormalizedClassification,
@@ -1069,8 +1204,9 @@ class RemoteWorker:
     ) -> None:
         """Apply a successful result under ONE lease-fenced transaction (F-07).
 
-        The lease guard runs FIRST: :func:`queue.lock_owned_task` row-locks the
-        task and re-asserts this worker still owns the lease before ANY side
+        The lease guard runs FIRST: :func:`queue.lock_owned_claim` row-locks the
+        task and re-asserts this worker still owns the lease — against the
+        IMMUTABLE ``claim`` snapshot, never a reloaded row — before ANY side
         effect. A stale worker (whose lease was stolen after a crash/stale-lock
         recovery) raises :class:`LeaseLost` here and writes NOTHING — no
         ClassificationResult event, no fan-out, no transition. Only an owning
@@ -1078,7 +1214,7 @@ class RemoteWorker:
         with the lease check, so the result is applied exactly once.
         """
         with transaction.atomic():
-            locked = queue.lock_owned_task(task)
+            locked = queue.lock_owned_claim(claim)
             write_live_result(
                 locked.inchikey,
                 norm,
@@ -1111,7 +1247,7 @@ class RemoteWorker:
             defaults={"payload_hash": f"test:{remote_query_id}"},
         )
         self._apply_result_with_fence(
-            task,
+            queue.claim_from_task(task),
             query=query,
             norm=norm,
             final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
@@ -1125,7 +1261,7 @@ class RemoteWorker:
 
     def _handle_key_mismatch(
         self,
-        task: RemoteTask,
+        claim: queue.TaskClaim,
         norm: NormalizedClassification,
         *,
         query: RemoteQuery | None,
@@ -1142,7 +1278,7 @@ class RemoteWorker:
         NOTHING (the rejected event included).
         """
         self._apply_result_with_fence(
-            task,
+            claim,
             query=query,
             norm=norm,
             final_status=BatchItemStatus.RESULT_KEY_MISMATCH,

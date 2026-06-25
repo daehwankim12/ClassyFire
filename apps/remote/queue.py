@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
@@ -46,6 +47,56 @@ class LeaseLost(Exception):  # noqa: N818 - domain name fixed by the F-07 contra
             f"lease lost for remote_task pk={task_pk}: version/token no longer match"
         )
         self.task_pk = task_pk
+
+
+@dataclass(frozen=True)
+class TaskClaim:
+    """An IMMUTABLE snapshot of a task's lease, captured at claim time (F-07).
+
+    The worker carries this value through the whole processing path. Result
+    application re-locks the row and re-asserts the lease against THIS snapshot
+    — never against the (possibly fresher) reloaded row — so a stale worker
+    whose lease was stolen after a crash/stale-lock recovery can never borrow
+    the new owner's lease by reloading ``RemoteQueryItem.task``.
+    """
+
+    task_id: int
+    worker_id: str
+    lease_version: int
+    lease_token: uuid.UUID | None
+
+
+def claim_from_task(task: RemoteTask) -> TaskClaim:
+    """Snapshot a task's CURRENT lease fields into an immutable :class:`TaskClaim`.
+
+    Captures the lease as the worker sees it at claim time. Callers must NOT
+    re-fetch the row to build the claim — the point is the snapshot may go stale.
+    """
+    return TaskClaim(
+        task_id=task.pk,
+        worker_id=str(task.lock_owner or ""),
+        lease_version=task.lease_version,
+        lease_token=task.lease_token,
+    )
+
+
+def lock_owned_claim(claim: TaskClaim) -> RemoteTask:
+    """Row-lock the claim's task and assert the lease still matches the snapshot.
+
+    ``SELECT ... FOR UPDATE`` the row, then verify its
+    ``(lease_version, lease_token, lock_owner)`` still equal the IMMUTABLE
+    ``claim``. If a fresher worker stole the lease the triple no longer matches
+    and we raise :class:`LeaseLost` BEFORE any side effect. MUST be called inside
+    ``transaction.atomic()`` so the returned row stays locked for the fenced work.
+    """
+    locked = RemoteTask.objects.select_for_update().get(pk=claim.task_id)
+    if (
+        locked.lease_version != claim.lease_version
+        or locked.lease_token != claim.lease_token
+        or str(locked.lock_owner or "") != claim.worker_id
+    ):
+        raise LeaseLost(claim.task_id)
+    return locked
 
 # Backoff schedule in seconds: 1m, 5m, 30m, 2h, 6h, 24h. Past the end of the
 # schedule the task is DEFERRED (parked, retried ~daily), never discarded.
