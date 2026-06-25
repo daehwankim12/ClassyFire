@@ -207,6 +207,11 @@ JOB_CREATE_DAILY_ROW_CAP: int = env_int("JOB_CREATE_DAILY_ROW_CAP", 100_000)
 ACTIVE_JOB_CAP: int = env_int("ACTIVE_JOB_CAP", 20)
 EXPORT_CREATE_RATE_LIMIT_PER_MINUTE: int = env_int("EXPORT_CREATE_RATE_LIMIT_PER_MINUTE", 10)
 JOB_ACCESS_COOKIE_DAYS: int = env_int("JOB_ACCESS_COOKIE_DAYS", 14)
+# M-03: orphan export files (no ExportArtifact row) and stale temp partials
+# from crashed streaming writes are deleted only when their mtime is older than
+# this many seconds.  The grace period ensures an in-flight write is never
+# raced.  Set via EXPORT_ORPHAN_GRACE_SECONDS env var; default 1 hour.
+EXPORT_ORPHAN_GRACE_SECONDS: int = env_int("EXPORT_ORPHAN_GRACE_SECONDS", 3600)
 
 # ---------------------------------------------------------------------------
 # Referrer policy (defence-in-depth: URL path embeds a per-job secret)
