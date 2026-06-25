@@ -13,9 +13,12 @@ export_cache
 media
 uploads
 exports
+export_files
+source_artifacts
 backups
 *.dump
 *.sql
 *.sqlite3
 *.log
+code.zip
 docs/superpowers/plans/*.tmp
