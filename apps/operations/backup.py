@@ -147,13 +147,15 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
                     archives_to_delete.add(legacy_media)
                 # Also prune every archive in artifact_archives (new manifests).
                 # Each entry is {"file": "...tar.gz", "checksum": "..."}.
-                for entry in (data.get("artifact_archives") or {}).values():
-                    try:
-                        fname = entry["file"]
-                        if fname:
-                            archives_to_delete.add(fname)
-                    except (KeyError, TypeError):
-                        pass
+                artifact_archives = data.get("artifact_archives") or {}
+                if isinstance(artifact_archives, dict):
+                    for entry in artifact_archives.values():
+                        try:
+                            fname = entry["file"]
+                            if fname:
+                                archives_to_delete.add(fname)
+                        except (KeyError, TypeError):
+                            pass
                 for fname in archives_to_delete:
                     archive_path = backup_dir / fname
                     if archive_path.exists():
