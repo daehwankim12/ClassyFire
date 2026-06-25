@@ -16,7 +16,7 @@ import pytest
 from django.test import Client
 
 from apps.batches.ingest import parse_text_input
-from apps.batches.services import create_job
+from apps.batches.services import create_job, run_pending_jobs
 from apps.core.enums import BatchItemStatus
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,11 @@ def test_submit_to_export_flow_via_test_client():
     payload = resp.json()
     job_id = payload["job_id"]
     secret = payload["result_secret"]
+
+    # H-04: text/paste input is spooled out-of-request and parsed by the durable
+    # worker, so no BatchItems exist at 202. Drive the worker to stage + normalize
+    # before asserting on items/exports (mirrors the deferred file-upload flow).
+    run_pending_jobs("e2e-worker")
 
     # --- 2. Poll job status ---
     resp = client.get(f"/api/jobs/{job_id}", HTTP_X_JOB_SECRET=secret)
