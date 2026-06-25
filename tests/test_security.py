@@ -1530,3 +1530,129 @@ class TestApiIngestGuards:
         assert "limit" in overlong_item.message.lower() or "exceed" in overlong_item.message.lower(), (
             f"message should state the length limit, got: {overlong_item.message}"
         )
+
+
+# ===========================================================================
+# 15. Job-create rate limit vs worker row-count accounting (kind split)
+# ===========================================================================
+
+
+class TestJobCreateKindSplit:
+    """[MEDIUM] The worker's row-count accounting event must NOT consume a
+    per-minute job-create rate slot.
+
+    After H-04, every job-create writes TWO BatchQuotaEvent rows: a request-time
+    reservation (row_count=0) and the worker's real-row-count accounting event.
+    The per-minute rate limiter COUNTs job-create events, so if both share the
+    same kind, the worker event halves the effective rate. The fix gives the
+    worker event a DISTINCT kind (KIND_JOB_ROWS) so the per-minute COUNT sees
+    exactly one event per job, while the daily-row-cap SUM still sees both kinds.
+    """
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        JOB_CREATE_RATE_LIMIT_PER_MINUTE=2,
+    )
+    def test_worker_rowcount_event_does_not_consume_rate_slot(self) -> None:
+        """One job created via the spool API path + drained by the worker must
+        leave exactly ONE KIND_JOB_CREATE reservation, so a SECOND job in the
+        same minute still succeeds (202) under a limit of 2.
+
+        Pre-fix this FAILS: the worker writes a second KIND_JOB_CREATE event, so
+        the per-minute COUNT hits 2 and the second request is rejected (429).
+        """
+        from apps.batches.models import BatchQuotaEvent
+        from apps.batches.services import run_pending_jobs
+
+        client = Client()
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {_TEST_PASSWORD}"}
+
+        # First job via the spool API path (text/paste now uses the spool too).
+        first = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": False}),
+            content_type="application/json",
+            **auth,
+        )
+        assert first.status_code == 202, (
+            f"First job-create should succeed (202), got {first.status_code}: {first.content}"
+        )
+
+        # Drain the worker so it stages the artifact and writes its row-count
+        # accounting event within the same minute window.
+        run_pending_jobs("test-worker", max_jobs=10)
+
+        # The worker event must NOT be a KIND_JOB_CREATE reservation.
+        job_create_count = BatchQuotaEvent.objects.filter(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+        ).count()
+        assert job_create_count == 1, (
+            "Exactly one KIND_JOB_CREATE reservation must exist per job after the "
+            f"worker drains; got {job_create_count} (the worker event must use "
+            "KIND_JOB_ROWS, not KIND_JOB_CREATE)."
+        )
+        # The worker's real row-count must be recorded under KIND_JOB_ROWS.
+        assert BatchQuotaEvent.objects.filter(
+            kind=BatchQuotaEvent.KIND_JOB_ROWS,
+            row_count__gt=0,
+        ).exists(), "Worker must record the real row count under KIND_JOB_ROWS"
+
+        # Second job in the same minute must still succeed: only 1 job-create
+        # reservation exists so far, and the limit is 2.
+        second = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": ASPIRIN_SMILES, "remote_enabled": False}),
+            content_type="application/json",
+            **auth,
+        )
+        assert second.status_code == 202, (
+            "Second job-create in the same minute must succeed (202) — the worker "
+            f"row-count event must not consume a rate slot; got {second.status_code}: "
+            f"{second.content}"
+        )
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        JOB_CREATE_DAILY_ROW_CAP=1,
+    )
+    def test_daily_row_cap_still_enforced_after_kind_split(self) -> None:
+        """The daily row cap must still be enforced by the worker after the kind
+        split. With a cap of 1 row and a multi-row job, the worker (which sums
+        over BOTH kinds) must park the job terminal-FAILED rather than staging it.
+        """
+        from apps.batches.models import BatchJob
+        from apps.batches.services import run_pending_jobs
+        from apps.core.enums import BatchJobStatus, BatchProcessingState
+
+        client = Client()
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {_TEST_PASSWORD}"}
+
+        # A two-row submission against a cap of 1 row.
+        text_input = f"{ASPIRIN_SMILES}\n{ASPIRIN_SMILES}"
+        response = client.post(
+            "/api/jobs",
+            data=json.dumps({"text_input": text_input, "remote_enabled": False}),
+            content_type="application/json",
+            **auth,
+        )
+        assert response.status_code == 202, (
+            f"Job create should be staged (202), got {response.status_code}: {response.content}"
+        )
+        job_id = response.json()["job_id"]
+
+        # The worker stages the artifact, discovers the real row count exceeds
+        # the daily cap, and parks the job terminal-FAILED.
+        run_pending_jobs("test-worker", max_jobs=10)
+
+        job = BatchJob.objects.get(pk=job_id)
+        assert job.status == BatchJobStatus.FAILED, (
+            f"Daily row cap must still park the job FAILED; got status={job.status}"
+        )
+        assert job.processing_state == BatchProcessingState.FAILED, (
+            f"processing_state must be FAILED; got {job.processing_state}"
+        )
+        assert "quota" in (job.processing_error or "").lower(), (
+            f"processing_error must record the quota reason; got: {job.processing_error}"
+        )

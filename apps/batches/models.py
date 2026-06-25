@@ -235,6 +235,7 @@ class BatchQuotaEvent(models.Model):
     """DB-backed quota accounting for job creation and export attempts."""
 
     KIND_JOB_CREATE = "job_create"
+    KIND_JOB_ROWS = "job_rows"
     KIND_EXPORT_CREATE = "export_create"
 
     kind = models.CharField(max_length=32)

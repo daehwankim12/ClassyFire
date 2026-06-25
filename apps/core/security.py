@@ -529,7 +529,10 @@ def validate_job_create_controls(request: HttpRequest, row_count: int) -> JsonRe
     daily_cap = int(getattr(settings, "JOB_CREATE_DAILY_ROW_CAP", 100_000))
     used_rows = (
         BatchQuotaEvent.objects.filter(
-            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            kind__in=[
+                BatchQuotaEvent.KIND_JOB_CREATE,
+                BatchQuotaEvent.KIND_JOB_ROWS,
+            ],
             created_at__gte=day_ago,
         )
         .filter(principal=principal)

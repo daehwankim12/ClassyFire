@@ -980,7 +980,10 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
             # recorded with row_count=0). Roll back the staged rows if exceeded.
             used_rows = (
                 BatchQuotaEvent.objects.filter(
-                    kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                    kind__in=[
+                        BatchQuotaEvent.KIND_JOB_CREATE,
+                        BatchQuotaEvent.KIND_JOB_ROWS,
+                    ],
                     created_at__gte=day_ago,
                     principal=locked_job.remote_principal,
                 ).aggregate(total=Sum("row_count"))["total"]
@@ -991,7 +994,7 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
                 raise QuotaExceededError("Daily row quota exceeded.")
 
             BatchQuotaEvent.objects.create(
-                kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                kind=BatchQuotaEvent.KIND_JOB_ROWS,
                 principal=locked_job.remote_principal,
                 ip_address="",
                 row_count=row_count,
