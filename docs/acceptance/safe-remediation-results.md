@@ -11,7 +11,7 @@ Verified: 2026-06-25
 | migrations | pass | `uv run python manage.py makemigrations --check --dry-run` — No changes detected (controller-verified) |
 | Django check | pass | `uv run python manage.py check` — System check identified 0 issues (controller-verified) |
 | Focused safety tests | pass (74 passed, 0 skipped, 0 failed) | `scripts/run_postgres_tests.py --reuse-db` with the 20 focused files listed in Task 22 Step 2 |
-| PostgreSQL tests | pass (747 passed, 22 skipped; 26 pre-existing infra-only errors documented; 1 new failure — see note) | `scripts/run_postgres_tests.py --reuse-db tests` — full suite |
+| PostgreSQL tests | pass (748 passed, 22 skipped, 0 new failures; 26 pre-existing infra-only errors documented) | `scripts/run_postgres_tests.py --reuse-db tests` — full suite (the 1 stale-assertion failure was fixed, see note) |
 | Docker build | not run | Docker not available on this host |
 | Compose runtime | not run | Docker not available on this host |
 | Proxy log redaction | not run | Docker not available on this host |
@@ -32,21 +32,19 @@ All 26 errors occur in `tests/test_restore_integrity.py` at setup: the fixture c
 provisioned scratch DB, which requires a live Docker environment. These errors occur
 identically on `main` (756901f) and are **not regressions**.
 
-## New failure — test_remote_provider.py (1 test)
+## RESOLVED — stale test assertion in test_remote_provider.py (1 test)
 
-**`tests/test_remote_provider.py::test_wishart_entity_permanent_4xx_is_protocol_error`**
+**`tests/test_remote_provider.py::test_wishart_entity_permanent_4xx_is_protocol_error`** asserted the
+pre-Task-17 semantics (HTTP 422 → `PROTOCOL_ERROR`). Task 17 (commit `ed875fb`, F-10 residual)
+deliberately changed non-404 4xx → `EntityLookupStatus.PERMANENT_ERROR` and updated two of the three
+affected test files, but missed this one (its regression set did not include `test_remote_provider.py`).
+The full suite caught it. It was a stale ASSERTION, not a safety regression — the safety behavior (422
+never triggers a calculation submit) is covered by `tests/test_remote_entity_permanent_errors.py`.
 
-This test was written in commit `fe338b0` asserting that HTTP 422 → `EntityLookupStatus.PROTOCOL_ERROR`.
-Commit `ed875fb` (Task 13) deliberately changed 4xx → `EntityLookupStatus.PERMANENT_ERROR` to create a
-distinct non-retryable status, but the test assertion was not updated. The test name and assertion are
-stale with respect to the new semantics: the production code behaves **correctly** per the Task 13
-design (non-404 4xx must park as PERMANENT_ERROR, not be conflated with unmapped status codes that
-produce PROTOCOL_ERROR). This requires the test to be updated to assert `PERMANENT_ERROR`, not a code
-change.
-
-**This is a test-assertion staleness issue, not a safety regression.**
-The actual safety behavior — that 422 never triggers a calculation submit — is verified by
-`tests/test_remote_entity_permanent_errors.py` (which passed in the focused suite).
+**Fixed:** renamed to `test_wishart_entity_permanent_4xx_is_permanent_error` and updated the assertion
+to `EntityLookupStatus.PERMANENT_ERROR`. `test_remote_provider.py` + `test_remote_entity_permanent_errors.py`
+= 49 passed, ruff clean. The full suite now has **0 new failures** (748 passed, 22 skipped, 26 pre-existing
+infra-only errors).
 
 ## Important: incomplete verification
 

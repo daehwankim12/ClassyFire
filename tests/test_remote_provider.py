@@ -301,15 +301,16 @@ def test_wishart_entity_unknown_status_is_protocol_error():
     assert result.status != EntityLookupStatus.FOUND
 
 
-def test_wishart_entity_permanent_4xx_is_protocol_error():
+def test_wishart_entity_permanent_4xx_is_permanent_error():
     # A definite non-404 4xx (e.g. 422) is a PERMANENT protocol/input error, NOT
-    # an entity miss: surface PROTOCOL_ERROR so the worker NEVER submits a
-    # calculation for a malformed request.
+    # an entity miss: surface PERMANENT_ERROR (distinct from an unmapped
+    # PROTOCOL_ERROR) so the worker NEVER submits a calculation for a malformed
+    # request. (Task 17 / F-10 residual.)
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(422, text="unprocessable")
 
     result = _wishart_with(handler).lookup_entity(IK_A)
-    assert result.status == EntityLookupStatus.PROTOCOL_ERROR
+    assert result.status == EntityLookupStatus.PERMANENT_ERROR
     assert result.raw_text == "unprocessable"
 
 
