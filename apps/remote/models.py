@@ -15,6 +15,7 @@ from apps.core.enums import (
     ACTIVE_TASK_STATES,
     LIVE_SUBMISSION_STATES,
     CircuitState,
+    ProviderControlState,
     QueryState,
     SubmissionState,
     TaskState,
@@ -563,3 +564,30 @@ class RemotePrincipalState(models.Model):
 
     def __str__(self) -> str:
         return f"remote-principal:{self.principal}"
+
+
+class RemoteProviderControl(models.Model):
+    """Durable operator-controlled gate for a remote provider (one row each).
+
+    A provider that returns 401/403 is flipped to ``AUTH_BLOCKED`` here so EVERY
+    worker process stops calling it (``RemoteWorker.tick`` short-circuits on this
+    row) until an operator runs ``manage.py reset_provider_auth``. The unique
+    ``provider`` column serializes concurrent block writers via
+    ``update_or_create`` — the first creates the row, the rest update it.
+    """
+
+    provider = models.CharField(max_length=32, default="wishart", unique=True)
+    state = models.CharField(
+        max_length=24,
+        choices=ProviderControlState.choices,
+        default=ProviderControlState.ENABLED,
+    )
+    blocked_reason = models.TextField(null=True, blank=True)
+    credential_version = models.CharField(max_length=128, null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_provider_controls"
+
+    def __str__(self) -> str:
+        return f"remote-provider-control:{self.provider}:{self.state}"

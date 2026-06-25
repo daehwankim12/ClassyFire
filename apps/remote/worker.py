@@ -37,6 +37,7 @@ from django.utils import timezone
 from apps.classifications.result_writer import write_live_result
 from apps.core.enums import (
     BatchItemStatus,
+    ProviderControlState,
     QueryState,
     SourceType,
     SubmissionState,
@@ -46,6 +47,7 @@ from apps.remote import fanout, queue
 from apps.remote.circuit import DbCircuitBreaker
 from apps.remote.models import (
     RemoteAttempt,
+    RemoteProviderControl,
     RemoteQuery,
     RemoteQueryItem,
     RemoteSubmission,
@@ -70,6 +72,18 @@ logger = logging.getLogger(__name__)
 # Provider namespace for the outbox/circuit/rate-bucket rows. Single provider
 # today; kept explicit so the idempotency key and shared state are namespaced.
 PROVIDER = "wishart"
+
+
+def _provider_auth_blocked(provider: str = PROVIDER) -> bool:
+    """True when an operator-resettable AUTH_BLOCKED gate exists for ``provider``.
+
+    A cheap point read of the single ``remote_provider_controls`` row. Every
+    worker's ``tick()`` consults this BEFORE claiming a task so a single durable
+    AUTH_BLOCKED state stops ALL worker processes from calling a provider whose
+    credentials are bad — until an operator runs ``reset_provider_auth`` (H-03).
+    """
+    row = RemoteProviderControl.objects.filter(provider=provider).first()
+    return row is not None and row.state == ProviderControlState.AUTH_BLOCKED
 
 
 class _Bucket(Protocol):
@@ -148,6 +162,11 @@ class RemoteWorker:
 
         if is_remote_paused():
             return False
+        if _provider_auth_blocked(PROVIDER):
+            # Durable provider-wide gate (H-03): a prior 401/403 blocked this
+            # provider. Return BEFORE claiming a task so no work is leased only to
+            # be deferred — every worker stays idle until an operator resets it.
+            return False
         queue.recover_stale_locks(self.lease_seconds)
         queue.reactivate_due_tasks()
         task = queue.claim_task(self.worker_id)
@@ -218,7 +237,34 @@ class RemoteWorker:
             queue.defer_task(task, delay_seconds=5)
             fanout.mark_items_delayed(task.inchikey)
             return
-        result = self.provider.lookup_entity(task.inchikey)
+        try:
+            result = self.provider.lookup_entity(task.inchikey)
+        except AuthProviderError as exc:
+            # A provider that RAISES an auth failure (rather than mapping it to
+            # EntityLookupStatus.AUTH_FAILURE) is handled identically: record the
+            # attempt, durably block the provider for ALL workers (H-03), and
+            # defer this task. Never burns an attempt.
+            self.circuit.record_failure()
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification="AUTH_FAILURE",
+                raw_payload=None,
+                http_status=exc.http_status,
+                detail=str(exc),
+                task=task,
+                request_inchikey=task.inchikey,
+                raw_body_text=exc.raw_text,
+                safe_headers=exc.safe_headers,
+            )
+            self._block_provider_auth(str(exc))
+            logger.error(
+                "remote entity AUTH_FAILURE (operator action) for %s: %s",
+                task.inchikey,
+                exc,
+            )
+            queue.defer_task(task, delay_seconds=self.lease_seconds)
+            fanout.mark_items_delayed(task.inchikey)
+            return
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
             self.circuit.record_failure()
@@ -255,6 +301,7 @@ class RemoteWorker:
                 raw_body_text=result.raw_text,
                 safe_headers=result.safe_headers,
             )
+            self._block_provider_auth(result.detail or "entity auth failure")
             logger.error(
                 "remote entity AUTH_FAILURE (operator action) for %s: %s",
                 task.inchikey,
@@ -539,6 +586,7 @@ class RemoteWorker:
                 safe_headers=exc.safe_headers,
             )
             self._fail_submission(submission, detail=f"auth: {exc}")
+            self._block_provider_auth(str(exc))
             logger.error("remote submit AUTH_FAILURE (operator action): %s", exc)
             for member in members:
                 queue.defer_task(member, delay_seconds=self.lease_seconds)
@@ -756,6 +804,28 @@ class RemoteWorker:
             fanout.mark_items_delayed(member.inchikey)
 
     @staticmethod
+    def _block_provider_auth(detail: str) -> None:
+        """Durably block the provider after an auth failure (H-03).
+
+        ``update_or_create`` on the unique ``provider`` column is race-safe: the
+        unique constraint serializes concurrent creators (a second creator's
+        INSERT fails and is retried as an UPDATE), so N workers hitting the same
+        401/403 converge on ONE AUTH_BLOCKED row instead of each deferring only
+        their own task and continuing to hammer the provider. The block is
+        cleared only by an operator via ``manage.py reset_provider_auth``.
+        """
+        RemoteProviderControl.objects.update_or_create(
+            provider=PROVIDER,
+            defaults={
+                "state": ProviderControlState.AUTH_BLOCKED,
+                "blocked_reason": detail[:2000],
+                "credential_version": getattr(
+                    settings, "WISHART_CREDENTIAL_VERSION", ""
+                ),
+            },
+        )
+
+    @staticmethod
     def _fail_submission(submission: RemoteSubmission, *, detail: str) -> None:
         """Flip an intent to FAILED so its idempotency key can be reused."""
         submission.state = SubmissionState.FAILED
@@ -955,6 +1025,7 @@ class RemoteWorker:
                         safe_headers=poll.safe_headers,
                     )
                     queue.defer_task(locked, delay_seconds=self.lease_seconds)
+                    self._block_provider_auth(poll.detail or "poll auth failure")
             except LeaseLost:
                 self._log_poll_lease_lost(task, "AUTH_FAILURE")
                 return

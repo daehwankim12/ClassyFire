@@ -288,6 +288,24 @@ class CircuitState(models.TextChoices):
     HALF_OPEN = "HALF_OPEN", "Half open"
 
 
+class ProviderControlState(models.TextChoices):
+    """Operator-controlled remote-provider gate (one row per provider).
+
+    Lives in ``remote_provider_controls`` so a single durable state stops ALL
+    worker processes from calling a provider whose credentials are bad. When a
+    remote call returns 401/403 the worker flips the provider to
+    ``AUTH_BLOCKED``; every worker's ``tick()`` then short-circuits until an
+    operator runs ``manage.py reset_provider_auth`` (back to ``ENABLED``). This
+    prevents N workers from hammering a provider with rejected credentials.
+
+    ENABLED ──provider 401/403──> AUTH_BLOCKED
+    AUTH_BLOCKED ──operator reset──> ENABLED
+    """
+
+    ENABLED = "ENABLED", "Enabled"
+    AUTH_BLOCKED = "AUTH_BLOCKED", "Auth blocked"
+
+
 class SeedProfile(models.TextChoices):
     """Which seed shape was imported."""
 
