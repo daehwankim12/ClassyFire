@@ -46,6 +46,16 @@ $$$$
 """
 
 
+@pytest.fixture(autouse=True)
+def _spool_to_tmp(settings, tmp_path):
+    """Point the H-04 upload-spool root at an isolated tmp dir for every test.
+
+    File uploads are now spooled to UPLOAD_ARTIFACT_DIR before the worker parses
+    them; isolate that root so tests never write into the repo tree.
+    """
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
+
+
 # ---------------------------------------------------------------------------
 # F-01: HTTP upload-route format dispatch + provenance
 # ---------------------------------------------------------------------------
@@ -73,18 +83,17 @@ def test_web_submit_csv_upload_dispatch_and_provenance():
     )
     assert resp.status_code in (302, 303), resp.content
 
+    # H-04: the file upload is spooled; the worker parses it into rows.
     job = BatchJob.objects.latest("created_at")
-    items = list(BatchItem.objects.filter(job=job).order_by("row_order"))
-    assert len(items) == 2
-    # Provenance (original_input + external_id) is set at staging time.
-    assert items[0].original_input == ASPIRIN_SMILES
-    assert items[0].external_id == "ASP-1"
-    assert items[1].external_id == "CAF-2"
-
-    # Run the durable worker to complete normalization + lookup.
+    assert BatchItem.objects.filter(job=job).count() == 0
     run_pending_jobs("test-worker", max_jobs=10)
 
     items = list(BatchItem.objects.filter(job=job).order_by("row_order"))
+    assert len(items) == 2
+    # Provenance (original_input + external_id) is preserved through staging.
+    assert items[0].original_input == ASPIRIN_SMILES
+    assert items[0].external_id == "ASP-1"
+    assert items[1].external_id == "CAF-2"
     assert items[0].detected_type == DetectedInputType.SMILES
     assert items[0].inchikey == ASPIRIN_INCHIKEY
 
@@ -93,6 +102,7 @@ def test_web_submit_csv_upload_dispatch_and_provenance():
 def test_web_submit_tsv_upload_dispatch():
     """POST a TSV (.tsv) → tab-delimited parse, provenance preserved."""
     from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import run_pending_jobs
 
     tsv = f"smiles\tid\n{ASPIRIN_SMILES}\tT-1\n".encode()
     upload = SimpleUploadedFile(
@@ -105,6 +115,7 @@ def test_web_submit_tsv_upload_dispatch():
     assert resp.status_code in (302, 303)
 
     job = BatchJob.objects.latest("created_at")
+    run_pending_jobs("test-worker", max_jobs=10)
     item = BatchItem.objects.filter(job=job).get()
     assert item.original_input == ASPIRIN_SMILES
     assert item.external_id == "T-1"
@@ -114,6 +125,7 @@ def test_web_submit_tsv_upload_dispatch():
 def test_web_submit_sdf_upload_dispatch_and_external_id():
     """POST an SDF → record split on $$$$, EXTERNAL_ID provenance preserved."""
     from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import run_pending_jobs
 
     upload = SimpleUploadedFile(
         "mol.sdf", _SDF_BLOCK.encode(), content_type="chemical/x-mdl-sdfile"
@@ -125,6 +137,7 @@ def test_web_submit_sdf_upload_dispatch_and_external_id():
     assert resp.status_code in (302, 303)
 
     job = BatchJob.objects.latest("created_at")
+    run_pending_jobs("test-worker", max_jobs=10)
     items = list(BatchItem.objects.filter(job=job))
     assert len(items) == 1
     assert items[0].external_id == "CPD-001"
@@ -148,11 +161,11 @@ def test_api_multipart_csv_upload_dispatch():
     assert resp.status_code == 202, resp.content
     data = resp.json()
     job = BatchJob.objects.get(pk=data["job_id"])
+    # H-04: rows are parsed + resolved by the worker, not the HTTP request.
+    assert BatchItem.objects.filter(job=job).count() == 0
+    run_pending_jobs("test-worker", max_jobs=10)
     item = BatchItem.objects.filter(job=job).get()
     assert item.external_id == "API-1"
-    # inchikey is resolved by the worker, not the HTTP request.
-    run_pending_jobs("test-worker", max_jobs=10)
-    item.refresh_from_db()
     assert item.inchikey == ASPIRIN_INCHIKEY
 
 
@@ -533,29 +546,35 @@ def test_deferred_worker_drains_to_same_result_as_sync():
 @pytest.mark.django_db(transaction=True)
 @override_settings(INGEST_DEFER_HEAVY_PROCESSING=True)
 def test_deferred_route_does_not_materialize_whole_upload(monkeypatch):
-    """(c) The deferred route must STREAM rows into staging — it must NOT build
-    the whole upload into a list. We forbid list() over the combined iterator by
-    asserting create_job_records_streaming is used (not create_job_under_quota's
-    list path) and that items are staged from a lazy generator."""
+    """(c) H-04: a FILE upload must be atomically SPOOLED in-request — the route
+    must NOT parse it or call create_job_records_streaming. Parsing is deferred
+    to the worker, which streams rows from the spooled artifact. We forbid any
+    in-request parse by failing if create_job_records_streaming is called, then
+    confirm the artifact is spooled (UPLOADING, no items) and the worker drains
+    it into rows from a lazy generator."""
     from apps.batches import services
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import run_pending_jobs
     from apps.core import security
+    from apps.core.enums import BatchProcessingState
 
-    used = {"streaming": False, "sync_list": False}
-    orig_stream = services.create_job_records_streaming
+    used = {"worker_streaming": False}
 
-    def spy_stream(row_iter, **kwargs):
-        # Prove the argument is a lazy generator, not a materialized list.
+    def fail_in_request(*_a, **_k):
+        raise AssertionError("HTTP route must not parse rows or stage in-request")
+
+    monkeypatch.setattr(security, "create_job_records_streaming", fail_in_request, raising=False)
+
+    orig_ingest = services.iter_uploaded_records_from_path
+
+    def spy_worker_iter(*args, **kwargs):
         import types
 
-        used["streaming"] = isinstance(row_iter, types.GeneratorType)
-        return orig_stream(row_iter, **kwargs)
+        gen = orig_ingest(*args, **kwargs)
+        used["worker_streaming"] = isinstance(gen, types.GeneratorType)
+        return gen
 
-    def fail_sync(*_a, **_k):
-        used["sync_list"] = True
-        raise AssertionError("deferred path must not call create_job_under_quota")
-
-    monkeypatch.setattr(services, "create_job_records_streaming", spy_stream)
-    monkeypatch.setattr(security, "create_job_under_quota", fail_sync)
+    monkeypatch.setattr(services, "iter_uploaded_records_from_path", spy_worker_iter)
 
     csv = ("smiles\n" + "\n".join([ASPIRIN_SMILES] * 50) + "\n").encode()
     upload = SimpleUploadedFile("big.csv", csv, content_type="text/csv")
@@ -564,8 +583,17 @@ def test_deferred_route_does_not_materialize_whole_upload(monkeypatch):
         "/", {"input_file": upload, "text_input": "", "remote_enabled": "false"}
     )
     assert resp.status_code in (302, 303), resp.content
-    assert used["streaming"] is True, "deferred staging must consume a lazy generator"
-    assert used["sync_list"] is False
+
+    job = BatchJob.objects.latest("created_at")
+    # In-request: spooled to UPLOADING with NO items and a durable artifact.
+    assert job.processing_state == BatchProcessingState.UPLOADING
+    assert job.upload_artifact_path
+    assert BatchItem.objects.filter(job=job).count() == 0
+
+    # The worker parses the artifact from a lazy generator (not a whole-file list).
+    run_pending_jobs("test-worker", max_jobs=10)
+    assert used["worker_streaming"] is True
+    assert BatchItem.objects.filter(job=job).count() == 50
 
 
 @pytest.mark.django_db(transaction=True)

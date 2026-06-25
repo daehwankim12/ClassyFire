@@ -37,6 +37,7 @@ from apps.core.security import (
     request_has_job_access_cookie,
     require_shared_access_web,
     set_job_access_cookie,
+    spool_upload_under_quota,
     stage_job_under_quota,
 )
 
@@ -76,14 +77,11 @@ def submit_view(request: HttpRequest) -> HttpResponse:
         remote_enabled_str = request.POST.get("remote_enabled", "")
         remote_enabled = remote_enabled_str.lower() in ("on", "true", "1", "yes")
 
-        # Handle file upload — BOUNDED STREAMING parse (F-01). The uploaded file
-        # is dispatched on suffix+content-type and parsed record-by-record via
-        # iter_combined_rows; we NEVER file.read() the whole upload.
+        # Handle file upload. Reject oversize uploads before reading content.
+        # file.size may be None when the upload size is unknown; in that case we
+        # fall through and let the spool stream enforce MAX_UPLOAD_MB mid-write.
         file = request.FILES.get("input_file")
         if file:
-            # Reject oversize uploads before reading content.
-            # file.size may be None when the upload size is unknown; in that
-            # case we fall through and let the read proceed (no size to check).
             try:
                 check_upload_size(file.size if file.size is not None else 0)
             except UploadTooLargeError as exc:
@@ -94,24 +92,27 @@ def submit_view(request: HttpRequest) -> HttpResponse:
                     status=413,
                 )
 
-        # Lazily chain text-input + file rows, re-indexed continuously and with
-        # provenance (external_id, raw input) preserved.
-        row_iter = iter_combined_rows(
-            parse_text_input(text_input),
-            file,
-            filename=file.name if file else None,
-            content_type=getattr(file, "content_type", None) if file else None,
-        )
-
-        # DEFERRED mode (F-11, always on): STAGE items only and RETURN
-        # immediately; the durable `process_jobs` worker drains the job. The
-        # row iterator is consumed straight into the staging insert — no full
-        # list materialisation in the HTTP request.
-        job, plaintext_secret, quota_error = stage_job_under_quota(
-            request,
-            row_iter,
-            remote_enabled=remote_enabled,
-        )
+        # H-04: a FILE upload is atomically SPOOLED to a durable artifact and the
+        # job is created in UPLOADING — NO parsing/RDKit/BatchItem creation in the
+        # request. The durable `process_jobs` worker parses the artifact later.
+        # A pure TEXT paste (no file) stays on the lightweight streaming-stage
+        # path (it only bulk-inserts rows; never touches RDKit in-request).
+        if file:
+            job, plaintext_secret, quota_error = spool_upload_under_quota(
+                request,
+                file,
+                remote_enabled=remote_enabled,
+            )
+        else:
+            row_iter = iter_combined_rows(
+                parse_text_input(text_input),
+                None,
+            )
+            job, plaintext_secret, quota_error = stage_job_under_quota(
+                request,
+                row_iter,
+                remote_enabled=remote_enabled,
+            )
         if quota_error is not None:
             quota_payload = json.loads(quota_error.content.decode("utf-8"))
             return render(

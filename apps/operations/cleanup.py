@@ -42,6 +42,9 @@ class CleanupResult:
     # ExportArtifact row (rollback orphans, stale .tmp.* partials) that were
     # older than EXPORT_ORPHAN_GRACE_SECONDS and have been unlinked.
     export_orphans_deleted: int = 0
+    # upload_temps_deleted counts stale *.tmp partials in UPLOAD_ARTIFACT_DIR
+    # (crashed spool writes) older than the upload-temp grace window.
+    upload_temps_deleted: int = 0
 
 
 _EXPORT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -242,6 +245,23 @@ def _cleanup_orphan_exports(now: datetime, grace_seconds: int) -> int:
     return orphans_deleted
 
 
+def _cleanup_stale_upload_temps() -> int:
+    """Remove stale ``*.tmp`` upload-spool partials (H-04), returning the count.
+
+    A ``.tmp`` older than the grace window is a partial from a crashed spool
+    write (the atomic ``replace()`` never ran), safe to drop. Guarded so a
+    misconfigured upload root never aborts the whole cleanup run.
+    """
+    from apps.batches.ingest import cleanup_stale_upload_temps
+
+    grace = int(getattr(settings, "UPLOAD_TEMP_GRACE_SECONDS", 86400))
+    try:
+        return cleanup_stale_upload_temps(max_age_seconds=grace)
+    except ValueError:
+        logger.warning("Skipping stale upload-temp cleanup: invalid UPLOAD_ARTIFACT_DIR")
+        return 0
+
+
 def cleanup_expired(actor: str = "system") -> CleanupResult:
     """Run all retention cleanup tasks and log a SystemEvent."""
     from apps.batches.models import BatchJob
@@ -279,12 +299,16 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
     orphan_grace = _retention_days("EXPORT_ORPHAN_GRACE_SECONDS", 3600)
     export_orphans_deleted = _cleanup_orphan_exports(now, orphan_grace)
 
+    # Remove stale *.tmp partials from crashed upload-spool writes (H-04).
+    upload_temps_deleted = _cleanup_stale_upload_temps()
+
     result = CleanupResult(
         jobs_secrets_wiped=secrets_wiped,
         jobs_deleted=jobs_deleted,
         exports_deleted=exports_deleted,
         export_files_deleted=export_files_deleted,
         export_orphans_deleted=export_orphans_deleted,
+        upload_temps_deleted=upload_temps_deleted,
     )
 
     SystemEvent.objects.create(
@@ -297,6 +321,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             "exports_deleted": exports_deleted,
             "export_files_deleted": export_files_deleted,
             "export_orphans_deleted": export_orphans_deleted,
+            "upload_temps_deleted": upload_temps_deleted,
             "upload_retention_days": upload_days,
             "job_retention_days": job_days,
             "export_retention_days": export_days,

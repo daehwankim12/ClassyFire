@@ -104,6 +104,20 @@ class BatchJob(models.Model):
         help_text="Monotonic lease version; bumped on every (re)claim.",
     )
 
+    # --- Spooled raw-upload artifact (H-04) ---
+    # When an upload is spooled to a durable artifact in-request, parsing is
+    # deferred to the ingest worker. These columns carry the artifact location
+    # and integrity metadata so the worker can re-open and parse it later.
+    upload_artifact_path = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Relative path to the spooled raw upload artifact.",
+    )
+    upload_original_name = models.TextField(null=True, blank=True)
+    upload_content_type = models.TextField(null=True, blank=True)
+    upload_size_bytes = models.BigIntegerField(null=True, blank=True)
+    upload_sha256 = models.CharField(max_length=64, null=True, blank=True)
+
     class Meta:
         db_table = "batch_jobs"
         indexes = [

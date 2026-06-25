@@ -604,6 +604,100 @@ def stage_job_under_quota(
     return job, plaintext_secret, None
 
 
+def validate_job_create_controls_no_rowcount(
+    request: HttpRequest,
+) -> JsonResponse | None:
+    """Row-count-INDEPENDENT job-create controls (disk, rate, active-job cap).
+
+    Used by the spooled-upload path (H-04): when parsing is deferred to the
+    ingest worker the row count is not known in-request, so the row-count caps
+    (``MAX_ROWS_PER_JOB`` hard cap, ``JOB_CREATE_DAILY_ROW_CAP`` daily cap) are
+    enforced later by :func:`apps.batches.services.stage_spooled_upload`. This
+    function still enforces every control that does NOT need a row count, so a
+    flood of zero-row uploads (rate, active-job count, disk pressure) is still
+    rejected up front.
+    """
+    return validate_job_create_controls(request, 0)
+
+
+def spool_upload_under_quota(
+    request: HttpRequest,
+    upload: object,
+    *,
+    remote_enabled: bool,
+    is_text: bool = False,
+) -> tuple[BatchJob | None, str, JsonResponse | None]:
+    """Atomically spool an upload and create a BatchJob in UPLOADING (H-04).
+
+    The HTTP request does NO parsing/RDKit/BatchItem creation: it enforces the
+    row-count-independent quota controls (under the same advisory locks the
+    synchronous path uses), records a quota event, atomically spools the raw
+    bytes to a durable artifact, and creates the job in the claimable
+    ``UPLOADING`` state. The durable ``process_jobs`` worker later parses the
+    artifact (and enforces the row-count caps) via ``stage_spooled_upload``.
+
+    Returns ``(job, plaintext_secret, error_response)`` mirroring
+    ``stage_job_under_quota``.
+    """
+    import secrets
+
+    from django.contrib.auth.hashers import make_password
+
+    from apps.batches.ingest import (
+        UploadTooLarge,
+        spool_text_input,
+        spool_upload_file,
+    )
+    from apps.batches.models import BatchJob, BatchQuotaEvent
+    from apps.core.enums import BatchProcessingState
+    from apps.remote.budget import normalize_principal
+
+    principal = _principal(request)
+    ip_address = _client_ip(request)
+
+    with transaction.atomic():
+        _acquire_quota_advisory_locks(
+            BatchQuotaEvent.KIND_JOB_CREATE,
+            principal,
+            ip_address,
+        )
+        quota_error = validate_job_create_controls_no_rowcount(request)
+        if quota_error is not None:
+            return None, "", quota_error
+
+        try:
+            if is_text:
+                spooled = spool_text_input(upload)  # type: ignore[arg-type]
+            else:
+                spooled = spool_upload_file(upload)
+        except UploadTooLarge as exc:
+            transaction.set_rollback(True)
+            return None, "", _quota_response(str(exc), status=413)
+
+        plaintext_secret = secrets.token_urlsafe(32)
+        job = BatchJob.objects.create(
+            secret_hash=make_password(plaintext_secret),
+            remote_enabled=remote_enabled,
+            remote_principal=normalize_principal(principal),
+            processing_state=BatchProcessingState.UPLOADING,
+            upload_artifact_path=spooled.relative_path,
+            upload_original_name=spooled.original_name,
+            upload_content_type=spooled.content_type,
+            upload_size_bytes=spooled.size_bytes,
+            upload_sha256=spooled.sha256,
+        )
+        # The quota event is recorded with a zero row count up front; the worker
+        # re-records the real row count when it stages the spooled artifact.
+        BatchQuotaEvent.objects.create(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            principal=principal,
+            ip_address=ip_address,
+            row_count=0,
+        )
+
+    return job, plaintext_secret, None
+
+
 def record_job_create_event(request: HttpRequest, row_count: int) -> None:
     from apps.batches.models import BatchQuotaEvent
 

@@ -184,6 +184,7 @@ REMOTE_DAILY_BUDGET_PER_PRINCIPAL: int = env_int(
 # ---------------------------------------------------------------------------
 
 MAX_UPLOAD_MB: int = env_int("MAX_UPLOAD_MB", 100)
+UPLOAD_ARTIFACT_DIR: str = env_str("UPLOAD_ARTIFACT_DIR", str(BASE_DIR / "uploads"))
 UPLOAD_RETENTION_DAYS: int = env_int("UPLOAD_RETENTION_DAYS", 30)
 JOB_RETENTION_DAYS: int = env_int("JOB_RETENTION_DAYS", 90)
 EXPORT_RETENTION_DAYS: int = env_int("EXPORT_RETENTION_DAYS", 14)

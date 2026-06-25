@@ -55,15 +55,20 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import cast
 
 from django.conf import settings
 from django.contrib.auth.hashers import make_password
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q
+from django.db.models import F, Q, Sum
 from django.utils import timezone
 
-from apps.batches.ingest import ingest_rows
+from apps.batches.ingest import (
+    ingest_rows,
+    iter_uploaded_records_from_path,
+    validate_upload_root,
+)
 from apps.batches.models import BatchItem, BatchJob
 from apps.classifications.services import (
     ClassificationLookupResult,
@@ -875,6 +880,103 @@ def _fenced_job_update(job: BatchJob, **fields: object) -> None:
     _fenced_claim_update(claim_from_job(job), **fields)
 
 
+class QuotaExceededError(Exception):
+    """A spooled upload exceeded a row-count quota at worker staging time.
+
+    The job is parked terminal-FAILED with this reason (mirroring the old
+    in-request rollback-to-quota-error behavior) rather than producing items.
+    """
+
+
+def _resolve_spooled_artifact(job: BatchJob) -> Path:
+    """Resolve a job's spooled artifact SAFELY under UPLOAD_ARTIFACT_DIR.
+
+    Rejects any ``upload_artifact_path`` that escapes the configured root
+    (path traversal / absolute path), so a tampered DB value can never make the
+    worker read an arbitrary file.
+    """
+    root = validate_upload_root(getattr(settings, "UPLOAD_ARTIFACT_DIR", ""))
+    artifact = (root / (job.upload_artifact_path or "")).resolve()
+    try:
+        artifact.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("upload artifact path escapes upload root") from exc
+    return artifact
+
+
+def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) -> None:
+    """Parse a spooled upload artifact into BatchItems (UPLOADING → PARSING).
+
+    Deferred-parse counterpart of the old in-request staging (H-04). Resolves the
+    artifact safely, streams its rows into BatchItems via ``ingest_rows`` with the
+    per-job ``MAX_ROWS_PER_JOB`` hard cap, enforces the daily row cap that the
+    in-request path used to enforce, then advances the claim-fenced
+    processing_state to PARSING so normalization proceeds.
+
+    A row-count-quota violation rolls the staged rows back and raises
+    :class:`QuotaExceededError`; the caller parks the job terminal-FAILED.
+
+    Idempotent: a job whose artifact was already staged (items exist) is skipped,
+    so a worker that crashed after committing rows but before finishing
+    normalization re-enters here and resumes without double-staging.
+    """
+    if not job.upload_artifact_path:
+        return
+    if BatchItem.objects.filter(job_id=job.pk).exists():
+        return
+
+    claim = claim or claim_from_job(job)
+    artifact = _resolve_spooled_artifact(job)
+
+    max_rows = int(getattr(settings, "MAX_ROWS_PER_JOB", 10_000))
+    daily_cap = int(getattr(settings, "JOB_CREATE_DAILY_ROW_CAP", 100_000))
+    day_ago = timezone.now() - timedelta(days=1)
+
+    from apps.batches.models import BatchQuotaEvent
+
+    try:
+        with transaction.atomic():
+            row_iter = iter_uploaded_records_from_path(
+                artifact,
+                original_name=job.upload_original_name or artifact.name,
+                content_type=job.upload_content_type or "",
+            )
+            row_count = ingest_rows(job, row_iter, max_rows=max_rows)
+
+            # Daily row cap: re-check against the principal's last-24h usage now
+            # that the real row count is known (the in-request quota event was
+            # recorded with row_count=0). Roll back the staged rows if exceeded.
+            used_rows = (
+                BatchQuotaEvent.objects.filter(
+                    kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                    created_at__gte=day_ago,
+                    principal=job.remote_principal,
+                ).aggregate(total=Sum("row_count"))["total"]
+                or 0
+            )
+            if used_rows + row_count > daily_cap:
+                transaction.set_rollback(True)
+                raise QuotaExceededError("Daily row quota exceeded.")
+
+            BatchQuotaEvent.objects.create(
+                kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                principal=job.remote_principal,
+                ip_address="",
+                row_count=row_count,
+            )
+    except RowCapExceededError as exc:
+        raise QuotaExceededError(
+            f"Job has more than {exc.max_rows} rows; the maximum is {exc.max_rows}."
+        ) from exc
+
+    _fenced_claim_update(
+        claim,
+        processing_state=BatchProcessingState.PARSING,
+        claimed_at=timezone.now(),
+    )
+    job.processing_state = BatchProcessingState.PARSING
+
+
 def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> None:
     """Run local normalization + lookup for all PENDING items in *job*.
 
@@ -895,6 +997,16 @@ def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> 
     command claims a job and calls the same path.
     """
     claim = claim or claim_from_job(job)
+
+    # H-04: a job with a spooled upload artifact but no BatchItems yet still
+    # needs its raw upload parsed. Parse the artifact into rows BEFORE
+    # normalization. This runs inside the durable worker, so the bounded
+    # streaming parse + RDKit-free row staging is OUT of the HTTP request. The
+    # claim flips processing_state UPLOADING→PARSING, so gate on the artifact +
+    # items-not-yet-staged rather than on the (already-flipped) state.
+    if job.upload_artifact_path:
+        stage_spooled_upload(job, claim=claim)
+
     # Fenced to the claim owner+version: a reclaimed (version-bumped) job makes
     # this FIRST write hit 0 rows and raise IngestLeaseLost before any chunk
     # work runs.
