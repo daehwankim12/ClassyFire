@@ -37,14 +37,26 @@ from __future__ import annotations
 
 import csv
 import enum
-import io
 from collections.abc import Iterator
 from typing import IO
 
+from django.conf import settings
+
+from apps.core.enums import DetectedInputType
 from apps.core.security import (
     MAX_SDF_PROPERTY_LEN,
     MAX_STRUCTURE_LEN,
 )
+
+
+def _max_structure_len() -> int:
+    """Bounded cap, read from Django settings so it can be overridden in tests.
+
+    Falls back to the module constant when settings are unavailable (the two are
+    kept in lockstep: ``settings.MAX_STRUCTURE_LEN`` defaults to
+    ``apps.core.security.MAX_STRUCTURE_LEN``).
+    """
+    return int(getattr(settings, "MAX_STRUCTURE_LEN", MAX_STRUCTURE_LEN))
 
 # Per-SDF-record byte cap. A record larger than this is skipped (it cannot be a
 # legitimate single small molecule) and surfaced as an error row so the user
@@ -145,14 +157,86 @@ def iter_upload_rows(
     the caller (ingest_rows) can persist them in bounded chunks without ever
     holding the whole file or the whole row list in memory.
     """
+    yield from iter_text_records(file, filename=filename, content_type=content_type)
+
+
+# ---------------------------------------------------------------------------
+# Bounded byte-chunk scanner (M-02)
+# ---------------------------------------------------------------------------
+
+
+def iter_bounded_lines(
+    binary_file: IO[bytes],
+    *,
+    max_bytes: int,
+    chunk_size: int = 64 * 1024,
+) -> Iterator[tuple[bytes | None, int]]:
+    """Yield physical lines from *binary_file* without materialising any single
+    line larger than ``max_bytes``.
+
+    Reads the upload in ``chunk_size`` byte blocks (never a single unbounded
+    ``read()``) and splits on ``\\n``. A line whose accumulated length crosses
+    ``max_bytes`` is NOT buffered whole: accumulation stops, the rest of the line
+    is counted (not stored), and the line is yielded as ``(None, overflow_len)``
+    where ``overflow_len`` is the TRUE total byte length of the physical line.
+    Normal lines are yielded as ``(line_bytes, len(line_bytes))`` (the trailing
+    ``\\n`` is stripped; a trailing ``\\r`` is left for the decoder to handle).
+    """
+    buffer = bytearray()
+    overflow = False
+    overflow_len = 0
+    while True:
+        chunk = binary_file.read(chunk_size)
+        if not chunk:
+            if buffer or overflow:
+                if overflow:
+                    yield None, overflow_len
+                else:
+                    yield bytes(buffer), len(buffer)
+            return
+        for byte in chunk:
+            if byte == 10:  # newline terminates the physical line
+                if overflow:
+                    yield None, overflow_len
+                    overflow = False
+                    overflow_len = 0
+                    buffer.clear()
+                else:
+                    yield bytes(buffer), len(buffer)
+                    buffer.clear()
+                continue
+            if overflow:
+                overflow_len += 1
+                continue
+            if len(buffer) >= max_bytes:
+                overflow = True
+                overflow_len = len(buffer) + 1
+                buffer.clear()
+                continue
+            buffer.append(byte)
+
+
+def iter_text_records(
+    binary_file: IO[bytes],
+    *,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> Iterator[dict]:
+    """Public bounded-scanner entry point: dispatch by format, drive the
+    byte-chunk scanner, and yield parser-style row dicts.
+
+    Every format (TEXT/CSV/TSV/SDF) reads through :func:`iter_bounded_lines`, so
+    a single line/record with no newline can never be slurped whole before the
+    ``MAX_STRUCTURE_LEN`` cap is applied.
+    """
     fmt = detect_upload_format(filename, content_type)
     if fmt is UploadFormat.SDF:
-        yield from _iter_sdf(file)
+        yield from _iter_sdf(binary_file)
     elif fmt in (UploadFormat.CSV, UploadFormat.TSV):
         delimiter = "," if fmt is UploadFormat.CSV else "\t"
-        yield from _iter_csv_tsv(file, delimiter)
+        yield from _iter_csv_tsv(binary_file, delimiter)
     else:
-        yield from _iter_text(file)
+        yield from _iter_text(binary_file)
 
 
 # ---------------------------------------------------------------------------
@@ -160,66 +244,80 @@ def iter_upload_rows(
 # ---------------------------------------------------------------------------
 
 
-def _text_stream(file: IO[bytes]) -> IO[str]:
-    """Wrap a binary upload in a decoding text stream (errors replaced).
+def _decode_line(raw: bytes, *, first: bool) -> str:
+    """Decode one bounded physical line. The first line uses ``utf-8-sig`` to
+    strip a leading BOM; subsequent lines use plain ``utf-8`` (errors replaced)."""
+    encoding = "utf-8-sig" if first else "utf-8"
+    return raw.decode(encoding, errors="replace").rstrip("\r")
 
-    ``UploadedFile`` is a binary file-like object; ``TextIOWrapper`` decodes it
-    lazily as it is iterated, so no full-file decode happens.
-    """
-    return io.TextIOWrapper(file, encoding="utf-8", errors="replace", newline="")
+
+def _overflow_row(overflow_length: int, row_index: int) -> dict:
+    """Parser-style row for a physical line that exceeded the byte cap.
+
+    The raw value is a fixed sentinel — the real bytes were never buffered — and
+    the TRUE total length is carried in ``overflow_length`` for the operator
+    message. Such a row must NOT be sent to RDKit (services rejects on
+    ``parse_error``)."""
+    return {
+        "raw": "[truncated]",
+        "row_index": row_index,
+        "parse_error": "ROW_TOO_LONG",
+        "overflow_length": overflow_length,
+        "input_type": DetectedInputType.UNKNOWN,
+    }
 
 
 def _iter_text(file: IO[bytes]) -> Iterator[dict]:
-    """Plain-text fallback: one non-blank line → one row."""
+    """Plain-text fallback: one non-blank line → one row, bounded per line."""
     row_index = 0
-    for line in _text_stream(file):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if len(stripped) > MAX_LINE_LEN:
-            yield {
-                "raw": stripped[:200],
-                "row_index": row_index,
-                "parse_error": "ROW_TOO_LONG",
-                "overflow_length": len(stripped),
-            }
+    first = True
+    for line_bytes, length in iter_bounded_lines(file, max_bytes=_max_structure_len()):
+        if line_bytes is None:
+            yield _overflow_row(length, row_index)
             row_index += 1
+            first = False
+            continue
+        stripped = _decode_line(line_bytes, first=first).strip()
+        first = False
+        if not stripped:
             continue
         yield {"raw": stripped, "row_index": row_index}
         row_index += 1
 
 
 def _iter_csv_tsv(file: IO[bytes], delimiter: str) -> Iterator[dict]:
-    """Stream a CSV/TSV upload: first column is ``raw``; an ``id``-like column
-    (if present) is ``external_id``. Header row is consumed once.
-
-    ``csv.reader`` pulls one line at a time from the underlying text iterator,
-    so memory stays bounded to a single row.
-    """
-    reader = csv.reader(_text_stream(file), delimiter=delimiter)
-    try:
-        header = next(reader)
-    except StopIteration:
-        return
-
-    id_index = _find_id_column(header)
-    smiles_index = _find_smiles_column(header)
-
+    """Stream a CSV/TSV upload: a ``smiles``-like column is ``raw``; an
+    ``id``-like column (if present) is ``external_id``. Header row is consumed
+    once. Each physical line is read bounded and parsed independently, so memory
+    stays bounded to a single line."""
+    header: list[str] | None = None
+    id_index: int | None = None
+    smiles_index = 0
     row_index = 0
-    for fields in reader:
+    first = True
+
+    for line_bytes, length in iter_bounded_lines(file, max_bytes=_max_structure_len()):
+        if line_bytes is None:
+            # An over-cap header line means we cannot dispatch columns; surface it
+            # as an error row and keep scanning.
+            yield _overflow_row(length, row_index)
+            row_index += 1
+            first = False
+            continue
+        text = _decode_line(line_bytes, first=first)
+        first = False
+        fields = next(csv.reader([text], delimiter=delimiter), [])
+
+        if header is None:
+            header = fields
+            id_index = _find_id_column(header)
+            smiles_index = _find_smiles_column(header)
+            continue
+
         if not fields:
             continue
         raw = fields[smiles_index].strip() if smiles_index < len(fields) else ""
         if not raw:
-            continue
-        if len(raw) > MAX_LINE_LEN:
-            yield {
-                "raw": raw[:200],
-                "row_index": row_index,
-                "parse_error": "ROW_TOO_LONG",
-                "overflow_length": len(raw),
-            }
-            row_index += 1
             continue
         result: dict = {"raw": raw, "row_index": row_index}
         if id_index is not None and id_index < len(fields):
@@ -263,14 +361,21 @@ def _iter_sdf(file: IO[bytes]) -> Iterator[dict]:
     surfaces as INVALID_INPUT downstream (provenance preserved as a bounded
     preview). Property values are extracted with a per-property cap.
     """
-    text_stream = _text_stream(file)
     row_index = 0
     buffer: list[str] = []
     buffer_bytes = 0
     overflowed = False
 
-    for line in text_stream:
-        if line.rstrip("\r\n") == "$$$$":
+    # Each bounded line is read in ≤64KB chunks; a single line longer than the
+    # cap arrives as ``None`` and overflows the current record instead of being
+    # materialised. We re-append ``\n`` to reconstruct the record block so the
+    # V2000 title / leading-blank line positions are preserved exactly.
+    for line_bytes, _length in iter_bounded_lines(file, max_bytes=MAX_SDF_RECORD_LEN):
+        if line_bytes is None:
+            overflowed = True
+            continue
+        line = _decode_line(line_bytes, first=False)
+        if line == "$$$$":
             if buffer or overflowed:
                 yield _build_sdf_row(buffer, row_index, overflowed)
                 row_index += 1
@@ -283,10 +388,8 @@ def _iter_sdf(file: IO[bytes]) -> Iterator[dict]:
             # Still draining an over-cap record: do not accumulate.
             continue
 
+        line += "\n"
         line_len = len(line)
-        if line_len > MAX_LINE_LEN:
-            line = line[:MAX_LINE_LEN]
-            line_len = MAX_LINE_LEN
         if buffer_bytes + line_len > MAX_SDF_RECORD_LEN:
             overflowed = True
             continue
