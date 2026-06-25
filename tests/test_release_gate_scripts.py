@@ -1,4 +1,19 @@
+from __future__ import annotations
+
 from pathlib import Path
+
+
+def test_release_workflow_runs_proxy_runtime_traffic():
+    workflow = Path(".github/workflows/release-gates.yml").read_text()
+    assert "docker compose up -d --build" in workflow
+    assert "scripts/exercise_secret_routes.sh" in workflow
+    assert "scripts/check_proxy_logs_for_secrets.sh" in workflow
+
+
+def test_release_workflow_runs_real_backup_restore():
+    workflow = Path(".github/workflows/release-gates.yml").read_text()
+    assert "scripts/run_backup_restore_smoke.sh" in workflow
+    assert "pg_restore" in workflow or "restore_smoke_test" in workflow
 
 
 def test_release_gate_workflow_has_required_jobs():

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_FILE="${1:?log file required}"
-SENTINEL="${CLASSYFIRE_SENTINEL_SECRET:?CLASSYFIRE_SENTINEL_SECRET required}"
+log_file="${1:?log file path required}"
+shift
 
-if grep -F "${SENTINEL}" "${LOG_FILE}" >/dev/null 2>&1; then
-  echo "sentinel secret found in proxy/app logs" >&2
-  exit 1
+if [ "$#" -eq 0 ]; then
+  sentinels="${CLASSYFIRE_SENTINEL_SECRET:?sentinel required}"
+else
+  sentinels="$*"
 fi
-exit 0
+
+for sentinel in ${sentinels}; do
+  if grep -F -- "$sentinel" "$log_file" >/dev/null; then
+    echo "secret leaked to logs: $sentinel" >&2
+    exit 1
+  fi
+done

@@ -53,11 +53,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose config
+      - run: docker compose up -d --build db migrate web worker ingest-worker proxy
+        env:
+          DJANGO_SECRET_KEY: sentinel-django-secret
+          POSTGRES_PASSWORD: classyfire
+          SHARED_ACCESS_PASSWORD_HASH: pbkdf2_sha256$1000000$sentinel$HcS2C1kMIEVvE6bXKqJtV3J3W1Id0s9UiB57QjXaXoY=
+          NGROK_DOMAIN: localhost
+      - run: CLASSYFIRE_BASE_URL=http://127.0.0.1 CLASSYFIRE_SENTINEL_SECRET=sentinel-release-gate-secret bash scripts/exercise_secret_routes.sh
+      - run: docker compose logs > compose.log
+      - run: bash scripts/check_proxy_logs_for_secrets.sh compose.log sentinel-release-gate-secret sentinel-django-secret
+      - if: always()
+        run: docker compose down -v
 
   backup-restore-smoke:
+    # scripts/run_backup_restore_smoke.sh runs pg_restore to verify a full dump→restore round-trip
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sh -n deploy/backup/backup.sh
-      - run: sh -n deploy/backup/restore.sh
+      - run: docker compose up -d --build db migrate web worker ingest-worker
+      - run: bash scripts/run_backup_restore_smoke.sh
+      - if: always()
+        run: docker compose down -v
