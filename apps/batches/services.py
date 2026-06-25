@@ -90,6 +90,7 @@ from apps.core.security import MAX_STRUCTURE_LEN, RowTooLongError, check_structu
 from apps.remote import queue as remote_queue
 from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
 from apps.remote.models import RemoteTask
+from apps.remote.queue import RemoteQueueBackpressure
 
 # Number of characters preserved in the bounded preview for an over-limit row.
 _OVERLONG_PREVIEW_CHARS = 200
@@ -252,6 +253,11 @@ def _get_or_create_remote_task(
     The partial-unique constraint allows only ONE active task per inchikey.
     We try to create; on IntegrityError (duplicate active task) we fetch
     the existing one in a savepoint so the outer transaction is unaffected.
+
+    If the global queue is at its high-water depth, ``enqueue_task`` raises
+    :class:`RemoteQueueBackpressure`; that propagates out of the savepoint (it is
+    NOT an IntegrityError) so the caller can park the item as REMOTE_DELAYED. The
+    web/API ingest call sites catch it — it never surfaces as a 500 (H-05).
     """
     from apps.core.enums import ACTIVE_TASK_STATES
 
@@ -386,6 +392,10 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                 except RemoteBudgetExceededError:
                     item.status = BatchItemStatus.REMOTE_DELAYED
                     item.message = "Remote budget exceeded for this principal."
+                    item.save(update_fields=["status", "message"])
+                except RemoteQueueBackpressure:
+                    item.status = BatchItemStatus.REMOTE_DELAYED
+                    item.message = "Remote queue is at capacity; retrying later."
                     item.save(update_fields=["status", "message"])
             else:
                 item.status = BatchItemStatus.REMOTE_DELAYED
@@ -542,6 +552,9 @@ def _process_item(
             )
         except RemoteBudgetExceededError:
             item.message = "Remote budget exceeded for this principal."
+            return BatchItemStatus.REMOTE_DELAYED
+        except RemoteQueueBackpressure:
+            item.message = "Remote queue is at capacity; retrying later."
             return BatchItemStatus.REMOTE_DELAYED
         return BatchItemStatus.PENDING_CLASSIFICATION
 

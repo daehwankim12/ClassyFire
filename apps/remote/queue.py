@@ -25,13 +25,26 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.core.enums import TaskState
 from apps.remote.budget import normalize_principal, reserve_remote_budget
-from apps.remote.models import RemotePrincipalState, RemoteTask
+from apps.remote.models import RemotePrincipalState, RemoteQueueControl, RemoteTask
+
+
+class RemoteQueueBackpressure(Exception):  # noqa: N818 - domain backpressure signal
+    """Raised when the global remote queue is at its high-water depth (H-05).
+
+    The active (non-DONE) ``remote_tasks`` count is at or above
+    ``settings.REMOTE_MAX_QUEUE_DEPTH``, so this enqueue is refused. Callers must
+    treat this as backpressure (park the work as REMOTE_DELAYED) — NOT as an
+    error to surface to a web/API user. The check runs under a
+    ``select_for_update`` lock on the single ``RemoteQueueControl`` row, so the
+    count-then-insert is serialized across processes and can never overshoot.
+    """
 
 
 class LeaseLost(Exception):  # noqa: N818 - domain name fixed by the F-07 contract
@@ -147,8 +160,18 @@ def enqueue_task(
     ).first()
     if existing is not None:
         return existing
+    max_depth = settings.REMOTE_MAX_QUEUE_DEPTH
     try:
         with transaction.atomic():
+            # Serialize concurrent enqueuers on the single queue-control row so
+            # the count-then-insert below cannot race past max_depth (H-05).
+            control, _ = RemoteQueueControl.objects.get_or_create(provider="wishart")
+            RemoteQueueControl.objects.select_for_update().get(pk=control.pk)
+            active_count = RemoteTask.objects.filter(
+                state__in=[s.value for s in TaskState.active_states()]
+            ).count()
+            if active_count >= max_depth:
+                raise RemoteQueueBackpressure("remote queue depth limit reached")
             normalized_principal = normalize_principal(principal)
             task = RemoteTask.objects.create(
                 inchikey=inchikey,

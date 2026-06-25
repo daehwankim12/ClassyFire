@@ -178,6 +178,13 @@ REMOTE_SUBMISSION_TTL_SECONDS: int = env_int(
 REMOTE_DAILY_BUDGET_PER_PRINCIPAL: int = env_int(
     "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", 100
 )
+# H-05: global high-water cap on outstanding (active, non-DONE) remote tasks.
+# Enforced race-safely in enqueue_task() under a select_for_update lock on the
+# single RemoteQueueControl row, so N concurrent enqueuers across processes can
+# never create more than this many active tasks. Kept high by default so normal
+# batch ingest (which enqueues one task per unique InChIKey) is never throttled;
+# the backpressure test overrides it to a small value to prove serialization.
+REMOTE_MAX_QUEUE_DEPTH: int = env_int("REMOTE_MAX_QUEUE_DEPTH", 10000)
 
 # ---------------------------------------------------------------------------
 # Upload / retention

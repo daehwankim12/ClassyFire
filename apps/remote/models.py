@@ -566,6 +566,26 @@ class RemotePrincipalState(models.Model):
         return f"remote-principal:{self.principal}"
 
 
+class RemoteQueueControl(models.Model):
+    """Serialization anchor for the global remote-queue depth gate (H-05).
+
+    A single row per provider. ``enqueue_task`` takes a ``SELECT ... FOR UPDATE``
+    on this row BEFORE counting active tasks and inserting, so N concurrent
+    enqueuers across processes are serialized: the count-then-insert can never
+    race past ``REMOTE_MAX_QUEUE_DEPTH``. The row carries no real payload — its
+    only job is to be the lock that makes the high-water check atomic.
+    """
+
+    provider = models.CharField(max_length=32, default="wishart", unique=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_queue_controls"
+
+    def __str__(self) -> str:
+        return f"remote-queue-control:{self.provider}"
+
+
 class RemoteProviderControl(models.Model):
     """Durable operator-controlled gate for a remote provider (one row each).
 
