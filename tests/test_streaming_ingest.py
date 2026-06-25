@@ -603,7 +603,9 @@ def test_true_crash_and_reclaim_resumes_without_double_processing(
     and job counters are all correct with no duplicates."""
     from apps.batches.models import BatchItem, BatchJob
     from apps.batches.services import (
-        _process_chunk,
+        _commit_prepared_chunk,
+        _prepare_chunk,
+        claim_from_job,
         claim_job_for_processing,
         create_job_records,
         process_claimed_job,
@@ -631,11 +633,14 @@ def test_true_crash_and_reclaim_resumes_without_double_processing(
             job=job, status=BatchItemStatus.PENDING_NORMALIZATION
         ).order_by("row_order")[:2]
     )
-    BatchJob.objects.filter(pk=job.pk).update(
-        processing_state=BatchProcessingState.LOCAL_LOOKUP
+    prepared = _prepare_chunk(first_chunk)
+    _commit_prepared_chunk(
+        claim_from_job(claimed),
+        prepared,
+        remote_enabled=False,
+        remote_principal=claimed.remote_principal,
+        checkpoint_row_order=1,
     )
-    _process_chunk(first_chunk, remote_enabled=False)
-    BatchJob.objects.filter(pk=job.pk).update(processed_through_row_order=1)
     # CRASH: worker A dies here. The job stays LOCAL_LOOKUP (claimable), three
     # items remain PENDING_NORMALIZATION, the lease belongs to the dead worker.
 

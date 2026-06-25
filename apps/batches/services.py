@@ -53,6 +53,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
 
@@ -443,7 +444,7 @@ def _process_item(
 
     # Pre-Step: Reject rows flagged by the parser as overlong without sending
     # them to RDKit.  This fires for both the legacy single-item path and the
-    # bulk-chunk path (via the norms.append(None) branch in _process_chunk).
+    # prepared chunk path (via the norm=None branch in _prepare_chunk).
     if item.parse_error:
         total = item.overflow_length or len(item.original_input)
         item.original_input = (
@@ -680,13 +681,64 @@ _ITEM_UPDATE_FIELDS = [
 ]
 
 
-def _process_chunk(
-    items: list[BatchItem],
-    *,
-    remote_enabled: bool,
-    remote_principal: str = "system",
-) -> None:
-    """Normalize + resolve a chunk of items with ONE bulk lookup (no N+1).
+@dataclass(frozen=True)
+class IngestJobClaim:
+    """Immutable snapshot of an ingest worker's BatchJob claim."""
+
+    job_id: object
+    worker_id: str
+    claim_lease_version: int
+
+
+@dataclass(frozen=True)
+class PreparedItem:
+    """A normalized chunk item ready for claim-fenced DB side effects."""
+
+    item_id: int
+    norm: NormalizedRow | None
+    lookup: object
+
+
+def claim_from_job(job: BatchJob) -> IngestJobClaim:
+    """Snapshot a job's CURRENT ingest claim fields."""
+    return IngestJobClaim(
+        job_id=job.pk,
+        worker_id=str(job.claimed_by or ""),
+        claim_lease_version=job.claim_lease_version,
+    )
+
+
+def _claim_filter_kwargs(claim: IngestJobClaim) -> dict[str, object]:
+    filters: dict[str, object] = {
+        "pk": claim.job_id,
+        "claim_lease_version": claim.claim_lease_version,
+    }
+    if claim.worker_id:
+        filters["claimed_by"] = claim.worker_id
+    else:
+        filters["claimed_by__isnull"] = True
+    return filters
+
+
+def _lock_owned_job(claim: IngestJobClaim) -> BatchJob:
+    """Lock the claimed BatchJob row and verify the captured claim still owns it."""
+    locked = BatchJob.objects.select_for_update().get(pk=claim.job_id)
+    if (
+        str(locked.claimed_by or "") != claim.worker_id
+        or locked.claim_lease_version != claim.claim_lease_version
+    ):
+        raise IngestLeaseLost(claim.job_id)
+    return locked
+
+
+def _fenced_claim_update(claim: IngestJobClaim, **fields: object) -> None:
+    updated = BatchJob.objects.filter(**_claim_filter_kwargs(claim)).update(**fields)
+    if updated != 1:
+        raise IngestLeaseLost(claim.job_id)
+
+
+def _prepare_chunk(items: list[BatchItem]) -> list[PreparedItem]:
+    """Normalize a chunk and run one bulk lookup without writing DB side effects.
 
     Two passes:
       1. Normalize every item (RDKit; inherently per-row CPU work) and collect
@@ -696,41 +748,79 @@ def _process_chunk(
          compound-upsert / usage / remote-task / pin semantics are IDENTICAL to
          the legacy per-item path — only the lookup is batched.
 
-    Item rows are updated inside one transaction so the chunk commits atomically
-    (a crash mid-chunk leaves those items PENDING_NORMALIZATION → reprocessed).
+    This function prepares data only. Compound usage, remote queue/budget,
+    item updates, and checkpoint writes happen later in ``_commit_prepared_chunk``
+    after the worker claim has been locked and verified.
     """
     # Pass 1: apply the structure-length guard, then normalize ONCE per item
     # (RDKit is expensive — never normalize the same row twice, and never feed
     # RDKit an over-limit string), collecting candidate inchikeys for the bulk
     # lookup. ``norms[i] is None`` marks an over-limit row handled in pass 2.
-    norms: list[NormalizedRow | None] = []
+    norms: dict[int, NormalizedRow | None] = {}
     candidate_keys: list[str] = []
     for item in items:
         # Parser-flagged overlong rows: route to _process_item without
         # normalization (mirrors the RowTooLongError branch below).
         if item.parse_error:
-            norms.append(None)
+            norms[item.id] = None
             continue
         try:
             check_structure_length(item.original_input)
         except RowTooLongError:
-            norms.append(None)
+            norms[item.id] = None
             continue
         norm = normalize_row(
             item.original_input,
             type_override=_submitted_type_override(item),
             external_id=item.external_id,
         )
-        norms.append(norm)
+        norms[item.id] = norm
         if norm.inchikey and len(norm.inchikey) == 27 and norm.error is None:
             candidate_keys.append(norm.inchikey)
 
     # Pass 2: ONE bulk lookup for the whole chunk (kills the per-item N+1).
     lookups = lookup_current_classifications(candidate_keys)
 
+    prepared: list[PreparedItem] = []
+    for item in items:
+        norm = norms[item.id]
+        override: object = _NO_LOOKUP_OVERRIDE
+        if (
+            norm
+            and norm.inchikey
+            and len(norm.inchikey) == 27
+            and norm.error is None
+        ):
+            override = lookups.get(norm.inchikey)
+        prepared.append(PreparedItem(item_id=item.id, norm=norm, lookup=override))
+    return prepared
+
+
+def _commit_prepared_chunk(
+    claim: IngestJobClaim,
+    prepared: list[PreparedItem],
+    *,
+    remote_enabled: bool,
+    remote_principal: str = "system",
+    checkpoint_row_order: int,
+) -> None:
+    """Commit a prepared chunk only while holding the captured job claim."""
     with transaction.atomic():
-        for item, chunk_norm in zip(items, norms, strict=True):
-            if chunk_norm is None:
+        locked_job = _lock_owned_job(claim)
+        items = list(
+            BatchItem.objects.select_for_update()
+            .filter(
+                job=locked_job,
+                id__in=[item.item_id for item in prepared],
+                status=BatchItemStatus.PENDING_NORMALIZATION,
+            )
+            .order_by("row_order")
+        )
+        prepared_by_id = {item.item_id: item for item in prepared}
+
+        for item in items:
+            entry = prepared_by_id[item.id]
+            if entry.norm is None:
                 # Over-limit row: drive the legacy guard branch (length check
                 # re-raises, truncates original_input + sets INVALID_INPUT).
                 item.status = _process_item(
@@ -739,21 +829,24 @@ def _process_chunk(
                     remote_principal=remote_principal,
                 )
                 continue
-            override: object = _NO_LOOKUP_OVERRIDE
-            if (
-                chunk_norm.inchikey
-                and len(chunk_norm.inchikey) == 27
-                and chunk_norm.error is None
-            ):
-                override = lookups.get(chunk_norm.inchikey)
             item.status = _process_item(
                 item,
                 remote_enabled=remote_enabled,
                 remote_principal=remote_principal,
-                lookup_override=override,
-                norm_override=chunk_norm,
+                lookup_override=entry.lookup,
+                norm_override=entry.norm,
             )
         BatchItem.objects.bulk_update(items, _ITEM_UPDATE_FIELDS)
+        locked_job.processing_state = BatchProcessingState.LOCAL_LOOKUP
+        locked_job.processed_through_row_order = checkpoint_row_order
+        locked_job.claimed_at = timezone.now()
+        locked_job.save(
+            update_fields=[
+                "processing_state",
+                "processed_through_row_order",
+                "claimed_at",
+            ]
+        )
 
 
 class IngestLeaseLost(Exception):  # noqa: N818 - mirrors remote LeaseLost contract
@@ -779,16 +872,10 @@ def _fenced_job_update(job: BatchJob, **fields: object) -> None:
     worker held at claim time. A stale worker (one whose job was reclaimed) hits
     0 rows and raises :class:`IngestLeaseLost`.
     """
-    updated = BatchJob.objects.filter(
-        pk=job.pk,
-        claimed_by=job.claimed_by,
-        claim_lease_version=job.claim_lease_version,
-    ).update(**fields)
-    if updated != 1:
-        raise IngestLeaseLost(job.pk)
+    _fenced_claim_update(claim_from_job(job), **fields)
 
 
-def process_job_items(job: BatchJob) -> None:
+def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> None:
     """Run local normalization + lookup for all PENDING items in *job*.
 
     Durable, chunked, restart-safe (F-11):
@@ -807,38 +894,34 @@ def process_job_items(job: BatchJob) -> None:
     This is the SYNCHRONOUS entry point unit tests drive inline; the management
     command claims a job and calls the same path.
     """
+    claim = claim or claim_from_job(job)
     # Fenced to the claim owner+version: a reclaimed (version-bumped) job makes
     # this FIRST write hit 0 rows and raise IngestLeaseLost before any chunk
     # work runs.
-    _fenced_job_update(
-        job, processing_state=BatchProcessingState.NORMALIZING
+    _fenced_claim_update(
+        claim,
+        processing_state=BatchProcessingState.NORMALIZING,
+        claimed_at=timezone.now(),
     )
 
     while True:
+        _fenced_claim_update(claim, claimed_at=timezone.now())
         chunk = list(
             BatchItem.objects.filter(
-                job=job, status=BatchItemStatus.PENDING_NORMALIZATION
+                job_id=claim.job_id, status=BatchItemStatus.PENDING_NORMALIZATION
             )
             .order_by("row_order")[:PROCESS_CHUNK_SIZE]
         )
         if not chunk:
             break
 
-        _fenced_job_update(
-            job, processing_state=BatchProcessingState.LOCAL_LOOKUP
-        )
-        _process_chunk(
-            chunk,
+        prepared = _prepare_chunk(chunk)
+        _commit_prepared_chunk(
+            claim,
+            prepared,
             remote_enabled=job.remote_enabled,
             remote_principal=job.remote_principal,
-        )
-
-        # Checkpoint: advance the cursor to the highest row_order in this chunk.
-        # A restarted worker re-queries PENDING_NORMALIZATION (the true resume
-        # frontier); the cursor is the durable, language-agnostic progress marker.
-        last_row_order = chunk[-1].row_order
-        _fenced_job_update(
-            job, processed_through_row_order=last_row_order
+            checkpoint_row_order=chunk[-1].row_order,
         )
 
     recompute_job_counters(job.pk)
@@ -899,8 +982,9 @@ def process_claimed_job(job: BatchJob) -> None:
     is parked in FAILED with the reason recorded; the items it already resolved
     stay resolved.
     """
+    claim = claim_from_job(job)
     try:
-        process_job_items(job)
+        process_job_items(job, claim=claim)
     except IngestLeaseLost:
         # The lease was lost mid-run: another worker now owns this job. Do NOT
         # park it FAILED - that would clobber the new owner's state. Propagate so
@@ -910,8 +994,8 @@ def process_claimed_job(job: BatchJob) -> None:
         # Fence the FAILED parking write too: a worker that lost its lease while
         # raising some OTHER error must not stomp the new owner's state. If this
         # fenced write itself finds the lease gone, let IngestLeaseLost propagate.
-        _fenced_job_update(
-            job,
+        _fenced_claim_update(
+            claim,
             processing_state=BatchProcessingState.FAILED,
             status=BatchJobStatus.FAILED,
             processing_error=str(exc)[:2000],
