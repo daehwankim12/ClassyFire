@@ -703,7 +703,7 @@ _ITEM_UPDATE_FIELDS = [
 class IngestJobClaim:
     """Immutable snapshot of an ingest worker's BatchJob claim."""
 
-    job_id: object
+    job_id: uuid.UUID
     worker_id: str
     claim_lease_version: int
 
@@ -801,16 +801,16 @@ def _prepare_chunk(items: list[BatchItem]) -> list[PreparedItem]:
 
     prepared: list[PreparedItem] = []
     for item in items:
-        norm = norms[item.id]
+        row_norm = norms[item.id]
         override: object = _NO_LOOKUP_OVERRIDE
         if (
-            norm
-            and norm.inchikey
-            and len(norm.inchikey) == 27
-            and norm.error is None
+            row_norm
+            and row_norm.inchikey
+            and len(row_norm.inchikey) == 27
+            and row_norm.error is None
         ):
-            override = lookups.get(norm.inchikey)
-        prepared.append(PreparedItem(item_id=item.id, norm=norm, lookup=override))
+            override = lookups.get(row_norm.inchikey)
+        prepared.append(PreparedItem(item_id=item.id, norm=row_norm, lookup=override))
     return prepared
 
 
