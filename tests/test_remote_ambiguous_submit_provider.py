@@ -92,3 +92,106 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     assert transport.submit_count == 1
     submission.refresh_from_db()
     assert submission.state == SubmissionState.UNKNOWN
+
+
+class Accepted2xxBodyTransport(httpx.BaseTransport):
+    """A 200 on submit whose body is supplied by the test.
+
+    Models a provider that ACCEPTED the POST (2xx) but returned a body the
+    client cannot parse into a query id — AMBIGUOUS ACCEPTANCE (F-06).
+    """
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.submit_count = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/entities/"):
+            return httpx.Response(404, request=request)
+        if request.method == "POST" and request.url.path == "/queries":
+            self.submit_count += 1
+            return httpx.Response(200, content=self.body, request=request)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+
+def _build_worker(transport: httpx.BaseTransport) -> RemoteWorker:
+    provider = WishartDirectProvider(base_url="https://wishart.invalid")
+    provider._http_client = httpx.Client(
+        transport=transport, base_url="https://wishart.invalid"
+    )
+    return RemoteWorker(
+        provider,
+        worker_id="worker-a",
+        rate_limiter=NoSleepLimiter(),
+        circuit=ClosedCircuit(),
+        lease_seconds=0.1,
+    )
+
+
+def _seed_ready_task() -> None:
+    compound = CompoundStructure.objects.create(
+        inchikey="LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
+        canonical_smiles="CCO",
+        original_input="CCO",
+    )
+    RemoteTask.objects.create(
+        inchikey=compound.inchikey,
+        compound=compound,
+        state=TaskState.READY,
+        next_run_at=timezone.now(),
+    )
+
+
+def _apply_settings(settings) -> None:
+    settings.REMOTE_ENABLED = True
+    settings.REMOTE_BATCH_SIZE = 1
+    settings.REMOTE_SUBMISSION_RECONCILE_MAX = 1
+    settings.REMOTE_SUBMISSION_TTL_SECONDS = 1
+    settings.REMOTE_POLL_MIN_SECONDS = 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_submit_2xx_malformed_body_parks_unknown_without_repost(settings):
+    _apply_settings(settings)
+    _seed_ready_task()
+
+    # 200 OK but the body is not valid JSON — the client cannot read the query
+    # id. The provider very likely created the query; auto re-POST is forbidden.
+    transport = Accepted2xxBodyTransport(b"not json{")
+    worker = _build_worker(transport)
+
+    assert worker.tick() is True
+    assert transport.submit_count == 1
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == SubmissionState.UNKNOWN
+
+    for _ in range(5):
+        assert worker.tick() in {True, False}
+
+    assert transport.submit_count == 1
+    submission.refresh_from_db()
+    assert submission.state == SubmissionState.UNKNOWN
+
+
+@pytest.mark.django_db(transaction=True)
+def test_submit_2xx_bad_query_id_schema_parks_unknown_without_repost(settings):
+    _apply_settings(settings)
+    _seed_ready_task()
+
+    # 200 OK with VALID JSON that lacks the query-id field, which
+    # validate_query_submit_payload rejects (ProviderContractError). The POST was
+    # accepted upstream; this is ambiguous acceptance, not a clean failure.
+    transport = Accepted2xxBodyTransport(b'{"status": "accepted"}')
+    worker = _build_worker(transport)
+
+    assert worker.tick() is True
+    assert transport.submit_count == 1
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == SubmissionState.UNKNOWN
+
+    for _ in range(5):
+        assert worker.tick() in {True, False}
+
+    assert transport.submit_count == 1
+    submission.refresh_from_db()
+    assert submission.state == SubmissionState.UNKNOWN

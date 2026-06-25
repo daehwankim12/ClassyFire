@@ -11,9 +11,9 @@ import pytest
 
 from apps.remote.mock import MockProvider, build_raw
 from apps.remote.provider import (
+    AmbiguousSubmissionError,
     EntityLookupStatus,
     PollStatus,
-    ProtocolProviderError,
 )
 
 IK_A = "RDHQFKQIGNGIED-MRVPVSSYSA-N"
@@ -58,12 +58,16 @@ def test_entity_lookup_success_rejects_malformed_consumed_slot():
 
 
 def test_query_submit_success_requires_scalar_query_id():
-    with pytest.raises(ProtocolProviderError, match="query id"):
+    # A 2xx means the provider ACCEPTED the POST (a query was likely created);
+    # a broken query-id schema is AMBIGUOUS ACCEPTANCE, not a clean failure, so
+    # the worker must park UNKNOWN (key held) rather than free the key and risk
+    # a duplicate re-POST (F-06).
+    with pytest.raises(AmbiguousSubmissionError, match="query id"):
         _wishart_with_json(201, {"id": []}).submit_structures([(IK_A, "CCO")])
 
 
 def test_query_submit_success_requires_present_query_id():
-    with pytest.raises(ProtocolProviderError, match="query id"):
+    with pytest.raises(AmbiguousSubmissionError, match="query id"):
         _wishart_with_json(201, {}).submit_structures([(IK_A, "CCO")])
 
 

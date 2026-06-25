@@ -282,10 +282,16 @@ class WishartDirectProvider:
                 http_status=resp.status_code,
             )
         # SUCCESS
+        # A 2xx means the provider ACCEPTED the POST: a query was very likely
+        # created upstream. Failing to read the query id LOCALLY (malformed body
+        # or a broken query-id schema) is AMBIGUOUS ACCEPTANCE, not a clean
+        # failure. Surface it as AmbiguousSubmissionError so the worker parks the
+        # intent UNKNOWN (idempotency key held) and NEVER auto-resubmits the same
+        # payload — re-POSTing could duplicate the upstream submission (F-06).
         try:
             body = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
-            raise RetryableProviderError(
+            raise AmbiguousSubmissionError(
                 f"malformed body: {exc}",
                 raw_text=raw_text,
                 safe_headers=headers,
@@ -294,7 +300,7 @@ class WishartDirectProvider:
         try:
             body, query_id = validate_query_submit_payload(body)
         except ProviderContractError as exc:
-            raise ProtocolProviderError(
+            raise AmbiguousSubmissionError(
                 str(exc),
                 raw_text=raw_text,
                 safe_headers=headers,
