@@ -231,20 +231,42 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     elif not request_has_job_access_cookie(request, job.pk):
         return JsonResponse({"error": "Invalid secret."}, status=403)
 
+    # Operational counts — computed from live item rows so callers know exactly
+    # what work is outstanding regardless of whether model counters have been
+    # flushed.  A single pass with three .count() calls avoids N+1.
+    pending_normalization = job.items.filter(
+        status=BatchItemStatus.PENDING_NORMALIZATION
+    ).count()
+    remote_delayed = job.items.filter(status=BatchItemStatus.REMOTE_DELAYED).count()
+    need_structure = job.items.filter(status=BatchItemStatus.NEED_STRUCTURE).count()
+
+    if pending_normalization:
+        next_action = "wait_for_ingest_worker"
+    elif remote_delayed:
+        next_action = "wait_for_remote_capacity"
+    elif need_structure:
+        next_action = "submit_missing_structures"
+    else:
+        next_action = "none"
+
     return JsonResponse(
         {
             "id": str(job.pk),
             "status": job.status,
+            "processing_state": job.processing_state,
             "total_count": job.total_count,
             "completed_count": job.completed_count,
             "local_hit_count": job.local_hit_count,
             "seed_hit_count": job.seed_hit_count,
             "remote_pending_count": job.remote_pending_count,
-            "need_structure_count": job.need_structure_count,
+            "need_structure_count": need_structure,
+            "normalization_pending_count": pending_normalization,
+            "remote_delayed_count": remote_delayed,
             "invalid_count": job.invalid_count,
             "remote_enabled": job.remote_enabled,
             "created_at": job.created_at.isoformat() if job.created_at else None,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "next_action": next_action,
         }
     )
 
