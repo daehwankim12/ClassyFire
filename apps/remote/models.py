@@ -177,6 +177,21 @@ class RemoteQueryItem(models.Model):
         max_length=27, null=True, blank=True, help_text="InChIKey this mapping targets."
     )
 
+    # --- durable per-member apply outcome (Task 15) ---
+    # Each member of a multi-structure query carries its OWN terminal apply state
+    # so a worker that resolves the query for the members it owns does NOT
+    # silently skip a sibling owned by another worker: that sibling is parked
+    # PENDING_OWNER until its owner applies it. The query only goes COMPLETE once
+    # every member is in a terminal apply state (APPLIED/MISMATCH/FAILED).
+    apply_state = models.CharField(
+        max_length=24,
+        default="PENDING",
+        db_default="PENDING",
+        help_text="PENDING/APPLIED/PENDING_OWNER/RETRY/MISMATCH/FAILED.",
+    )
+    apply_detail = models.TextField(null=True, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         db_table = "remote_query_items"
         constraints = [

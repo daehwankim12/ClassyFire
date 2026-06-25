@@ -1026,10 +1026,15 @@ class RemoteWorker:
                 self._log_poll_lease_lost(task, "RUNNING")
             return
 
-        # COMPLETE: record the poll attempt + flip query.state to COMPLETE only
-        # if THIS worker still owns the lease, then dispatch each member under its
-        # own fence. If the initial claim is lost, abort BEFORE query.state=COMPLETE
-        # so a stale worker never advances the query the fresh owner now drives.
+        # COMPLETE: record the poll attempt + capture the upstream raw_response
+        # only if THIS worker still owns the lease, then dispatch each member
+        # under its own fence. If the initial claim is lost, abort BEFORE any
+        # write so a stale worker never advances the query the fresh owner drives.
+        #
+        # Task 15: the provider query being Done does NOT by itself make the local
+        # query COMPLETE — that is gated on every member reaching a terminal apply
+        # state (see _complete_query_if_terminal). A member owned by another worker
+        # is parked PENDING_OWNER and the query stays open until its owner applies.
         raw = poll.raw_json or {}
         try:
             with transaction.atomic():
@@ -1047,10 +1052,8 @@ class RemoteWorker:
                     raw_body_text=poll.raw_text,
                     safe_headers=poll.safe_headers,
                 )
-                query.state = QueryState.COMPLETE
                 query.raw_response = raw
-                query.completed_at = timezone.now()
-                query.save(update_fields=["state", "raw_response", "completed_at"])
+                query.save(update_fields=["raw_response"])
         except LeaseLost:
             self._log_poll_lease_lost(task, "COMPLETE")
             return
@@ -1116,23 +1119,75 @@ class RemoteWorker:
             # Clean one-entity-per-task response: pair positionally and validate
             # each pair's key, so a wrong-key slot surfaces as a mismatch.
             for member, norm in zip(members, results, strict=True):
-                member_claim = self._member_claim(member, claim)
-                if member_claim is None:
-                    continue
-                self._dispatch_resolved(member_claim, member, query, norm)
-            return
+                self._dispatch_member(claim, member, query, norm)
+        else:
+            # Partial / ragged response: resolve by InChIKey, retry the absent.
+            by_key: dict[str, NormalizedClassification] = {
+                norm.inchikey: norm for norm in results if norm.inchikey is not None
+            }
+            for member in members:
+                self._dispatch_member(
+                    claim, member, query, by_key.get(member.inchikey)
+                )
 
-        # Partial / ragged response: resolve by InChIKey, retry the absent.
-        by_key: dict[str, NormalizedClassification] = {
-            norm.inchikey: norm for norm in results if norm.inchikey is not None
-        }
-        for member in members:
-            member_claim = self._member_claim(member, claim)
-            if member_claim is None:
-                continue
-            self._dispatch_resolved(
-                member_claim, member, query, by_key.get(member.inchikey)
-            )
+        # Task 15: only complete the query once EVERY member is in a terminal
+        # apply state. A PENDING_OWNER (or still-PENDING/RETRY) member keeps the
+        # query open so its owner's later poll/apply finishes it.
+        self._complete_query_if_terminal(query)
+
+    def _dispatch_member(
+        self,
+        claim: queue.TaskClaim,
+        member: RemoteTask,
+        query: RemoteQuery,
+        norm: NormalizedClassification | None,
+    ) -> None:
+        """Resolve ONE batched member, recording a DURABLE apply outcome (Task 15).
+
+        A member this worker can lock under a valid claim is dispatched and its
+        ``RemoteQueryItem`` stamped APPLIED/MISMATCH inside the fenced txn. A
+        member actively owned by ANOTHER worker is NOT applied (and never
+        silently skipped): its item is parked PENDING_OWNER so the owner's later
+        poll/apply completes it. A member with no entity in the response retries
+        and is left in a non-terminal apply state.
+        """
+        # A member already in a terminal apply state was resolved by a prior poll
+        # (possibly by another worker); do not re-apply it.
+        if (
+            RemoteQueryItem.objects.filter(query=query, task=member)
+            .filter(apply_state__in=["APPLIED", "MISMATCH", "FAILED"])
+            .exists()
+        ):
+            return
+        member_claim = self._member_claim(member, claim)
+        if member_claim is None:
+            # Owned by a different worker (or unlockable): defer to its owner.
+            self._park_member_pending_owner(query, member)
+            return
+        self._dispatch_resolved(member_claim, member, query, norm)
+
+    def _park_member_pending_owner(
+        self, query: RemoteQuery, member: RemoteTask
+    ) -> None:
+        owner = member.lock_owner or "no worker"
+        RemoteQueryItem.objects.filter(query=query, task=member).update(
+            apply_state="PENDING_OWNER",
+            apply_detail=f"owned by {owner}; deferred to owner",
+        )
+
+    def _complete_query_if_terminal(self, query: RemoteQuery) -> None:
+        """Flip the query to COMPLETE only when no member remains non-terminal."""
+        pending_exists = query.items.exclude(
+            apply_state__in=["APPLIED", "MISMATCH", "FAILED"]
+        ).exists()
+        if pending_exists:
+            return
+        query.refresh_from_db(fields=["state"])
+        if query.state == QueryState.COMPLETE and query.completed_at is not None:
+            return
+        query.state = QueryState.COMPLETE
+        query.completed_at = timezone.now()
+        query.save(update_fields=["state", "completed_at"])
 
     def _member_claim(
         self, member: RemoteTask, claim: queue.TaskClaim
@@ -1157,9 +1212,17 @@ class RemoteWorker:
         fence is the equivalent of the pre-refactor ``lock_owned_task(member)``
         guard (row-lock + lease self-consistency) and keeps batch resolution
         correct without ever writing an unowned-but-concurrently-stolen sibling.
+
+        Task 15: a sibling ACTIVELY owned by a DIFFERENT worker (its lock_owner
+        is set and is not us) is NOT ours to apply — return None so the caller
+        parks its RemoteQueryItem PENDING_OWNER, deferring resolution to that
+        owner's own poll/apply rather than borrowing its lease. A POLL_WAIT
+        sibling (lock_owner released) or a task we already own is applicable.
         """
         if member.pk == claim.task_id:
             return claim
+        if member.lock_owner and member.lock_owner != self.worker_id:
+            return None
         return self._claim_for_member_if_owned(member)
 
     def _claim_for_member_if_owned(
@@ -1250,6 +1313,13 @@ class RemoteWorker:
             queue.transition_locked(
                 locked, TaskState.DONE, lock_owner=None, locked_at=None
             )
+            if query is not None:
+                # Task 15: durable per-member outcome, committed with the apply.
+                RemoteQueryItem.objects.filter(query=query, task=locked).update(
+                    apply_state="APPLIED",
+                    applied_at=timezone.now(),
+                    apply_detail="applied under valid task claim",
+                )
 
     def apply_fenced_result_for_test(
         self, task: RemoteTask, norm: NormalizedClassification, *, remote_query_id: str
@@ -1345,6 +1415,16 @@ class RemoteWorker:
             queue.transition_locked(
                 locked, TaskState.DONE, lock_owner=None, locked_at=None
             )
+            if query is not None:
+                # Task 15: a mismatch is terminal for the member's apply outcome.
+                RemoteQueryItem.objects.filter(query=query, task=locked).update(
+                    apply_state="MISMATCH",
+                    applied_at=timezone.now(),
+                    apply_detail=(
+                        f"result key mismatch: requested {locked.inchikey}, "
+                        f"returned {norm.inchikey}"
+                    ),
+                )
 
     def _structure_for(self, task: RemoteTask) -> str | None:
         """Return a submittable structure (SMILES/InChI) for the task, if any."""
