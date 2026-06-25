@@ -161,13 +161,33 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
 
 
 # ---------------------------------------------------------------------------
-# Archive helpers
+# Fail-closed path validation
 # ---------------------------------------------------------------------------
 
 
-def _archive_media(media_dir: Path, archive_path: Path) -> str | None:
-    """Create a tar.gz of media_dir at archive_path. Returns sha256 or None."""
-    return _archive_dir(media_dir, archive_path)
+class BackupConfigurationError(ValueError):
+    """Backup configuration points at an unsafe artifact path."""
+
+
+def validate_artifact_dir(value: str, *, backup_dir: Path, label: str) -> Path:
+    raw = (value or "").strip()
+    if not raw:
+        raise BackupConfigurationError(f"{label} artifact path is empty")
+    path = Path(raw).resolve()
+    backup_root = backup_dir.resolve()
+    forbidden = {Path("/").resolve(), Path.cwd().resolve(), backup_root}
+    if path in forbidden:
+        raise BackupConfigurationError(f"{label} artifact path is unsafe: {path}")
+    if backup_root == path or backup_root.is_relative_to(path):
+        raise BackupConfigurationError(
+            f"{label} artifact path contains backup output: {path}"
+        )
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Archive helpers
+# ---------------------------------------------------------------------------
 
 
 def _archive_dir(src_dir: Path, archive_path: Path) -> str | None:
@@ -245,27 +265,37 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
 
     checksum = _sha256_file(dump_path)
 
-    # Archive media (upload + export) artifacts.
-    media_dir = Path(getattr(settings, "MEDIA_ROOT", "/app/media"))
-    media_archive_filename = f"classyfire_media_{timestamp}.tar.gz"
-    media_archive_path = backup_dir / media_archive_filename
-    media_checksum = _archive_media(media_dir, media_archive_path)
-
-    # Build artifact_archives for all artifact directories.
+    # Build artifact_dirs with fail-closed path validation.
     artifact_dirs = {
-        "media": media_dir,
-        "exports": Path(getattr(settings, "EXPORT_DIR", "/app/export_files")),
-        "source_artifacts": Path(
-            getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts")
+        "media": validate_artifact_dir(
+            getattr(settings, "MEDIA_ROOT", "/app/media"),
+            backup_dir=backup_dir,
+            label="media",
+        ),
+        "exports": validate_artifact_dir(
+            getattr(settings, "EXPORT_DIR", "/app/export_files"),
+            backup_dir=backup_dir,
+            label="exports",
+        ),
+        "source_artifacts": validate_artifact_dir(
+            getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts"),
+            backup_dir=backup_dir,
+            label="source_artifacts",
         ),
     }
     artifact_archives = _build_artifact_archives(backup_dir, timestamp, artifact_dirs)
+
+    # media_file / media_checksum: kept for backward compatibility with
+    # existing callers that read these top-level keys.
+    media_entry = artifact_archives.get("media")
+    media_file = media_entry["file"] if media_entry else None
+    media_checksum = media_entry["checksum"] if media_entry else None
 
     manifest: dict[str, Any] = {
         "timestamp": now.isoformat(),
         "file": dump_filename,
         "checksum": checksum,
-        "media_file": media_archive_filename if media_checksum else None,
+        "media_file": media_file,
         "media_checksum": media_checksum,
         "artifact_archives": artifact_archives,
         "excludes": _seed_exclude_pattern(),
@@ -322,12 +352,22 @@ def run_backup_injectable(
 
     checksum = _sha256_file(dump_path)
 
-    # Archive all artifact directories.
+    # Archive all artifact directories with fail-closed path validation.
     artifact_dirs = {
-        "media": Path(getattr(settings, "MEDIA_ROOT", "/app/media")),
-        "exports": Path(getattr(settings, "EXPORT_DIR", "/app/export_files")),
-        "source_artifacts": Path(
-            getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts")
+        "media": validate_artifact_dir(
+            getattr(settings, "MEDIA_ROOT", "/app/media"),
+            backup_dir=backup_dir,
+            label="media",
+        ),
+        "exports": validate_artifact_dir(
+            getattr(settings, "EXPORT_DIR", "/app/export_files"),
+            backup_dir=backup_dir,
+            label="exports",
+        ),
+        "source_artifacts": validate_artifact_dir(
+            getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts"),
+            backup_dir=backup_dir,
+            label="source_artifacts",
         ),
     }
     artifact_archives = _build_artifact_archives(backup_dir, timestamp, artifact_dirs)

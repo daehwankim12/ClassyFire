@@ -98,6 +98,8 @@ from apps.core.settings import env_str as _env_str  # noqa: E402
 
 EXPORT_DIR = _env_str("EXPORT_DIR", "/app/export_files")
 SOURCE_ARTIFACT_DIR = _env_str("SOURCE_ARTIFACT_DIR", "/app/source_artifacts")
+MEDIA_ROOT = _env_str("MEDIA_ROOT", "/app/media")
+UPLOAD_ARTIFACT_DIR = _env_str("UPLOAD_ARTIFACT_DIR", "/app/uploads")
 
 # ---------------------------------------------------------------------------
 # Logging (minimal — full observability is Task 11)

@@ -39,7 +39,34 @@ BACKUP_DIR="${BACKUP_DIR:-/backups}"
 MEDIA_DIR="${MEDIA_DIR:-/app/media}"
 EXPORT_DIR="${EXPORT_DIR:-/app/export_files}"
 SOURCE_ARTIFACT_DIR="${SOURCE_ARTIFACT_DIR:-/app/source_artifacts}"
+UPLOAD_DIR="${UPLOAD_DIR:-/app/uploads}"
 POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+
+# ---------------------------------------------------------------------------
+# Guard: reject unsafe artifact roots before any tar is created.
+# Prevents a misconfiguration from archiving / or the backup output itself.
+# ---------------------------------------------------------------------------
+_check_artifact_dir() {
+  _label="$1"
+  _dir="$2"
+  if [ -z "${_dir}" ]; then
+    echo "[backup] ERROR: ${_label} path is empty" >&2; exit 1
+  fi
+  if [ "${_dir}" = "/" ]; then
+    echo "[backup] ERROR: ${_label} path is / — refusing to archive root filesystem" >&2; exit 1
+  fi
+  # Reject if BACKUP_DIR is the same as or nested inside the artifact dir.
+  case "${BACKUP_DIR}/" in
+    "${_dir}/"*)
+      echo "[backup] ERROR: ${_label} path '${_dir}' contains backup output dir '${BACKUP_DIR}'" >&2; exit 1
+      ;;
+  esac
+}
+
+_check_artifact_dir "MEDIA_DIR" "${MEDIA_DIR}"
+_check_artifact_dir "EXPORT_DIR" "${EXPORT_DIR}"
+_check_artifact_dir "SOURCE_ARTIFACT_DIR" "${SOURCE_ARTIFACT_DIR}"
+_check_artifact_dir "UPLOAD_DIR" "${UPLOAD_DIR}"
 BACKUP_DAILY_COUNT="${BACKUP_DAILY_COUNT:-7}"
 BACKUP_WEEKLY_COUNT="${BACKUP_WEEKLY_COUNT:-4}"
 BACKUP_MONTHLY_COUNT="${BACKUP_MONTHLY_COUNT:-6}"

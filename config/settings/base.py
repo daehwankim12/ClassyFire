@@ -187,6 +187,7 @@ MAX_UPLOAD_MB: int = env_int("MAX_UPLOAD_MB", 100)
 # Per-structure / per-record byte cap. Mirrors apps.core.security.MAX_STRUCTURE_LEN
 # and bounds the upload physical-line / SDF-record scanner (M-02).
 MAX_STRUCTURE_LEN: int = env_int("MAX_STRUCTURE_LEN", 100_000)
+MEDIA_ROOT: str = env_str("MEDIA_ROOT", str(BASE_DIR / "media"))
 UPLOAD_ARTIFACT_DIR: str = env_str("UPLOAD_ARTIFACT_DIR", str(BASE_DIR / "uploads"))
 UPLOAD_RETENTION_DAYS: int = env_int("UPLOAD_RETENTION_DAYS", 30)
 JOB_RETENTION_DAYS: int = env_int("JOB_RETENTION_DAYS", 90)

@@ -56,6 +56,7 @@ POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 POSTGRES_USER="${POSTGRES_USER:-classyfire}"
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 RESTORE_DROP_DB="${RESTORE_DROP_DB:-0}"
+RESTORE_UPLOAD_DIR="${RESTORE_UPLOAD_DIR:-}"
 
 # ── Validate required variables ────────────────────────────────────────────
 if [ -z "${POSTGRES_DB:-}" ]; then
