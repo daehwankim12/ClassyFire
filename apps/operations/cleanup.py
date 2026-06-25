@@ -4,9 +4,10 @@ NEVER deletes classification cache (classyfire_live, classyfire_seed,
 classification_history). Only removes expired operational/transient data.
 
 Retention days are read from settings:
-  UPLOAD_RETENTION_DAYS  (default 30) — BatchJobs older than N days get secret_hash wiped
-  JOB_RETENTION_DAYS     (default 90) — BatchJobs completed more than N days ago get deleted
-  EXPORT_RETENTION_DAYS  (default 14) — expired export cache files are deleted
+  UPLOAD_RETENTION_DAYS        (default 30)   — BatchJobs older than N days get secret_hash wiped
+  JOB_RETENTION_DAYS           (default 90)   — BatchJobs completed more than N days ago get deleted
+  EXPORT_RETENTION_DAYS        (default 14)   — expired export cache files are deleted
+  EXPORT_ORPHAN_GRACE_SECONDS  (default 3600) — grace window before an orphan/temp file is removed
 """
 from __future__ import annotations
 
@@ -37,6 +38,10 @@ class CleanupResult:
     # those are tracked by export_files_deleted.
     exports_deleted: int
     export_files_deleted: int = 0
+    # export_orphans_deleted counts files in EXPORT_DIR with no live
+    # ExportArtifact row (rollback orphans, stale .tmp.* partials) that were
+    # older than EXPORT_ORPHAN_GRACE_SECONDS and have been unlinked.
+    export_orphans_deleted: int = 0
 
 
 _EXPORT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -156,6 +161,87 @@ def _cleanup_expired_exports(now: datetime, retention_days: int) -> tuple[int, i
     return artifacts_pruned, files_deleted
 
 
+def _cleanup_orphan_exports(now: datetime, grace_seconds: int) -> int:
+    """Delete orphaned export files and stale temp partials in EXPORT_DIR.
+
+    An "orphan" is any regular file in EXPORT_DIR whose basename is NOT in the
+    set of live (non-expired) ExportArtifact file basenames AND whose mtime is
+    older than ``now - grace_seconds``.  This covers both:
+    - Payload files whose transaction rolled back (no DB row was ever written).
+    - Stale ``.tmp.<token>.<suffix>`` partials from crashed streaming writes
+      (pattern: ``tempfile.mkstemp(prefix=".tmp.<token>.")``, a dotfile name).
+
+    Files referenced by a non-expired ExportArtifact are ALWAYS kept, even if
+    their mtime is old.  Files newer than the grace cutoff are also kept so we
+    never race an in-flight atomic write.
+
+    Path safety: every candidate is resolved and checked to lie inside
+    EXPORT_DIR before unlinking.  Symlinks and directory entries are skipped.
+
+    Returns the count of files deleted.
+    """
+    from apps.batches import exports
+    from apps.batches.models import ExportArtifact
+
+    export_dir = exports.EXPORT_DIR
+    if not export_dir.exists():
+        return 0
+
+    export_root = export_dir.resolve()
+    grace_cutoff = now - timedelta(seconds=grace_seconds)
+
+    # Build the set of basenames that have a live (non-expired) ExportArtifact.
+    # This is the authoritative "do not delete" set.
+    live_basenames: set[str] = {
+        Path(a.path).name
+        for a in ExportArtifact.objects.filter(expires_at__gt=now).only("path")
+    }
+
+    # Also include sidecar files for live tokens so we never accidentally remove
+    # a .meta.json whose payload is still live.
+    live_sidecar_basenames: set[str] = {
+        f"{a.token}.meta.json"
+        for a in ExportArtifact.objects.filter(expires_at__gt=now).only("token")
+    }
+    protected_basenames = live_basenames | live_sidecar_basenames
+
+    orphans_deleted = 0
+    for entry in export_dir.iterdir():
+        # Only regular files — skip directories and symlinks.
+        if not entry.is_file() or entry.is_symlink():
+            continue
+
+        # Path-safety: resolve and verify the file is inside the export root.
+        try:
+            resolved = entry.resolve()
+            resolved.relative_to(export_root)
+        except (ValueError, OSError):
+            continue
+
+        # Never touch files that belong to a live ExportArtifact.
+        if entry.name in protected_basenames:
+            continue
+
+        # Grace period: skip files that might still be part of an in-flight write.
+        try:
+            mtime = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
+        except OSError:
+            continue
+        if mtime >= grace_cutoff:
+            continue
+
+        deleted = _delete_if_exists(entry)
+        if deleted:
+            orphans_deleted += 1
+            logger.info(
+                "Deleted orphan export file name=%s mtime=%s",
+                entry.name,
+                mtime.isoformat(),
+            )
+
+    return orphans_deleted
+
+
 def cleanup_expired(actor: str = "system") -> CleanupResult:
     """Run all retention cleanup tasks and log a SystemEvent."""
     from apps.batches.models import BatchJob
@@ -190,11 +276,15 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
 
     exports_deleted, export_files_deleted = _cleanup_expired_exports(now, export_days)
 
+    orphan_grace = _retention_days("EXPORT_ORPHAN_GRACE_SECONDS", 3600)
+    export_orphans_deleted = _cleanup_orphan_exports(now, orphan_grace)
+
     result = CleanupResult(
         jobs_secrets_wiped=secrets_wiped,
         jobs_deleted=jobs_deleted,
         exports_deleted=exports_deleted,
         export_files_deleted=export_files_deleted,
+        export_orphans_deleted=export_orphans_deleted,
     )
 
     SystemEvent.objects.create(
@@ -206,9 +296,11 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             "jobs_deleted": jobs_deleted,
             "exports_deleted": exports_deleted,
             "export_files_deleted": export_files_deleted,
+            "export_orphans_deleted": export_orphans_deleted,
             "upload_retention_days": upload_days,
             "job_retention_days": job_days,
             "export_retention_days": export_days,
+            "export_orphan_grace_seconds": orphan_grace,
         },
     )
 

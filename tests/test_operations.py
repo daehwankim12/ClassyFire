@@ -915,29 +915,43 @@ def test_cleanup_export_metadata_unsupported_fmt_does_not_delete_payload(
 def test_cleanup_orphan_exports_only_deletes_known_payload_files(
     tmp_path, monkeypatch, settings
 ):
+    """Stale regular files in EXPORT_DIR are deleted by the orphan-cleanup phase
+    (including .csv payloads with no ExportArtifact row); directories are kept.
+
+    Note: the orphan phase (M-03) now deletes ALL stale regular files in
+    EXPORT_DIR that are not referenced by a live ExportArtifact, not just those
+    matching the export-payload regex.  This is intentional — unrecognised files
+    with no live artifact are also cleaned up after the grace period.
+    """
     from apps.operations.cleanup import cleanup_expired
 
     export_dir = tmp_path / "export_cache"
     export_dir.mkdir()
     monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
     settings.EXPORT_RETENTION_DAYS = 14
+    settings.EXPORT_ORPHAN_GRACE_SECONDS = 3600
 
     old = (datetime.now(UTC) - timedelta(days=20)).timestamp()
     orphan_payload = export_dir / "orphan-token.csv"
     unrelated_file = export_dir / "notes.txt"
     unrelated_dir = export_dir / "old-dir.csv"
     orphan_payload.write_text("delete")
-    unrelated_file.write_text("keep")
+    unrelated_file.write_text("stale unknown file")
     unrelated_dir.mkdir()
     os.utime(orphan_payload, (old, old))
     os.utime(unrelated_file, (old, old))
     os.utime(unrelated_dir, (old, old))
 
-    cleanup_expired(actor="test")
+    result = cleanup_expired(actor="test")
 
+    # The export-payload orphan is removed by the legacy OR orphan phase.
     assert not orphan_payload.exists()
-    assert unrelated_file.exists()
+    # Stale unknown regular files are also removed by the orphan phase (M-03).
+    assert not unrelated_file.exists()
+    # Directories are never touched — iterdir() only unlinks regular files.
     assert unrelated_dir.exists()
+    # Both the payload and the unknown file are counted as orphans.
+    assert result.export_orphans_deleted >= 1
 
 
 def test_cleanup_deletes_old_action_required_jobs_by_completed_at():
