@@ -39,6 +39,7 @@ from apps.core.enums import (
     BatchItemStatus,
     ProviderControlState,
     QueryState,
+    RemoteQueryItemApplyState,
     SourceType,
     SubmissionState,
     TaskState,
@@ -1245,7 +1246,13 @@ class RemoteWorker:
         # (possibly by another worker); do not re-apply it.
         if (
             RemoteQueryItem.objects.filter(query=query, task=member)
-            .filter(apply_state__in=["APPLIED", "MISMATCH", "FAILED"])
+            .filter(
+                apply_state__in=[
+                    RemoteQueryItemApplyState.APPLIED,
+                    RemoteQueryItemApplyState.MISMATCH,
+                    RemoteQueryItemApplyState.FAILED,
+                ]
+            )
             .exists()
         ):
             return
@@ -1256,16 +1263,24 @@ class RemoteWorker:
     ) -> None:
         owner = member.lock_owner or "no worker"
         RemoteQueryItem.objects.filter(query=query, task=member).exclude(
-            apply_state__in=["APPLIED", "MISMATCH", "FAILED"]
+            apply_state__in=[
+                RemoteQueryItemApplyState.APPLIED,
+                RemoteQueryItemApplyState.MISMATCH,
+                RemoteQueryItemApplyState.FAILED,
+            ]
         ).update(
-            apply_state="PENDING_OWNER",
+            apply_state=RemoteQueryItemApplyState.PENDING_OWNER,
             apply_detail=f"owned by {owner}; deferred to owner",
         )
 
     def _complete_query_if_terminal(self, query: RemoteQuery) -> None:
         """Flip the query to COMPLETE only when no member remains non-terminal."""
         pending_exists = query.items.exclude(
-            apply_state__in=["APPLIED", "MISMATCH", "FAILED"]
+            apply_state__in=[
+                RemoteQueryItemApplyState.APPLIED,
+                RemoteQueryItemApplyState.MISMATCH,
+                RemoteQueryItemApplyState.FAILED,
+            ]
         ).exists()
         if pending_exists:
             return
@@ -1403,7 +1418,7 @@ class RemoteWorker:
             if query is not None:
                 # Task 15: durable per-member outcome, committed with the apply.
                 RemoteQueryItem.objects.filter(query=query, task=locked).update(
-                    apply_state="APPLIED",
+                    apply_state=RemoteQueryItemApplyState.APPLIED,
                     applied_at=timezone.now(),
                     apply_detail="applied under valid task claim",
                 )
@@ -1505,7 +1520,7 @@ class RemoteWorker:
             if query is not None:
                 # Task 15: a mismatch is terminal for the member's apply outcome.
                 RemoteQueryItem.objects.filter(query=query, task=locked).update(
-                    apply_state="MISMATCH",
+                    apply_state=RemoteQueryItemApplyState.MISMATCH,
                     applied_at=timezone.now(),
                     apply_detail=(
                         f"result key mismatch: requested {locked.inchikey}, "

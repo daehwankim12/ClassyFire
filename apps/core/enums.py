@@ -269,6 +269,27 @@ LIVE_SUBMISSION_STATES: tuple[str, ...] = tuple(
 )
 
 
+class RemoteQueryItemApplyState(models.TextChoices):
+    """Durable per-member apply outcome for a ``remote_query_items`` row (Task 15).
+
+    Each member of a multi-structure query carries its OWN terminal apply state
+    so a worker that resolves the query for the members it owns does NOT silently
+    skip a sibling owned by another worker: the sibling is parked ``PENDING_OWNER``
+    until its owner applies it. The query only goes COMPLETE once every member is
+    in a terminal apply state (``APPLIED``/``MISMATCH``/``FAILED``).
+
+    value == name on purpose: these literals are the persisted contract (existing
+    rows + the COMPLETE-gating predicate). A future Go/Rust worker drives the SAME
+    column with the SAME strings.
+    """
+
+    PENDING = "PENDING", "Pending"
+    APPLIED = "APPLIED", "Applied"
+    PENDING_OWNER = "PENDING_OWNER", "Pending owner"
+    MISMATCH = "MISMATCH", "Mismatch"
+    FAILED = "FAILED", "Failed"
+
+
 class CircuitState(models.TextChoices):
     """remote_circuits breaker lifecycle (F-08 DB-backed circuit breaker).
 

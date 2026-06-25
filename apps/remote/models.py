@@ -17,6 +17,7 @@ from apps.core.enums import (
     CircuitState,
     ProviderControlState,
     QueryState,
+    RemoteQueryItemApplyState,
     SubmissionState,
     TaskState,
 )
@@ -186,9 +187,10 @@ class RemoteQueryItem(models.Model):
     # every member is in a terminal apply state (APPLIED/MISMATCH/FAILED).
     apply_state = models.CharField(
         max_length=24,
-        default="PENDING",
-        db_default="PENDING",
-        help_text="PENDING/APPLIED/PENDING_OWNER/RETRY/MISMATCH/FAILED.",
+        choices=RemoteQueryItemApplyState.choices,
+        default=RemoteQueryItemApplyState.PENDING,
+        db_default=RemoteQueryItemApplyState.PENDING,
+        help_text="PENDING/APPLIED/PENDING_OWNER/MISMATCH/FAILED.",
     )
     apply_detail = models.TextField(null=True, blank=True)
     applied_at = models.DateTimeField(null=True, blank=True)
