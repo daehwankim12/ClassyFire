@@ -4,7 +4,7 @@ Two correctness gaps are closed here:
 
 * The Wishart ENTITY lookup must distinguish a genuine entity MISS (HTTP 404 →
   ``NOT_FOUND``, "try calculating via a structure submit") from a PERMANENT
-  protocol error (HTTP 400/422 → ``PROTOCOL_ERROR``, "do NOT submit, surface").
+  input error (HTTP 400/422 → ``PERMANENT_ERROR``, "do NOT submit, surface").
   Conflating them lets a malformed request wrongly trigger a calculation.
 
 * Result freshness must use the query's SUBMIT time as the apply timestamp, not
@@ -56,11 +56,11 @@ def wishart_provider_factory():
 @pytest.mark.parametrize(
     "status_code,expected",
     [
-        (400, EntityLookupStatus.PROTOCOL_ERROR),
+        (400, EntityLookupStatus.PERMANENT_ERROR),
         (401, EntityLookupStatus.AUTH_FAILURE),
         (403, EntityLookupStatus.AUTH_FAILURE),
         (404, EntityLookupStatus.NOT_FOUND),
-        (422, EntityLookupStatus.PROTOCOL_ERROR),
+        (422, EntityLookupStatus.PERMANENT_ERROR),
         (429, EntityLookupStatus.RETRYABLE_ERROR),
         (500, EntityLookupStatus.RETRYABLE_ERROR),
     ],

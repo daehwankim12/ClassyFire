@@ -78,10 +78,13 @@ class EntityLookupStatus(StrEnum):
 
     ``NOT_FOUND`` (HTTP 404) is a GENUINE entity miss — the key is simply not in
     the cache, so the worker may try to calculate it via a structure submit. It
-    is kept distinct from ``PROTOCOL_ERROR`` (a permanent input/protocol failure
-    such as a 400/422) which must NEVER trigger a calculation. ``MISS`` remains
-    the (provider-agnostic, e.g. MockProvider) "no entity, may submit" trigger;
-    both ``NOT_FOUND`` and ``MISS`` route to the submit/NEED_STRUCTURE path.
+    is kept distinct from a PERMANENT input/protocol failure (a non-404 4xx such
+    as 400/422), which must NEVER trigger a calculation. ``PERMANENT_ERROR`` is a
+    DEFINITE non-retryable entity-request error (e.g. a bad key / 400 / 422);
+    ``PROTOCOL_ERROR`` is an unmapped/structurally-broken response. NEITHER ever
+    routes to submit. ``MISS`` remains the (provider-agnostic, e.g. MockProvider)
+    "no entity, may submit" trigger; ONLY ``NOT_FOUND`` and ``MISS`` route to the
+    submit/NEED_STRUCTURE path.
     """
 
     FOUND = "FOUND"
@@ -90,6 +93,7 @@ class EntityLookupStatus(StrEnum):
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
     AUTH_FAILURE = "AUTH_FAILURE"
     PROTOCOL_ERROR = "PROTOCOL_ERROR"
+    PERMANENT_ERROR = "PERMANENT_ERROR"
 
 
 class PollStatus(StrEnum):

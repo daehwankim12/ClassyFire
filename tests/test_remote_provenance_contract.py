@@ -289,8 +289,11 @@ def remote_outcome_harness():
         ("ENTITY", "404_miss", "NOT_FOUND"),
         ("ENTITY", "401", "AUTH_FAILURE"),
         ("ENTITY", "403", "AUTH_FAILURE"),
-        ("ENTITY", "400", "PROTOCOL_ERROR"),
-        ("ENTITY", "422", "PROTOCOL_ERROR"),
+        # A non-404 4xx (bad key / 400 / 422) is a PERMANENT entity error: it is
+        # recorded as such and (Task 17 / F-10) NEVER escalates to a submit —
+        # distinct from a malformed/unmapped PROTOCOL_ERROR response below.
+        ("ENTITY", "400", "PERMANENT"),
+        ("ENTITY", "422", "PERMANENT"),
         ("ENTITY", "429", "RETRYABLE"),
         ("ENTITY", "500", "RETRYABLE"),
         ("ENTITY", "timeout", "RETRYABLE"),

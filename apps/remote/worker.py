@@ -311,12 +311,25 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
 
-        if result.status == EntityLookupStatus.PROTOCOL_ERROR:
-            # Unmapped status: never treat as MISS/COMPLETE; surface + retry.
+        if result.status in (
+            EntityLookupStatus.PROTOCOL_ERROR,
+            EntityLookupStatus.PERMANENT_ERROR,
+        ):
+            # PERMANENT_ERROR (a definite non-404 4xx — bad key / 400 / 422) and
+            # PROTOCOL_ERROR (an unmapped/structurally-broken response) are both
+            # non-miss outcomes that must NEVER escalate to a structure submit
+            # (F-10): a malformed request must not burn a remote calculation. We
+            # record the attempt — preserving the real http_status + raw body —
+            # surface it, and schedule a retry, but NEVER call ``_submit_batch``.
             self.circuit.record_failure()
+            classification = (
+                "PERMANENT"
+                if result.status == EntityLookupStatus.PERMANENT_ERROR
+                else "PROTOCOL_ERROR"
+            )
             self._record_attempt(
                 RemoteAttempt.OPERATION_ENTITY,
-                classification="PROTOCOL_ERROR",
+                classification=classification,
                 raw_payload=result.raw_json,
                 http_status=result.http_status,
                 detail=result.detail,
@@ -326,7 +339,8 @@ class RemoteWorker:
                 safe_headers=result.safe_headers,
             )
             logger.error(
-                "remote entity PROTOCOL_ERROR for %s: %s",
+                "remote entity %s for %s: %s",
+                classification,
                 task.inchikey,
                 result.detail,
             )

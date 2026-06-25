@@ -171,11 +171,13 @@ class WishartDirectProvider:
                 safe_headers=headers,
             )
         if outcome is HttpOutcome.PERMANENT:
-            # Definite 4xx input/protocol error (400/422/other non-404 4xx): this
-            # is NOT an entity miss. Surface PROTOCOL_ERROR so the worker records
-            # the attempt and NEVER submits a calculation for a malformed request.
+            # Definite non-404 4xx input error (400/422/other): this is NOT an
+            # entity miss. Surface PERMANENT_ERROR — a non-retryable, never-submit
+            # outcome — so the worker records the attempt and NEVER submits a
+            # calculation for a malformed request (distinct from a genuine 404
+            # NOT_FOUND miss, and from an unmapped PROTOCOL_ERROR response).
             return EntityLookupResult(
-                status=EntityLookupStatus.PROTOCOL_ERROR,
+                status=EntityLookupStatus.PERMANENT_ERROR,
                 inchikey=inchikey,
                 http_status=resp.status_code,
                 detail=f"HTTP {resp.status_code}",
