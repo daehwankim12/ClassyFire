@@ -1,6 +1,6 @@
 # Safe Remediation Results
 
-Branch: `safe-production-remediation` (HEAD 456eacc)
+Branch: `safe-production-remediation` (HEAD 899bb9c)
 Verified: 2026-06-25
 
 | Check | Result | Evidence |
