@@ -477,14 +477,15 @@ def _job_state_signature(job: BatchJob) -> str:
 
 
 def _artifact_matches_current_job_state(artifact: ExportArtifact) -> bool:
-    """Return True when an artifact's cheap job-state snapshot is current."""
+    """Return True when an artifact still matches the job's current rows."""
     job = BatchJob.objects.filter(pk=artifact.job_id).first()
     if job is None:
         return False
-    return (
-        artifact.row_count == job.total_count
-        and artifact.job_state_signature == _job_state_signature(job)
-    )
+    if artifact.row_count != job.total_count:
+        return False
+    if artifact.job_state_signature != _job_state_signature(job):
+        return False
+    return artifact.rows_signature == _compute_rows_signature(job)
 
 def _artifact_file_checksum_matches(path: Path, artifact: ExportArtifact) -> bool:
     """Return True iff the on-disk file's SHA-256 matches the stored artifact checksum."""

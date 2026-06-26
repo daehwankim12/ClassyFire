@@ -29,3 +29,27 @@ def test_download_rejects_corrupt_export_file(tmp_path):
     )
     path.write_text("bad\n")
     assert get_export_path(artifact.token) is None
+
+
+@pytest.mark.django_db
+def test_download_rejects_stale_rows_signature_even_when_job_state_matches(tmp_path):
+    from apps.batches import exports
+
+    job = BatchJob.objects.create(secret_hash="hash")
+    path = tmp_path / "export.csv"
+    path.write_text("good\n")
+    checksum = exports._checksum_file(path)
+    artifact = ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token="token-stale-rows-export",
+        path=str(path),
+        checksum=checksum,
+        byte_size=path.stat().st_size,
+        rows_signature="a" * 64,
+        row_count=0,
+        job_state_signature=exports._job_state_signature(job),
+        expires_at=timezone.now() + timedelta(days=1),
+    )
+
+    assert get_export_path(artifact.token) is None
