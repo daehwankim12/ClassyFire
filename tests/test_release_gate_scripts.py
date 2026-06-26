@@ -47,6 +47,30 @@ def test_secret_scan_scripts_fail_on_missing_args():
     assert "CLASSYFIRE_SENTINEL_SECRET" in log_script
 
 
+def test_proxy_log_secret_scan_does_not_echo_matched_secret(tmp_path):
+    secret = "ULTRA_PRIVATE_SECRET_12345"
+    log_file = tmp_path / "proxy.log"
+    log_file.write_text(f"request contained {secret}\n")
+
+    import subprocess
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/check_proxy_logs_for_secrets.sh",
+            str(log_file),
+            secret,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "secret leaked to logs" in result.stderr
+    assert secret not in result.stderr
+
+
 def test_secret_route_exerciser_hits_sensitive_routes():
     script = Path("scripts/exercise_secret_routes.sh").read_text()
     assert '"${base}/stats/"' in script

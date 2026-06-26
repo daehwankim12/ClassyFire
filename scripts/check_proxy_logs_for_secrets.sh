@@ -24,7 +24,7 @@ fail_if_leaked() {
   secret="$1"
   [ -z "$secret" ] && return 0
   if grep -F -- "$secret" "$log_file" >/dev/null; then
-    echo "secret leaked to logs: $secret" >&2
+    echo "secret leaked to logs" >&2
     exit 1
   fi
 }
