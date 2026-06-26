@@ -52,6 +52,7 @@ from apps.remote.models import (
     RemoteQuery,
     RemoteQueryItem,
     RemoteSubmission,
+    RemoteSubmissionMember,
     RemoteTask,
 )
 from apps.remote.provider import (
@@ -448,6 +449,75 @@ class RemoteWorker:
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
 
+    @staticmethod
+    def _structure_hash(structure: str) -> str:
+        """Canonical sha256 of one submitted structure (R-01 reservation key)."""
+        return hashlib.sha256(structure.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _member_specs(
+        structures: list[tuple[str, str]]
+    ) -> list[dict[str, str]]:
+        """Per-member reservation specs parallel to ``structures``."""
+        return [
+            {
+                "inchikey": inchikey,
+                "structure": structure,
+                "structure_hash": RemoteWorker._structure_hash(structure),
+            }
+            for inchikey, structure in structures
+        ]
+
+    @staticmethod
+    def _release_submission_members(
+        submission: RemoteSubmission, *, reason: str
+    ) -> None:
+        """Release every live per-member reservation held by ``submission`` (R-01).
+
+        Called ONLY when the submission deliberately leaves a live state: it FAILS
+        (key freed), an operator marks an UNKNOWN intent failed, or a SUBMITTED
+        query reaches terminal apply for every member. Never on an automatic
+        PENDING→UNKNOWN in-doubt transition (UNKNOWN keeps holding the slot).
+        """
+        RemoteSubmissionMember.objects.filter(
+            submission=submission, active=True
+        ).update(
+            active=False,
+            released_at=timezone.now(),
+            release_reason=reason,
+        )
+
+    def _filter_reserved_members(
+        self,
+        members: list[RemoteTask],
+        structures: list[tuple[str, str]],
+    ) -> tuple[list[RemoteTask], list[tuple[str, str]]]:
+        """Drop members already actively reserved by ANOTHER live submission (R-01).
+
+        A member whose ``(inchikey, structure_hash)`` is already reserved is parked
+        (DEFERRED) without POSTing — it stays out of every batch until its existing
+        submission resolves and releases the reservation. Returns the members and
+        their structures that are free to submit.
+        """
+        inchikeys = [inchikey for inchikey, _structure in structures]
+        reserved_pairs = set(
+            RemoteSubmissionMember.objects.filter(
+                provider=PROVIDER,
+                active=True,
+                inchikey__in=inchikeys,
+            ).values_list("inchikey", "structure_hash")
+        )
+        free_members: list[RemoteTask] = []
+        free_structures: list[tuple[str, str]] = []
+        for member, (inchikey, structure) in zip(members, structures, strict=True):
+            if (inchikey, self._structure_hash(structure)) in reserved_pairs:
+                queue.defer_task(member, delay_seconds=self.lease_seconds)
+                fanout.mark_items_delayed(member.inchikey)
+            else:
+                free_members.append(member)
+                free_structures.append((inchikey, structure))
+        return free_members, free_structures
+
     def _submit_batch(self, task: RemoteTask) -> None:
         # Batch this task with other READY tasks that have a structure, up to
         # REMOTE_BATCH_SIZE. The dedup index guarantees one task per inchikey.
@@ -485,6 +555,38 @@ class RemoteWorker:
             self._reconcile_submission(existing, members)
             return
 
+        # --- R-01: per-member live reservation pre-filter --------------------
+        # An exact-payload retry reconciled above. A REGROUPED batch (different
+        # payload_hash, e.g. an ambiguous [A,B] later regrouped as [A,C]) reaches
+        # here: defer any member still actively reserved by ANOTHER live
+        # submission and POST only the free remainder, so the same normalized
+        # member is never re-POSTed while its first submission holds the slot.
+        members, structures = self._filter_reserved_members(members, structures)
+        if not members:
+            return
+        payload = self._canonical_payload(structures)
+        payload_hash = self._payload_hash(payload)
+        member_specs = self._member_specs(structures)
+        structure_hash_by_key = {
+            spec["inchikey"]: spec["structure_hash"] for spec in member_specs
+        }
+        # The free-member subset may itself match an existing live intent.
+        existing = (
+            RemoteSubmission.objects.filter(
+                provider=PROVIDER,
+                payload_hash=payload_hash,
+                state__in=[s.value for s in SubmissionState.live_states()],
+            )
+            .order_by("-id")
+            .first()
+        )
+        if existing is not None:
+            self._reconcile_submission(existing, members)
+            return
+        # The first free member represents the batch for per-attempt audit rows;
+        # the original ``task`` may itself have been deferred as reserved above.
+        representative = members[0]
+
         # No existing intent → this is a genuine first/fresh submit. Only NOW
         # draw a global submit token.
         if not self.rate_limiter.submit.allow():
@@ -493,8 +595,11 @@ class RemoteWorker:
                 fanout.mark_items_delayed(member.inchikey)
             return
 
-        # Persist INTENT (PENDING) BEFORE the network call. The partial-UNIQUE on
-        # (provider, payload_hash) makes a concurrent/duplicate intent fail fast.
+        # Persist INTENT (PENDING) + the per-member reservations BEFORE the
+        # network call. The partial-UNIQUE on (provider, payload_hash) makes a
+        # concurrent/duplicate intent fail fast; the partial-UNIQUE on
+        # (provider, inchikey, structure_hash) over active rows makes a concurrent
+        # reservation of the same member fail fast too (R-01).
         try:
             with transaction.atomic():
                 submission = RemoteSubmission.objects.create(
@@ -503,8 +608,23 @@ class RemoteWorker:
                     state=SubmissionState.PENDING,
                     request_payload=payload,
                 )
+                RemoteSubmissionMember.objects.bulk_create(
+                    [
+                        RemoteSubmissionMember(
+                            submission=submission,
+                            provider=PROVIDER,
+                            inchikey=spec["inchikey"],
+                            structure_hash=spec["structure_hash"],
+                        )
+                        for spec in member_specs
+                    ]
+                )
         except IntegrityError:
-            # Another worker raced us to the intent; reconcile against it.
+            # Lost a race on EITHER the payload-hash intent OR a member
+            # reservation. If a live intent for this exact payload now exists,
+            # reconcile against it; otherwise a concurrent worker reserved one of
+            # our members — schedule a retry, on which the pre-filter defers the
+            # now-conflicting member and POSTs the remainder.
             existing = (
                 RemoteSubmission.objects.filter(
                     provider=PROVIDER,
@@ -542,9 +662,9 @@ class RemoteWorker:
                 classification="UNKNOWN_ACCEPTANCE",
                 raw_payload=None,
                 detail=f"{detail}: {exc}",
-                task=task,
+                task=representative,
                 submission=submission,
-                request_inchikey=task.inchikey,
+                request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
@@ -564,9 +684,9 @@ class RemoteWorker:
                 classification="RETRYABLE",
                 raw_payload=None,
                 detail=str(exc),
-                task=task,
+                task=representative,
                 submission=submission,
-                request_inchikey=task.inchikey,
+                request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
@@ -592,9 +712,9 @@ class RemoteWorker:
                 classification="AUTH_FAILURE",
                 raw_payload=None,
                 detail=str(exc),
-                task=task,
+                task=representative,
                 submission=submission,
-                request_inchikey=task.inchikey,
+                request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
@@ -615,9 +735,9 @@ class RemoteWorker:
                 classification="PROTOCOL_ERROR",
                 raw_payload=None,
                 detail=str(exc),
-                task=task,
+                task=representative,
                 submission=submission,
-                request_inchikey=task.inchikey,
+                request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
@@ -636,9 +756,9 @@ class RemoteWorker:
                 classification="PERMANENT",
                 raw_payload=None,
                 detail=str(exc),
-                task=task,
+                task=representative,
                 submission=submission,
-                request_inchikey=task.inchikey,
+                request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
@@ -680,10 +800,11 @@ class RemoteWorker:
                 query=query,
                 http_status=submit.http_status,
                 remote_query_id=submit.remote_query_id,
-                task=task,
+                task=representative,
                 submission=submission,
-                request_inchikey=task.inchikey,
+                request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
+                request_structure_hash=structure_hash_by_key[representative.inchikey],
                 raw_body_text=submit.raw_text,
                 safe_headers=submit.safe_headers,
             )
@@ -842,10 +963,18 @@ class RemoteWorker:
 
     @staticmethod
     def _fail_submission(submission: RemoteSubmission, *, detail: str) -> None:
-        """Flip an intent to FAILED so its idempotency key can be reused."""
+        """Flip an intent to FAILED so its idempotency key can be reused.
+
+        A FAILED submission no longer holds the idempotency slot, so its per-member
+        reservations (R-01) MUST be released too — otherwise a legitimate retry of
+        a member that merely hit a retryable submit error could never re-POST.
+        """
         submission.state = SubmissionState.FAILED
         submission.detail = detail
         submission.save(update_fields=["state", "detail", "updated_at"])
+        RemoteWorker._release_submission_members(
+            submission, reason="submission_failed"
+        )
 
     def _record_attempt(
         self,
@@ -1290,6 +1419,12 @@ class RemoteWorker:
         query.state = QueryState.COMPLETE
         query.completed_at = timezone.now()
         query.save(update_fields=["state", "completed_at"])
+        # Every member reached a terminal apply state, so the submission(s)
+        # backing this query no longer need to hold their per-member
+        # reservations (R-01): release them so future work for the same key can
+        # submit again.
+        for submission in query.submissions.all():
+            self._release_submission_members(submission, reason="query_complete")
 
     def _member_claim(
         self, member: RemoteTask, claim: queue.TaskClaim

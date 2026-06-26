@@ -29,7 +29,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.core.enums import QueryState, SubmissionState
-from apps.remote.models import RemoteQuery, RemoteSubmission
+from apps.remote.models import RemoteQuery, RemoteSubmission, RemoteSubmissionMember
 
 
 class Command(BaseCommand):
@@ -129,13 +129,26 @@ class Command(BaseCommand):
         )
 
     def _mark_failed(self, submission: RemoteSubmission) -> None:
-        """Operator verified non-acceptance: move to FAILED, freeing the key."""
-        submission.state = SubmissionState.FAILED
-        submission.detail = (
-            "operator verified provider did NOT accept via resolve_submission "
-            "--mark-failed (idempotency key freed)"
-        )
-        submission.save(update_fields=["state", "detail", "updated_at"])
+        """Operator verified non-acceptance: move to FAILED, freeing the key.
+
+        The submission no longer holds the idempotency slot, so its per-member
+        reservations (R-01) are released in the SAME transaction — a genuine
+        re-POST of those members may now occur.
+        """
+        with transaction.atomic():
+            submission.state = SubmissionState.FAILED
+            submission.detail = (
+                "operator verified provider did NOT accept via resolve_submission "
+                "--mark-failed (idempotency key freed)"
+            )
+            submission.save(update_fields=["state", "detail", "updated_at"])
+            RemoteSubmissionMember.objects.filter(
+                submission=submission, active=True
+            ).update(
+                active=False,
+                released_at=timezone.now(),
+                release_reason="operator_mark_failed",
+            )
         self.stdout.write(
             self.style.SUCCESS(
                 f"Submission {submission.pk} -> FAILED (idempotency key freed)."

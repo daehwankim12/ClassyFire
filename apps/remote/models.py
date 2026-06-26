@@ -307,6 +307,65 @@ class RemoteSubmission(models.Model):
         return f"submission:{self.provider}:{self.payload_hash[:12]} ({self.state})"
 
 
+class RemoteSubmissionMember(models.Model):
+    """Durable live reservation for one submitted provider member (R-01).
+
+    The ``RemoteSubmission`` idempotency key is the hash of the WHOLE batch
+    payload, so regrouping an ambiguous batch ``[A, B]`` into ``[A, C]`` produces
+    a different key and would let the same normalized member ``A`` be POSTed a
+    second time while its first submission is still live. This per-member
+    reservation closes that gap: a member is reserved (``active=True``) for as
+    long as its submission holds the idempotency slot (PENDING/SUBMITTED/UNKNOWN),
+    and the partial-UNIQUE over ``(provider, inchikey, structure_hash)`` for
+    ``active`` rows means the worker can never re-POST the same normalized member
+    in a different batch. A reservation is released deliberately — when its
+    submission FAILS (key freed), when every member of a SUBMITTED query reaches
+    a terminal apply state, or when an operator marks an UNKNOWN submission
+    failed — never on an automatic PENDING→UNKNOWN in-doubt transition.
+    """
+
+    submission = models.ForeignKey(
+        RemoteSubmission,
+        on_delete=models.CASCADE,
+        related_name="members",
+    )
+    provider = models.CharField(max_length=32, default="wishart")
+    inchikey = models.CharField(max_length=27)
+    structure_hash = models.CharField(
+        max_length=64,
+        help_text="sha256 hex of the submitted structure (SMILES/InChI).",
+    )
+    active = models.BooleanField(default=True, db_default=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    release_reason = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "remote_submission_members"
+        constraints = [
+            models.CheckConstraint(
+                name="remote_submission_member_inchikey_format",
+                condition=Q(inchikey__regex=INCHIKEY_REGEX),
+            ),
+            # At most ONE active reservation per normalized member: a regrouped
+            # batch cannot repost a member already live in another submission.
+            models.UniqueConstraint(
+                fields=["provider", "inchikey", "structure_hash"],
+                condition=Q(active=True),
+                name="remote_submission_member_live_unique",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["provider", "inchikey", "active"],
+                name="remote_sub_member_live_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"sub-member:{self.inchikey} (active={self.active})"
+
+
 class RemoteRateBucket(models.Model):
     """Shared DB-backed token bucket for global rate limiting (F-08).
 

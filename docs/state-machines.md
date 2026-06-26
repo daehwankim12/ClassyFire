@@ -475,6 +475,21 @@ intent to `UNKNOWN` (the key stays held); it can NOT free a key. No age-based
 or count-based path force-frees a key — `resolve_submission --mark-failed`
 (which requires `state == UNKNOWN`) is the ONLY key-freeing command.
 
+**Per-member reservations (`remote_submission_members`, R-01):** the
+`(provider, payload_hash)` key idempotency-protects an _exact batch_, but a
+member can be regrouped into a _different_ batch (e.g. an ambiguous `[A, B]`
+later re-formed as `[A, C]`) whose payload hash differs — which would let the
+same normalized member `A` be POSTed twice while its first submission is still
+live. To close this, every POSTed member is reserved as a `remote_submission_members`
+row with a partial-UNIQUE over `(provider, inchikey, structure_hash)` for
+`active=True` rows. Before a fresh submit the worker defers (does not POST) any
+member already actively reserved by another live submission. A reservation is
+released — `active=False` — ONLY when its submission deliberately leaves a live
+state: it FAILS (`_fail_submission`, key freed), every member of a `SUBMITTED`
+query reaches terminal apply (`_complete_query_if_terminal`), or an operator runs
+`resolve_submission --mark-failed`. An automatic `PENDING`→`UNKNOWN` transition
+keeps the reservation held, mirroring the idempotency key.
+
 ---
 
 ## 7. `remote_circuits` — shared circuit breaker (`CircuitState`, F-08)

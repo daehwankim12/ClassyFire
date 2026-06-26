@@ -6,7 +6,9 @@ from django.utils import timezone
 
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import SubmissionState, TaskState
-from apps.remote.models import RemoteSubmission, RemoteTask
+from apps.remote.mock import MockProvider
+from apps.remote.models import RemoteSubmission, RemoteSubmissionMember, RemoteTask
+from apps.remote.provider import AmbiguousSubmissionError
 from apps.remote.wishart import WishartDirectProvider
 from apps.remote.worker import RemoteWorker
 
@@ -92,6 +94,90 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     assert transport.submit_count == 1
     submission.refresh_from_db()
     assert submission.state == SubmissionState.UNKNOWN
+
+
+class AmbiguousSubmitProvider(MockProvider):
+    """A provider whose every /queries POST ends in ambiguous acceptance.
+
+    Records the (label, structure) batch it was asked to submit (so a test can
+    assert which members were POSTed), then raises
+    :class:`AmbiguousSubmissionError` so the submission is parked UNKNOWN — a LIVE
+    state that holds the per-member reservation. Entity lookups MISS (empty
+    ``entities``) so the worker routes to a structure submit.
+    """
+
+    def submit_structures(self, structures):  # type: ignore[override]
+        self.submit_calls.append(list(structures))
+        raise AmbiguousSubmissionError("provider acceptance unknown (test)")
+
+
+def _seed_compound(inchikey: str, smiles: str) -> CompoundStructure:
+    return CompoundStructure.objects.create(
+        inchikey=inchikey,
+        canonical_smiles=smiles,
+        original_input=smiles,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ambiguous_submission_member_cannot_repost_in_different_batch(settings):
+    settings.REMOTE_ENABLED = True
+    settings.REMOTE_BATCH_SIZE = 2
+    settings.REMOTE_SUBMISSION_RECONCILE_MAX = 0
+    settings.REMOTE_SUBMISSION_TTL_SECONDS = 0
+    settings.REMOTE_POLL_MIN_SECONDS = 1
+
+    a = _seed_compound("AAAAAAAAAAAAAA-BBBBBBBBBB-C", "C")
+    b = _seed_compound("BBBBBBBBBBBBBB-CCCCCCCCCC-D", "CC")
+    c = _seed_compound("CCCCCCCCCCCCCC-DDDDDDDDDD-E", "CCC")
+
+    for structure in (a, b):
+        RemoteTask.objects.create(
+            inchikey=structure.inchikey,
+            compound=structure,
+            state=TaskState.READY,
+        )
+
+    provider = AmbiguousSubmitProvider()
+    worker = RemoteWorker(
+        provider,
+        worker_id="regroup-worker",
+        rate_limiter=NoSleepLimiter(),
+        circuit=ClosedCircuit(),
+        lease_seconds=0.1,
+    )
+    worker.tick()
+
+    RemoteTask.objects.filter(inchikey=b.inchikey).update(state=TaskState.DONE)
+    RemoteTask.objects.create(
+        inchikey=c.inchikey,
+        compound=c,
+        state=TaskState.READY,
+    )
+    RemoteTask.objects.filter(inchikey=a.inchikey).update(
+        state=TaskState.READY,
+        lock_owner=None,
+        locked_at=None,
+        next_run_at=None,
+    )
+
+    worker.tick()
+
+    posted_members = [
+        inchikey
+        for call in provider.submit_calls
+        for inchikey, _structure in call
+    ]
+    assert posted_members.count(a.inchikey) == 1
+    assert posted_members.count(c.inchikey) == 1
+    assert (
+        RemoteSubmissionMember.objects.filter(
+            provider="wishart",
+            inchikey=a.inchikey,
+            active=True,
+        ).count()
+        == 1
+    )
 
 
 class Accepted2xxBodyTransport(httpx.BaseTransport):
