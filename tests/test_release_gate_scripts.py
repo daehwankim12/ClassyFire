@@ -119,3 +119,9 @@ def test_backup_restore_smoke_requires_export_download_check():
     assert "hashlib.sha256(b'smoke').hexdigest()" not in script
     assert "not yet supported" not in script
     assert "skipping HTTP check" not in script
+
+
+def test_runtime_image_includes_backup_restore_smoke_script():
+    dockerfile = Path("Dockerfile").read_text()
+
+    assert "COPY scripts/run_backup_restore_smoke.sh ./scripts/" in dockerfile

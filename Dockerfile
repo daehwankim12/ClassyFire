@@ -66,6 +66,7 @@ COPY config ./config
 COPY templates ./templates
 COPY static ./static
 COPY deploy ./deploy
+COPY scripts/run_backup_restore_smoke.sh ./scripts/
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
