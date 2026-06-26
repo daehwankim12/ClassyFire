@@ -22,10 +22,11 @@ from apps.classifications.models import ClassificationResult, ClassyfireLive
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, ResultKind, TaskState
 from apps.remote.circuit import CircuitBreaker
+from apps.remote.contract import ProviderContractError, validate_entity_lookup_payload
 from apps.remote.mock import MockProvider, build_raw
 from apps.remote.models import RemoteAttempt, RemoteSubmission, RemoteTask
 from apps.remote.rate_limit import RateLimiter
-from apps.remote.worker import RemoteWorker
+from apps.remote.worker import MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS, RemoteWorker
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -103,6 +104,54 @@ def test_remote_attempt_carries_request_response_identity(
     assert attempt.request_payload_hash
     assert attempt.raw_body_sha256
     assert attempt.raw_body_text is not None
+
+
+def test_remote_attempt_caps_stored_raw_body_text():
+    worker = RemoteWorker.__new__(RemoteWorker)
+    compound = CompoundStructure.objects.create(
+        original_input=SMILES, canonical_smiles=SMILES, inchikey=IK
+    )
+    task = RemoteTask.objects.create(inchikey=IK, compound=compound)
+    raw_body_text = "x" * (MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS + 1024)
+
+    worker._record_attempt(
+        RemoteAttempt.OPERATION_ENTITY,
+        classification="RETRYABLE",
+        raw_payload=None,
+        task=task,
+        request_inchikey=task.inchikey,
+        raw_body_text=raw_body_text,
+    )
+
+    attempt = RemoteAttempt.objects.latest("id")
+    assert len(attempt.raw_body_text) == MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS
+    assert "truncated remote response body" in attempt.raw_body_text
+    assert attempt.raw_body_sha256 == hashlib.sha256(raw_body_text.encode()).hexdigest()
+
+
+def test_remote_attempt_drops_invalid_returned_inchikey_before_insert():
+    worker = RemoteWorker.__new__(RemoteWorker)
+    compound = CompoundStructure.objects.create(
+        original_input=SMILES, canonical_smiles=SMILES, inchikey=IK
+    )
+    task = RemoteTask.objects.create(inchikey=IK, compound=compound)
+
+    worker._record_attempt(
+        RemoteAttempt.OPERATION_ENTITY,
+        classification="RESULT_KEY_MISMATCH",
+        raw_payload={"inchikey": "InChIKey=SHORT"},
+        task=task,
+        request_inchikey=task.inchikey,
+        returned_inchikey="SHORT",
+    )
+
+    attempt = RemoteAttempt.objects.latest("id")
+    assert attempt.returned_inchikey is None
+
+
+def test_entity_contract_rejects_non_full_length_inchikey():
+    with pytest.raises(ProviderContractError):
+        validate_entity_lookup_payload(build_raw("SHORT"))
 
 
 class _MismatchScenario:

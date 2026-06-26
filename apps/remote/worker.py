@@ -115,6 +115,8 @@ class CircuitLike(Protocol):
 # Default lock lease: how long a claimed task may be held before the recovery
 # sweep reclaims it. Derived from the remote timeout with generous headroom.
 DEFAULT_LEASE_SECONDS = 300.0
+MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS = 65536
+TRUNCATED_REMOTE_ATTEMPT_SUFFIX = "\n...[truncated remote response body]"
 
 
 def _raw_body_text(raw_payload: object | None, raw_body_text: str | None) -> str:
@@ -130,6 +132,21 @@ def _raw_body_text(raw_payload: object | None, raw_body_text: str | None) -> str
     return json.dumps(
         raw_payload, sort_keys=True, separators=(",", ":"), default=str
     )
+
+
+def _stored_raw_body_text(body_text: str) -> str:
+    """Return a bounded representation of provider-controlled response text."""
+    if len(body_text) <= MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS:
+        return body_text
+    keep = MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS - len(TRUNCATED_REMOTE_ATTEMPT_SUFFIX)
+    return body_text[:keep] + TRUNCATED_REMOTE_ATTEMPT_SUFFIX
+
+
+def _auditable_inchikey(inchikey: str | None) -> str | None:
+    """Only persist full-length InChIKeys in constrained audit columns."""
+    if inchikey is None or len(inchikey) != 27:
+        return None
+    return inchikey
 
 
 def make_worker_id() -> str:
@@ -1144,6 +1161,7 @@ class RemoteWorker:
         """
         body_text = _raw_body_text(raw_payload, raw_body_text)
         body_sha256 = hashlib.sha256(body_text.encode()).hexdigest()
+        stored_body_text = _stored_raw_body_text(body_text)
         RemoteAttempt.objects.create(
             provider=PROVIDER,
             operation=operation,
@@ -1155,11 +1173,11 @@ class RemoteWorker:
             detail=detail,
             task=task,
             submission=submission,
-            request_inchikey=request_inchikey,
-            returned_inchikey=returned_inchikey,
+            request_inchikey=_auditable_inchikey(request_inchikey),
+            returned_inchikey=_auditable_inchikey(returned_inchikey),
             request_payload_hash=request_payload_hash,
             request_structure_hash=request_structure_hash,
-            raw_body_text=body_text,
+            raw_body_text=stored_body_text,
             raw_body_sha256=body_sha256,
             safe_headers=safe_headers,
         )

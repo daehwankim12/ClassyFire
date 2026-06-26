@@ -23,6 +23,7 @@ class QueryPollContractStatus(StrEnum):
 
 _ENTITY_SLOT_KEYS = ("kingdom", "superclass", "class", "subclass", "direct_parent")
 _INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
+INCHIKEY_LENGTH = 27
 MAX_STRING_LENGTH = 4096
 MAX_ALTERNATIVE_PARENTS = 100
 MAX_QUERY_ENTITIES = 1000
@@ -52,6 +53,13 @@ def _normalized_inchikey(value: Any) -> str | None:
         return None
     normalized = value.replace("InChIKey=", "").strip()
     if not normalized or _INCHIKEY_RE.fullmatch(normalized) is None:
+        return None
+    return normalized
+
+
+def _normalized_full_inchikey(value: Any) -> str | None:
+    normalized = _normalized_inchikey(value)
+    if normalized is None or len(normalized) != INCHIKEY_LENGTH:
         return None
     return normalized
 
@@ -87,7 +95,7 @@ def _validate_slot(raw: dict[str, Any], key: str) -> None:
 def validate_entity_lookup_payload(payload: Any) -> dict[str, Any]:
     """Validate a successful entity lookup response and return the same dict."""
     raw = _object(payload, "entity lookup response")
-    if _normalized_inchikey(raw.get("inchikey")) is None:
+    if _normalized_full_inchikey(raw.get("inchikey")) is None:
         raise ProviderContractError("entity lookup response missing valid inchikey")
     for key in _ENTITY_SLOT_KEYS:
         _validate_slot(raw, key)
