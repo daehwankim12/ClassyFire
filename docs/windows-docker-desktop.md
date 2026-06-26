@@ -43,7 +43,7 @@ TLS는 ngrok이 종단합니다.
 - CPU 4코어 이상, RAM 8GB 이상(시드 임포트 시 16GB 권장)
 - 디스크 여유 공간
   - 코드 + 이미지: 약 3~5GB
-  - 시드 데이터셋 `FULL` 임포트 시: **추가 약 4GB 다운로드 + DB 적재분**
+  - 시드 데이터셋: 압축 파일 약 2GB + DB 적재분(압축 해제 시 그 이상)
 
 ### 1-2. 소프트웨어
 1. **Windows 10 21H2 이상 / Windows 11**, 64-bit
@@ -226,6 +226,9 @@ docker compose exec web python -c "import urllib.request as u; req=u.Request('ht
 
 > 공개 URL에는 **포트를 붙이지 마세요**(`:8000` 등). ngrok 엣지는 443만 받습니다.
 
+> 로그인은 되지만 화합물을 제출해도 캐시가 비어 있으면 대부분 `PENDING`/원격 대기로
+> 빠집니다. **결과가 로컬에서 바로 나오게 하려면 이어서 6장(시드 임포트)을 수행하세요.**
+
 ### 5-4. (선택) Django 관리자 계정
 ```bash
 docker compose exec web python manage.py createsuperuser
@@ -234,28 +237,24 @@ docker compose exec web python manage.py createsuperuser
 
 ---
 
-## 6. 시드 데이터셋 임포트 (선택)
+## 6. 시드 데이터셋 임포트 (기본 절차)
 
-로컬 분류 캐시를 미리 채우면 원격 호출이 줄어듭니다. 시드 파일(약 2GB의
-`*.tsv.zst` 본체와 ChemOnt 사전 `chemont_dictionary.tsv`)은 용량·라이선스
-때문에 **git에도 Docker 이미지에도 포함되지 않습니다.** 따라서 호스트에 따로
-내려받아 컨테이너로 **마운트**한 뒤, 컨테이너 안에서 임포트합니다.
+시드를 임포트해야 로컬 분류 캐시가 채워져 원격 호출 없이 곧바로 결과가 나옵니다.
+**최초 기동 시 반드시 한 번 거치는 단계로 생각하세요.** 시드 파일(약 2GB의
+`*.tsv.zst` 본체와 ChemOnt 사전 `chemont_dictionary.tsv`)은 용량·라이선스 때문에
+git·Docker 이미지에 포함되지 않으므로, 호스트에 내려받기만 하면 됩니다. 마운트는
+이미 `docker-compose.yml` 에 들어 있습니다(`web` 서비스가 `./seed_cache` 를
+읽기전용으로 마운트).
 
-### 6-1. 시드 파일 배치 & 마운트
-1. Zenodo 레코드 `20472700` 에서 두 파일을 받아 리포지토리 루트의 `seed_cache/`
-   폴더에 둡니다(이 폴더는 `.gitignore` 대상):
-   - `classyfire_dedup_inchikey_smiles.enriched.tsv.zst` (시드 본체)
-   - `chemont_dictionary.tsv` (ChemOnt 온톨로지)
-2. `web` 컨테이너가 이 폴더를 보도록 **`docker-compose.override.yml`** 에
-   읽기전용 바인드 마운트를 추가합니다(파일이 없으면 새로 만들고, 이미 있으면
-   `services:` 아래에 합칩니다):
-   ```yaml
-   services:
-     web:
-       volumes:
-         - ./seed_cache:/app/seed_cache:ro
-   ```
-   `docker compose` 는 override 파일을 자동으로 합치므로 별도 플래그가 필요 없습니다.
+### 6-1. 시드 파일 배치
+Zenodo 레코드 `20472700` 에서 두 파일을 받아 리포지토리 루트의 `seed_cache/`
+폴더에 둡니다(이 폴더는 `.gitignore` 대상이며, web 컨테이너가 자동으로 봅니다):
+
+- `classyfire_dedup_inchikey_smiles.enriched.tsv.zst` (시드 본체)
+- `chemont_dictionary.tsv` (ChemOnt 온톨로지)
+
+> 별도 compose 수정은 필요 없습니다. `web` 서비스에 `./seed_cache:/app/seed_cache:ro`
+> 마운트가 기본 포함돼 있어, 아래 명령의 `/app/seed_cache/...` 경로가 그대로 동작합니다.
 
 ### 6-2. 임포트 절차 (순서 중요)
 ```bash

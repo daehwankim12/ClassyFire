@@ -146,6 +146,13 @@ services:
       - source_artifacts:/app/source_artifacts
       # H-04: upload spool volume — web spools raw uploads here before the worker reads them
       - uploads:/app/uploads
+      # Seed dataset (read-only): the ~2GB seed .tsv.zst + chemont_dictionary.tsv
+      # live in the gitignored ./seed_cache and are NOT baked into the image.
+      # Mounted here so `docker compose run --rm web python manage.py seed_import
+      # --source /app/seed_cache/<file>` (and import_chemont) work by default.
+      # If ./seed_cache is absent on the host, Docker creates an empty dir — the
+      # seed commands simply have nothing to import until you populate it.
+      - ./seed_cache:/app/seed_cache:ro
     networks:
       - internal
       - external
