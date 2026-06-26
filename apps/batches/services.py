@@ -887,17 +887,21 @@ def _retry_backpressured_remote_delayed_items(
         return
 
     with transaction.atomic():
-        locked_job = _lock_owned_job(claim)
+        # Lock retryable item rows before the parent job row. Remote fan-out
+        # updates matching BatchItem rows and then recomputes counters, which
+        # locks the BatchJob row; taking locks in that same item -> job order
+        # avoids a PostgreSQL ABBA deadlock for the same InChIKey.
         items = list(
             BatchItem.objects.select_for_update()
             .filter(
-                job=locked_job,
+                job_id=claim.job_id,
                 status=BatchItemStatus.REMOTE_DELAYED,
                 message=_REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
                 inchikey__isnull=False,
             )
             .order_by("row_order")
         )
+        _lock_owned_job(claim)
         for item in items:
             result = lookup_current_classification(item.inchikey)
             if result is not None:
