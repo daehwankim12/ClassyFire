@@ -27,6 +27,7 @@ import json
 import logging
 import socket
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Protocol
 
@@ -234,6 +235,32 @@ class RemoteWorker:
 
     # -- entity-first flow -------------------------------------------------
 
+    def _with_owned_claim(
+        self,
+        claim: queue.TaskClaim,
+        action: Callable[[RemoteTask], None],
+    ) -> bool:
+        """Run ``action(locked_task)`` ONLY while this worker still owns the lease.
+
+        Row-locks the claim's task and re-asserts the IMMUTABLE lease snapshot
+        BEFORE running ``action`` (which performs a branch's DB side effects). If
+        the lease was stolen/reclaimed the action never runs and NOTHING is
+        written — the stale worker yields to the fresh owner (R-02). Mirrors the
+        poll path's lease-fenced writes for the entity-first path. Returns True
+        iff the action ran under a valid claim.
+        """
+        try:
+            with transaction.atomic():
+                locked = queue.lock_owned_claim(claim)
+                action(locked)
+            return True
+        except LeaseLost:
+            logger.warning(
+                "lease lost for task %s before entity side effects; aborting",
+                claim.task_id,
+            )
+            return False
+
     def _entity_first(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
         if not self.rate_limiter.entity.allow():
             queue.defer_task(task, delay_seconds=5)
@@ -245,72 +272,88 @@ class RemoteWorker:
             # A provider that RAISES an auth failure (rather than mapping it to
             # EntityLookupStatus.AUTH_FAILURE) is handled identically: record the
             # attempt, durably block the provider for ALL workers (H-03), and
-            # defer this task. Never burns an attempt.
+            # defer this task. Never burns an attempt. Every write is lease-fenced
+            # so a stale worker writes nothing (R-02).
             self.circuit.record_failure()
-            self._record_attempt(
-                RemoteAttempt.OPERATION_ENTITY,
-                classification="AUTH_FAILURE",
-                raw_payload=None,
-                http_status=exc.http_status,
-                detail=str(exc),
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=exc.raw_text,
-                safe_headers=exc.safe_headers,
-            )
-            self._block_provider_auth(str(exc))
-            logger.error(
-                "remote entity AUTH_FAILURE (operator action) for %s: %s",
-                task.inchikey,
-                exc,
-            )
-            queue.defer_task(task, delay_seconds=self.lease_seconds)
-            fanout.mark_items_delayed(task.inchikey)
+            # Bind to a stable local: Python deletes the ``except ... as exc``
+            # name at block exit, but the fenced closure references it.
+            auth_exc = exc
+
+            def write_auth_raised(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification="AUTH_FAILURE",
+                    raw_payload=None,
+                    http_status=auth_exc.http_status,
+                    detail=str(auth_exc),
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=auth_exc.raw_text,
+                    safe_headers=auth_exc.safe_headers,
+                )
+                self._block_provider_auth(str(auth_exc))
+                queue.defer_task(locked, delay_seconds=self.lease_seconds)
+
+            if self._with_owned_claim(claim, write_auth_raised):
+                logger.error(
+                    "remote entity AUTH_FAILURE (operator action) for %s: %s",
+                    task.inchikey,
+                    exc,
+                )
+                fanout.mark_items_delayed(task.inchikey)
             return
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
             self.circuit.record_failure()
-            self._record_attempt(
-                RemoteAttempt.OPERATION_ENTITY,
-                classification="RETRYABLE",
-                raw_payload=result.raw_json,
-                http_status=result.http_status,
-                detail=result.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=result.raw_text,
-                safe_headers=result.safe_headers,
-            )
-            if result.retry_after is not None:
-                self.rate_limiter.entity.penalize(result.retry_after)
-                queue.retry_after_override(task, result.retry_after)
-            else:
-                queue.schedule_retry(task)
-            fanout.mark_items_delayed(task.inchikey)
+
+            def write_retryable(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification="RETRYABLE",
+                    raw_payload=result.raw_json,
+                    http_status=result.http_status,
+                    detail=result.detail,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=result.raw_text,
+                    safe_headers=result.safe_headers,
+                )
+                if result.retry_after is not None:
+                    self.rate_limiter.entity.penalize(result.retry_after)
+                    queue.retry_after_override(locked, result.retry_after)
+                else:
+                    queue.schedule_retry(locked)
+
+            if self._with_owned_claim(claim, write_retryable):
+                fanout.mark_items_delayed(task.inchikey)
             return
 
         if result.status == EntityLookupStatus.AUTH_FAILURE:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
             self.circuit.record_failure()
-            self._record_attempt(
-                RemoteAttempt.OPERATION_ENTITY,
-                classification="AUTH_FAILURE",
-                raw_payload=result.raw_json,
-                http_status=result.http_status,
-                detail=result.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=result.raw_text,
-                safe_headers=result.safe_headers,
-            )
-            self._block_provider_auth(result.detail or "entity auth failure")
-            logger.error(
-                "remote entity AUTH_FAILURE (operator action) for %s: %s",
-                task.inchikey,
-                result.detail,
-            )
-            queue.defer_task(task, delay_seconds=self.lease_seconds)
-            fanout.mark_items_delayed(task.inchikey)
+
+            def write_auth(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification="AUTH_FAILURE",
+                    raw_payload=result.raw_json,
+                    http_status=result.http_status,
+                    detail=result.detail,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=result.raw_text,
+                    safe_headers=result.safe_headers,
+                )
+                self._block_provider_auth(result.detail or "entity auth failure")
+                queue.defer_task(locked, delay_seconds=self.lease_seconds)
+
+            if self._with_owned_claim(claim, write_auth):
+                logger.error(
+                    "remote entity AUTH_FAILURE (operator action) for %s: %s",
+                    task.inchikey,
+                    result.detail,
+                )
+                fanout.mark_items_delayed(task.inchikey)
             return
 
         if result.status in (
@@ -329,42 +372,51 @@ class RemoteWorker:
                 if result.status == EntityLookupStatus.PERMANENT_ERROR
                 else "PROTOCOL_ERROR"
             )
-            self._record_attempt(
-                RemoteAttempt.OPERATION_ENTITY,
-                classification=classification,
-                raw_payload=result.raw_json,
-                http_status=result.http_status,
-                detail=result.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=result.raw_text,
-                safe_headers=result.safe_headers,
-            )
-            logger.error(
-                "remote entity %s for %s: %s",
-                classification,
-                task.inchikey,
-                result.detail,
-            )
-            queue.schedule_retry(task)
-            fanout.mark_items_delayed(task.inchikey)
+
+            def write_permanent(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification=classification,
+                    raw_payload=result.raw_json,
+                    http_status=result.http_status,
+                    detail=result.detail,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=result.raw_text,
+                    safe_headers=result.safe_headers,
+                )
+                queue.schedule_retry(locked)
+
+            if self._with_owned_claim(claim, write_permanent):
+                logger.error(
+                    "remote entity %s for %s: %s",
+                    classification,
+                    task.inchikey,
+                    result.detail,
+                )
+                fanout.mark_items_delayed(task.inchikey)
             return
 
         self.circuit.record_success()
 
         if result.status == EntityLookupStatus.FOUND and result.raw_json is not None:
             norm = self.provider.parse_result(result.raw_json)
-            self._record_attempt(
-                RemoteAttempt.OPERATION_ENTITY,
-                classification="FOUND",
-                raw_payload=result.raw_json,
-                http_status=result.http_status,
-                task=task,
-                request_inchikey=task.inchikey,
-                returned_inchikey=norm.inchikey,
-                raw_body_text=result.raw_text,
-                safe_headers=result.safe_headers,
-            )
+
+            def write_found(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification="FOUND",
+                    raw_payload=result.raw_json,
+                    http_status=result.http_status,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    returned_inchikey=norm.inchikey,
+                    raw_body_text=result.raw_text,
+                    safe_headers=result.safe_headers,
+                )
+
+            if not self._with_owned_claim(claim, write_found):
+                return
             if not self._key_matches(task.inchikey, norm.inchikey):
                 self._handle_key_mismatch(claim, norm, query=None)
                 return
@@ -386,49 +438,59 @@ class RemoteWorker:
             # Record the entity-miss attempt for a COMPLETE audit trail (F-05):
             # every entity outcome leaves a row, even a genuine cache miss that
             # routes onward to a structure submit. ``str(result.status)`` records
-            # NOT_FOUND (HTTP 404) or MISS (provider-agnostic) verbatim.
-            self._record_attempt(
-                RemoteAttempt.OPERATION_ENTITY,
-                classification=str(result.status),
-                raw_payload=result.raw_json,
-                http_status=result.http_status,
-                detail=result.detail,
-                task=task,
-                request_inchikey=task.inchikey,
-                raw_body_text=result.raw_text,
-                safe_headers=result.safe_headers,
-            )
-            self._handle_entity_miss(task)
+            # NOT_FOUND (HTTP 404) or MISS (provider-agnostic) verbatim. The attempt
+            # (and the NEED_STRUCTURE terminal) are lease-fenced; only an owning
+            # worker then proceeds to a submit (which re-asserts the claim).
+            structure = self._structure_for(task)
+
+            def write_miss(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification=str(result.status),
+                    raw_payload=result.raw_json,
+                    http_status=result.http_status,
+                    detail=result.detail,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=result.raw_text,
+                    safe_headers=result.safe_headers,
+                )
+                if structure is None:
+                    fanout.fan_out_result(
+                        locked.inchikey, BatchItemStatus.NEED_STRUCTURE
+                    )
+                    queue.transition_locked(
+                        locked, TaskState.DONE, lock_owner=None, locked_at=None
+                    )
+
+            owned = self._with_owned_claim(claim, write_miss)
+            if owned and structure is not None:
+                self._submit_batch(task, claim)
             return
 
         # Unexpected/unmapped status with circuit success recorded: surface it as a
         # protocol error rather than silently submitting or dropping the task.
-        logger.error(
-            "remote entity unexpected status %s for %s; retrying without submit",
-            result.status,
-            task.inchikey,
-        )
-        self._record_attempt(
-            RemoteAttempt.OPERATION_ENTITY,
-            classification="PROTOCOL_ERROR",
-            raw_payload=result.raw_json,
-            http_status=result.http_status,
-            detail=f"unexpected entity status {result.status}",
-            task=task,
-            request_inchikey=task.inchikey,
-            raw_body_text=result.raw_text,
-            safe_headers=result.safe_headers,
-        )
-        queue.schedule_retry(task)
-        fanout.mark_items_delayed(task.inchikey)
+        def write_unexpected(locked: RemoteTask) -> None:
+            self._record_attempt(
+                RemoteAttempt.OPERATION_ENTITY,
+                classification="PROTOCOL_ERROR",
+                raw_payload=result.raw_json,
+                http_status=result.http_status,
+                detail=f"unexpected entity status {result.status}",
+                task=locked,
+                request_inchikey=locked.inchikey,
+                raw_body_text=result.raw_text,
+                safe_headers=result.safe_headers,
+            )
+            queue.schedule_retry(locked)
 
-    def _handle_entity_miss(self, task: RemoteTask) -> None:
-        structure = self._structure_for(task)
-        if structure is None:
-            fanout.fan_out_result(task.inchikey, BatchItemStatus.NEED_STRUCTURE)
-            queue.finish_task(task)
-            return
-        self._submit_batch(task)
+        if self._with_owned_claim(claim, write_unexpected):
+            logger.error(
+                "remote entity unexpected status %s for %s; retrying without submit",
+                result.status,
+                task.inchikey,
+            )
+            fanout.mark_items_delayed(task.inchikey)
 
     @staticmethod
     def _canonical_payload(structures: list[tuple[str, str]]) -> dict:
@@ -518,7 +580,21 @@ class RemoteWorker:
                 free_structures.append((inchikey, structure))
         return free_members, free_structures
 
-    def _submit_batch(self, task: RemoteTask) -> None:
+    def _submit_batch(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
+        # R-02: never INITIATE a submit under a lost lease. A stale entity worker
+        # whose lease was stolen during lookup_entity must POST nothing. Re-assert
+        # ownership of the representative task before claiming extras or persisting
+        # any intent; if the lease is gone the fresh owner drives the submit.
+        try:
+            with transaction.atomic():
+                queue.lock_owned_claim(claim)
+        except LeaseLost:
+            logger.warning(
+                "lease lost before submit for task %s (inchikey=%s); aborting",
+                task.pk,
+                task.inchikey,
+            )
+            return
         # Batch this task with other READY tasks that have a structure, up to
         # REMOTE_BATCH_SIZE. The dedup index guarantees one task per inchikey.
         batch = [task]
