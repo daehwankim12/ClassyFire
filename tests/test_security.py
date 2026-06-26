@@ -1119,6 +1119,58 @@ class TestSecurityImplementationGuards:
         with override_settings(SHARED_ACCESS_PASSWORD_HASH=make_password("correct")):
             assert _principal(first) == _principal(second) == principal
 
+    @pytest.mark.django_db
+    def test_shared_password_daily_row_quota_survives_fresh_browser_session(
+        self,
+        settings: object,
+    ) -> None:
+        from django.test import Client, RequestFactory
+        from django.utils import timezone
+
+        from apps.batches.models import BatchQuotaEvent
+        from apps.core.security import _principal, validate_job_create_controls
+
+        settings.JOB_CREATE_DAILY_ROW_CAP = 100
+        settings.JOB_CREATE_RATE_LIMIT_PER_MINUTE = -1
+        settings.ACTIVE_JOB_CAP = 20
+        settings.SHARED_ACCESS_PASSWORD_HASH = _TEST_HASH
+
+        first_client = Client(REMOTE_ADDR="198.51.100.40")
+        second_client = Client(REMOTE_ADDR="198.51.100.40")
+        assert (
+            first_client.post("/access/", {"password": _TEST_PASSWORD}).status_code
+            == 303
+        )
+        assert (
+            second_client.post("/access/", {"password": _TEST_PASSWORD}).status_code
+            == 303
+        )
+
+        factory = RequestFactory()
+        first_request = factory.post("/api/jobs", REMOTE_ADDR="198.51.100.40")
+        first_request.session = first_client.session
+        second_request = factory.post("/api/jobs", REMOTE_ADDR="198.51.100.40")
+        second_request.session = second_client.session
+
+        first_principal = _principal(first_request)
+        second_principal = _principal(second_request)
+        assert first_principal == second_principal
+        assert first_principal.startswith("shared-access:")
+
+        BatchQuotaEvent.objects.create(
+            kind=BatchQuotaEvent.KIND_JOB_CREATE,
+            principal=first_principal,
+            ip_address="198.51.100.40",
+            row_count=90,
+            created_at=timezone.now(),
+        )
+
+        quota_error = validate_job_create_controls(second_request, 20)
+
+        assert quota_error is not None
+        assert quota_error.status_code == 429
+        assert b"Daily row quota exceeded" in quota_error.content
+
     @pytest.mark.django_db(transaction=True)
     @override_settings(INGEST_DEFER_HEAVY_PROCESSING=False)
     def test_create_job_under_quota_processes_items_after_quota_transaction(
