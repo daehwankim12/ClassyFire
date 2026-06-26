@@ -173,7 +173,11 @@ WISHART_BASE_URL: str = env_str(
 )
 REMOTE_ENABLED: bool = env_bool("REMOTE_ENABLED", True)
 REMOTE_ENTITY_REQUESTS_PER_MIN: int = env_int("REMOTE_ENTITY_REQUESTS_PER_MIN", 10)
-REMOTE_SUBMITS_PER_MIN: int = env_int("REMOTE_SUBMITS_PER_MIN", 1)
+# Wishart caps POST (query submit) requests at 12/min — a fixed external limit,
+# so this is hard-coded (NOT env-overridable) at a paced 10/min (one per ~6s).
+# The submit token-bucket burst is pinned to 1 in DbRateLimiter.from_settings so
+# a fresh worker cannot fire a whole minute's budget at once and trip the cap.
+REMOTE_SUBMITS_PER_MIN: int = 10
 REMOTE_BATCH_SIZE: int = env_int("REMOTE_BATCH_SIZE", 25)
 REMOTE_POLL_MIN_SECONDS: int = env_int("REMOTE_POLL_MIN_SECONDS", 60)
 REMOTE_MAX_CONCURRENCY: int = env_int("REMOTE_MAX_CONCURRENCY", 2)

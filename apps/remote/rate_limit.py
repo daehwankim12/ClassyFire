@@ -172,6 +172,9 @@ class DbRateLimiter:
         return cls(
             entity_per_min=settings.REMOTE_ENTITY_REQUESTS_PER_MIN,
             submit_per_min=settings.REMOTE_SUBMITS_PER_MIN,
+            # Pace submits at one per ~6s with NO catch-up burst so the shared
+            # bucket never exceeds Wishart's fixed 12 POST/min limit.
+            submit_capacity=1,
             provider=provider,
         )
 
