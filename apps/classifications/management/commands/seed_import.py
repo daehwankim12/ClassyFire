@@ -30,14 +30,50 @@ from apps.classifications.seed_stream import StreamImportError, stream_import
 
 
 def _ensure_seed_table(table_name: str) -> None:
-    """Create a versioned seed table with the same shape as classyfire_seed."""
+    """Create a versioned seed table with the same shape as classyfire_seed.
+
+    ``LIKE classyfire_seed INCLUDING ALL`` copies the CHECK constraints, NOT NULL
+    flags and column storage we want — but because ``classyfire_seed``'s primary
+    key is ``inchikey``, it ALSO emits a *second* btree on ``inchikey`` next to
+    the primary-key index. That duplicate is never used for reads yet costs a
+    full extra copy of the key (~3 GB on a 70M-row version table) and slows every
+    import by maintaining two identical indexes. We therefore exclude the copied
+    indexes and recreate only what the workload uses, with no duplicate: the
+    ``inchikey`` primary key and the five ChemOnt slot FK indexes (the latter
+    used by ``seed_audit``'s ChemOnt validation). The ``inchikey14`` skeleton
+    index is deliberately omitted — it measured 0 index scans in production while
+    the inchikey PK took every lookup; the len14 CHECK constraint (copied by
+    LIKE) still applies. Re-add that index only if 14-char connectivity-skeleton
+    matching is ever introduced.
+
+    Idempotent for ``--resume``: if the table already exists we leave it
+    untouched, because re-running ``ADD PRIMARY KEY`` / ``CREATE INDEX`` would
+    error or stack duplicate indexes.
+    """
     with connection.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", [table_name])
+        if cur.fetchone()[0] is not None:
+            return  # already created on a previous (possibly interrupted) run
+
+        tbl = pgsql.Identifier(table_name)
         cur.execute(
             pgsql.SQL(
-                "CREATE TABLE IF NOT EXISTS {} "
-                "(LIKE classyfire_seed INCLUDING ALL)"
-            ).format(pgsql.Identifier(table_name))
+                "CREATE TABLE {} (LIKE classyfire_seed INCLUDING ALL EXCLUDING INDEXES)"
+            ).format(tbl)
         )
+        cur.execute(pgsql.SQL("ALTER TABLE {} ADD PRIMARY KEY (inchikey)").format(tbl))
+        for column in (
+            "kingdom_id",
+            "superclass_id",
+            "class_id",
+            "subclass_id",
+            "direct_parent_id",
+        ):
+            cur.execute(
+                pgsql.SQL("CREATE INDEX ON {} ({})").format(
+                    tbl, pgsql.Identifier(column)
+                )
+            )
 
 
 class Command(BaseCommand):
