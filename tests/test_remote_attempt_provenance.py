@@ -229,7 +229,10 @@ def test_remote_key_mismatch_with_malformed_returned_key_is_terminal(
     assert returned_key == malformed_returned
     assert event.returned_inchikey is None
     assert event.kind == ResultKind.REJECTED_MISMATCH
-    assert event.raw_json["inchikey"] == malformed_returned
+    # raw_json preserves the literal upstream payload — Wishart prefixes keys with
+    # "InChIKey=" (see apps.remote.mock.build_raw). The malformed value is kept
+    # verbatim for provenance even though returned_inchikey normalises to None.
+    assert event.raw_json["inchikey"] == f"InChIKey={malformed_returned}"
 
     attempt = RemoteAttempt.objects.get(classification="RESULT_KEY_MISMATCH")
     assert attempt.request_inchikey == requested_key
