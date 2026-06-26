@@ -754,8 +754,16 @@ class TestResultUrlSecret:
         content = caddyfile.read_text()
 
         assert "health_headers" in content
-        assert "Host {env.NGROK_DOMAIN}" in content
+        assert "Host {$NGROK_DOMAIN}" in content
         assert "X-Forwarded-Proto https" in content
+
+    def test_caddy_ngrok_site_uses_parse_time_env_substitution(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "http://{$NGROK_DOMAIN} {" in content
+        assert "{env.NGROK_DOMAIN}" not in content
+        assert "header_up X-Forwarded-Proto https" in content
 
     def test_caddy_upload_limit_has_parseable_default(self) -> None:
         caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"

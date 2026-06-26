@@ -104,6 +104,16 @@ def test_dockerfile_creates_runtime_writable_directories():
     assert "chown -R appuser:appgroup /app" in dockerfile
 
 
+def test_ngrok_agent_config_uses_v3_https_endpoint_to_proxy_http():
+    config = yaml.safe_load(read_file("deploy/ngrok/ngrok.yml.template"))
+
+    assert "tunnels" not in config
+    assert config["version"] == "3"
+    assert config["agent"]["authtoken"] == "${NGROK_AUTHTOKEN}"
+    assert config["endpoints"][0]["url"] == "https://${NGROK_DOMAIN}"
+    assert config["endpoints"][0]["upstream"]["url"] == "http://proxy:80"
+
+
 def test_db_no_external_network():
     compose = load_compose()
     db_networks = compose["services"]["db"]["networks"]

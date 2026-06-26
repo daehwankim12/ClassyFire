@@ -1,16 +1,17 @@
 # =============================================================================
 # ClassyFire Batch Web — Caddyfile
 #
-# Caddy acts as the TLS-terminating reverse proxy sitting in front of the
-# Gunicorn `web` container.  TLS is handled automatically (ACME / Let's
-# Encrypt or ngrok's own cert when the tunnel is active).
+# Caddy acts as the reverse proxy sitting in front of the Gunicorn `web`
+# container. Public TLS is terminated by ngrok; Caddy receives internal HTTP
+# and forwards `X-Forwarded-Proto: https` so Django applies secure-cookie and
+# HTTPS-only behavior correctly.
 #
-# Environment variables available at runtime via `{env.VAR}` syntax:
+# Environment variables available at Caddyfile parse time via `{$VAR}` syntax:
 #   NGROK_DOMAIN  — the public hostname (e.g. myapp.ngrok-free.app)
 #   MAX_UPLOAD_MB — maximum body size for file uploads; defaults to 100
 # =============================================================================
 
-{env.NGROK_DOMAIN} {
+http://{$NGROK_DOMAIN} {
 
     # ── Upload size limit ────────────────────────────────────────────────────
     # MAX_UPLOAD_MB defaults to 100 when the env var is unset.
@@ -42,7 +43,7 @@
     reverse_proxy web:8000 {
         # Forward the real client IP and protocol
         header_up X-Forwarded-For {remote_host}
-        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Proto https
         header_up X-Real-IP {remote_host}
         header_up Host {host}
 
@@ -52,7 +53,7 @@
         health_timeout 5s
         health_status 200
         health_headers {
-            Host {env.NGROK_DOMAIN}
+            Host {$NGROK_DOMAIN}
             X-Forwarded-Proto https
         }
     }
