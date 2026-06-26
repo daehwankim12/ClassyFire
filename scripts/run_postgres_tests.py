@@ -117,6 +117,12 @@ def _export_django_database_env(config: PostgresTestConfig) -> None:
     os.environ["POSTGRES_USER"] = config.user
     os.environ["POSTGRES_PASSWORD"] = config.password
     os.environ.setdefault("DJANGO_SECRET_KEY", DEFAULT_SECRET_KEY)
+    # Hermetic auth gate: a developer's exported SHARED_ACCESS_PASSWORD_HASH must
+    # not flip the app into shared-access "locked" mode for the test subprocess
+    # (it would yield spurious 401s on every dev-open / API test). Cleared here,
+    # before pytest/Django start, so it holds regardless of conftest import order.
+    # Locked-mode tests opt in explicitly via @override_settings.
+    os.environ["SHARED_ACCESS_PASSWORD_HASH"] = ""
 
 
 def main(argv: list[str] | None = None) -> int:
