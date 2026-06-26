@@ -102,6 +102,8 @@ class Command(BaseCommand):
                     "payload_hash": submission.payload_hash,
                     "state": QueryState.SUBMITTED,
                     "next_poll_at": timezone.now(),
+                    # Preserve the true send time (F-18) when known.
+                    "submitted_at": submission.request_started_at or timezone.now(),
                 },
             )
             submission.state = SubmissionState.SUBMITTED

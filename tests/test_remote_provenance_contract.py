@@ -343,6 +343,14 @@ def test_every_remote_outcome_records_complete_attempt(
         assert attempt.request_payload_hash is not None
     if operation == "SUBMIT":
         assert attempt.submission_id == submission.id
+        # R-07/F-18 provenance: EVERY submit attempt carries the canonical
+        # sha256 of the submitted structure for the representative member.
+        assert RemoteAttempt.objects.filter(
+            operation=RemoteAttempt.OPERATION_SUBMIT,
+            request_structure_hash__regex=r"^[0-9a-f]{64}$",
+        ).count() == RemoteAttempt.objects.filter(
+            operation=RemoteAttempt.OPERATION_SUBMIT,
+        ).count()
     if operation == "POLL":
         assert attempt.query_id == query.id
 

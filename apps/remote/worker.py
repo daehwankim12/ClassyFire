@@ -683,6 +683,10 @@ class RemoteWorker:
                     payload_hash=payload_hash,
                     state=SubmissionState.PENDING,
                     request_payload=payload,
+                    # Stamp the TRUE send time immediately before the POST so the
+                    # linked query's submitted_at orders by real outbound order
+                    # (F-18), not by response-persist order.
+                    request_started_at=timezone.now(),
                 )
                 RemoteSubmissionMember.objects.bulk_create(
                     [
@@ -742,6 +746,7 @@ class RemoteWorker:
                 submission=submission,
                 request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
+                request_structure_hash=structure_hash_by_key[representative.inchikey],
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
                 safe_headers=exc.safe_headers,
@@ -764,6 +769,7 @@ class RemoteWorker:
                 submission=submission,
                 request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
+                request_structure_hash=structure_hash_by_key[representative.inchikey],
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
                 safe_headers=exc.safe_headers,
@@ -792,6 +798,7 @@ class RemoteWorker:
                 submission=submission,
                 request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
+                request_structure_hash=structure_hash_by_key[representative.inchikey],
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
                 safe_headers=exc.safe_headers,
@@ -815,6 +822,7 @@ class RemoteWorker:
                 submission=submission,
                 request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
+                request_structure_hash=structure_hash_by_key[representative.inchikey],
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
                 safe_headers=exc.safe_headers,
@@ -836,6 +844,7 @@ class RemoteWorker:
                 submission=submission,
                 request_inchikey=representative.inchikey,
                 request_payload_hash=payload_hash,
+                request_structure_hash=structure_hash_by_key[representative.inchikey],
                 http_status=exc.http_status,
                 raw_body_text=exc.raw_text,
                 safe_headers=exc.safe_headers,
@@ -862,6 +871,8 @@ class RemoteWorker:
                 payload_hash=payload_hash,
                 state=QueryState.SUBMITTED,
                 next_poll_at=poll_at,
+                # True send time (F-18): the moment just before this POST, not now.
+                submitted_at=submission.request_started_at or timezone.now(),
             )
             submission.state = SubmissionState.SUBMITTED
             submission.query = query
@@ -1655,6 +1666,74 @@ class RemoteWorker:
             norm=norm,
             final_status=BatchItemStatus.COMPLETE_AFTER_WISHART,
         )
+
+    def create_submission_for_test(self, compound) -> RemoteSubmission:
+        """Test-only hook: create a PENDING submission + reservation for ``compound``.
+
+        Mirrors the intent-persist step of ``_submit_batch``: stamps the true
+        ``request_started_at`` (send time) and reserves the member, but skips the
+        real POST. Lets a test build submissions in a controlled send order and
+        then persist their queries in a DIFFERENT order to prove freshness orders
+        by true send time (F-18). Named ``for_test`` so it is obviously a harness
+        entry point and never wired into production flow.
+        """
+        structure = (
+            compound.canonical_smiles
+            or compound.original_smiles
+            or compound.inchi
+            or compound.inchikey
+        )
+        structures = [(compound.inchikey, structure)]
+        payload = self._canonical_payload(structures)
+        payload_hash = self._payload_hash(payload)
+        member_specs = self._member_specs(structures)
+        with transaction.atomic():
+            submission = RemoteSubmission.objects.create(
+                provider=PROVIDER,
+                payload_hash=payload_hash,
+                state=SubmissionState.PENDING,
+                request_payload=payload,
+                request_started_at=timezone.now(),
+            )
+            RemoteSubmissionMember.objects.bulk_create(
+                [
+                    RemoteSubmissionMember(
+                        submission=submission,
+                        provider=PROVIDER,
+                        inchikey=spec["inchikey"],
+                        structure_hash=spec["structure_hash"],
+                    )
+                    for spec in member_specs
+                ]
+            )
+        return submission
+
+    def persist_submit_for_test(
+        self, submission: RemoteSubmission, *, remote_query_id: str
+    ) -> None:
+        """Test-only hook: persist a confirmed submit for ``submission``.
+
+        Mirrors the durable-first success step of ``_submit_batch``: creates the
+        RemoteQuery stamping ``submitted_at`` from the submission's TRUE
+        ``request_started_at`` (NOT response-persist time) and flips the intent to
+        SUBMITTED. Named ``for_test``; never wired into production flow.
+        """
+        poll_at = timezone.now() + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS)
+        with transaction.atomic():
+            query = RemoteQuery.objects.create(
+                provider=PROVIDER,
+                remote_query_id=remote_query_id,
+                payload_hash=submission.payload_hash,
+                state=QueryState.SUBMITTED,
+                next_poll_at=poll_at,
+                submitted_at=submission.request_started_at or timezone.now(),
+            )
+            submission.state = SubmissionState.SUBMITTED
+            submission.query = query
+            submission.remote_query_id = remote_query_id
+            submission.save(
+                update_fields=["state", "query", "remote_query_id", "updated_at"]
+            )
 
     # -- helpers -----------------------------------------------------------
 

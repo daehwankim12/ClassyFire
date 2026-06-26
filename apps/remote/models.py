@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from django.db import models
 from django.db.models import Q
+from django.utils import timezone
 
 from apps.core.enums import (
     ACTIVE_TASK_STATES,
@@ -129,7 +130,13 @@ class RemoteQuery(models.Model):
     raw_response = models.JSONField(
         null=True, blank=True, help_text="Latest raw upstream response as JSONB."
     )
-    submitted_at = models.DateTimeField(auto_now_add=True)
+    # The TRUE outbound send time (F-18 freshness key), copied from the
+    # submission's ``request_started_at`` at submit time — NOT the response-persist
+    # time. ``default=timezone.now`` keeps it auto-populated for callers that don't
+    # set it, while ALLOWING the worker to stamp the real send time (which
+    # ``auto_now_add`` would have silently ignored), so an OLDER query completing
+    # LATE never supersedes a NEWER one.
+    submitted_at = models.DateTimeField(default=timezone.now)
     completed_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
@@ -269,6 +276,15 @@ class RemoteSubmission(models.Model):
     )
     request_payload = models.JSONField(
         help_text="Canonical request payload submitted to the provider (JSONB).",
+    )
+    request_started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "TRUE outbound send time, stamped immediately before the /queries "
+            "POST is attempted. Copied to the linked RemoteQuery.submitted_at so "
+            "freshness orders by real send time, not response-persist time (F-18)."
+        ),
     )
     reconcile_attempts = models.IntegerField(
         default=0,

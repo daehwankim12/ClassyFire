@@ -22,7 +22,7 @@ from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, ResultKind, SourceType, TaskState
 from apps.remote import queue
 from apps.remote.circuit import CircuitBreaker
-from apps.remote.mock import build_raw, parse_wishart_payload
+from apps.remote.mock import MockProvider, build_raw, parse_wishart_payload
 from apps.remote.models import RemoteQuery, RemoteTask
 from apps.remote.rate_limit import RateLimiter
 from apps.remote.worker import RemoteWorker
@@ -133,3 +133,48 @@ def test_newer_query_completing_after_older_supersedes_live_result(
     newer_event = ClassificationResult.objects.latest("id")
     assert newer_event.kind != ResultKind.REJECTED_STALE
     assert newer_event.source_type == SourceType.WISHART_LIVE_QUERY
+
+
+class OutOfOrderSubmitProvider(MockProvider):
+    """Constructed only to build a worker; the freshness test drives the submit
+    lifecycle via worker test hooks, so no real /queries POST is ever made."""
+
+
+@pytest.mark.django_db(transaction=True)
+def test_true_send_order_drives_freshness_when_responses_complete_out_of_order(
+    settings,
+):
+    settings.REMOTE_BATCH_SIZE = 1
+    settings.REMOTE_POLL_MIN_SECONDS = 1
+    # Distinct keys: two PENDING submissions cannot reserve the SAME normalized
+    # member at once (R-01). The freshness invariant under test — submitted_at
+    # orders by true send time — is independent of the member identity.
+    older = CompoundStructure.objects.create(
+        inchikey="AAAAAAAAAAAAAA-BBBBBBBBBB-C",
+        canonical_smiles="C",
+        original_input="C",
+    )
+    newer = CompoundStructure.objects.create(
+        inchikey="CCCCCCCCCCCCCC-DDDDDDDDDD-E",
+        canonical_smiles="CC",
+        original_input="CC",
+    )
+    worker = RemoteWorker(
+        OutOfOrderSubmitProvider(),
+        worker_id="freshness-worker",
+        rate_limiter=RateLimiter(1000, 1000),
+        circuit=CircuitBreaker(failure_threshold=1000),
+    )
+
+    # Send order: older THEN newer.
+    older_submission = worker.create_submission_for_test(older)
+    newer_submission = worker.create_submission_for_test(newer)
+
+    # Responses complete out of order: persist the NEWER query first, OLDER last.
+    worker.persist_submit_for_test(newer_submission, remote_query_id="newer")
+    worker.persist_submit_for_test(older_submission, remote_query_id="older")
+
+    older_query = RemoteQuery.objects.get(remote_query_id="older")
+    newer_query = RemoteQuery.objects.get(remote_query_id="newer")
+    # submitted_at reflects TRUE send order, not response-persist order.
+    assert older_query.submitted_at < newer_query.submitted_at
