@@ -42,7 +42,7 @@
   // (the element is replaced on each refresh, so a captured reference would go
   // stale) and stops once it reports data-complete="true". Independent of htmx,
   // so it is robust regardless of how the item-table poller behaves.
-  const INTERVAL_MS = 5000;
+  const INTERVAL_MS = 2000;
 
   function scheduleNext() {
     setTimeout(refresh, INTERVAL_MS);
