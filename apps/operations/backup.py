@@ -303,6 +303,11 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
             backup_dir=backup_dir,
             label="source_artifacts",
         ),
+        "uploads": validate_artifact_dir(
+            getattr(settings, "UPLOAD_ARTIFACT_DIR", "/app/uploads"),
+            backup_dir=backup_dir,
+            label="uploads",
+        ),
     }
     artifact_archives = _build_artifact_archives(backup_dir, timestamp, artifact_dirs)
 
@@ -389,6 +394,11 @@ def run_backup_injectable(
             getattr(settings, "SOURCE_ARTIFACT_DIR", "/app/source_artifacts"),
             backup_dir=backup_dir,
             label="source_artifacts",
+        ),
+        "uploads": validate_artifact_dir(
+            getattr(settings, "UPLOAD_ARTIFACT_DIR", "/app/uploads"),
+            backup_dir=backup_dir,
+            label="uploads",
         ),
     }
     artifact_archives = _build_artifact_archives(backup_dir, timestamp, artifact_dirs)

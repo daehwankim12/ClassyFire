@@ -44,21 +44,44 @@ POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 
 # ---------------------------------------------------------------------------
 # Guard: reject unsafe artifact roots before any tar is created.
-# Prevents a misconfiguration from archiving / or the backup output itself.
+# RESOLVE every path (symlinks + ".." + relative paths) so a misconfiguration
+# cannot archive the root filesystem, the cwd, or the backup output itself —
+# matching the Python validate_artifact_dir contract (R-04/R-08).
 # ---------------------------------------------------------------------------
+_realpath() {
+  # Canonicalize a path that may not exist yet. Prefer GNU `realpath -m`; fall
+  # back to python3, then to plain realpath for paths that already exist.
+  realpath -m "$1" 2>/dev/null \
+    || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null \
+    || realpath "$1"
+}
+
+BACKUP_DIR_REAL="$(_realpath "${BACKUP_DIR}")"
+
 _check_artifact_dir() {
   _label="$1"
   _dir="$2"
   if [ -z "${_dir}" ]; then
     echo "[backup] ERROR: ${_label} path is empty" >&2; exit 1
   fi
-  if [ "${_dir}" = "/" ]; then
-    echo "[backup] ERROR: ${_label} path is / — refusing to archive root filesystem" >&2; exit 1
+  _real="$(_realpath "${_dir}")"
+  _cwd="$(_realpath ".")"
+  if [ "${_real}" = "/" ] || [ "${_real}" = "${_cwd}" ]; then
+    echo "[backup] ERROR: ${_label} path '${_dir}' resolves to unsafe root '${_real}'" >&2
+    exit 1
   fi
   # Reject if BACKUP_DIR is the same as or nested inside the artifact dir.
-  case "${BACKUP_DIR}/" in
-    "${_dir}/"*)
-      echo "[backup] ERROR: ${_label} path '${_dir}' contains backup output dir '${BACKUP_DIR}'" >&2; exit 1
+  case "${BACKUP_DIR_REAL}/" in
+    "${_real}/"*)
+      echo "[backup] ERROR: backup output dir is inside ${_label} path '${_real}'" >&2
+      exit 1
+      ;;
+  esac
+  # Reject if the artifact dir is nested inside the backup output dir.
+  case "${_real}/" in
+    "${BACKUP_DIR_REAL}/"*)
+      echo "[backup] ERROR: ${_label} path '${_real}' is inside backup output dir" >&2
+      exit 1
       ;;
   esac
 }
@@ -143,6 +166,20 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 2d. Upload spool artifact archive (H-04 / R-04).
+#     Only run if the directory exists and is non-empty.
+# ---------------------------------------------------------------------------
+UPLOADS_ARCHIVE="${BACKUP_DIR}/classyfire_uploads_${TIMESTAMP}.tar.gz"
+UPLOADS_CHECKSUM=""
+if [ -d "${UPLOAD_DIR}" ] && [ "$(find "${UPLOAD_DIR}" -mindepth 1 -maxdepth 1 | head -c1)" != "" ]; then
+  tar -czf "${UPLOADS_ARCHIVE}" -C "$(dirname "${UPLOAD_DIR}")" "$(basename "${UPLOAD_DIR}")"
+  UPLOADS_CHECKSUM=$(sha256sum "${UPLOADS_ARCHIVE}" | awk '{print $1}')
+  echo "[backup] Uploads archive written: ${UPLOADS_ARCHIVE} (SHA-256: ${UPLOADS_CHECKSUM})"
+else
+  echo "[backup] Uploads dir empty or absent — skipping uploads archive"
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Write manifest (JSON, no python3 required — use heredoc with sh vars)
 # ---------------------------------------------------------------------------
 BACKUP_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -177,6 +214,13 @@ else
   ARTIFACT_SOURCE_JSON="    \"source_artifacts\": null"
 fi
 
+# Build artifact_archives.uploads JSON fragment
+if [ -n "${UPLOADS_CHECKSUM}" ]; then
+  ARTIFACT_UPLOADS_JSON="    \"uploads\": {\"file\": \"classyfire_uploads_${TIMESTAMP}.tar.gz\", \"checksum\": \"${UPLOADS_CHECKSUM}\"}"
+else
+  ARTIFACT_UPLOADS_JSON="    \"uploads\": null"
+fi
+
 cat > "${MANIFEST_FILE}" <<EOF
 {
   "timestamp": "${BACKUP_TS}",
@@ -186,7 +230,8 @@ ${MEDIA_JSON}
   "artifact_archives": {
 ${ARTIFACT_MEDIA_JSON},
 ${ARTIFACT_EXPORTS_JSON},
-${ARTIFACT_SOURCE_JSON}
+${ARTIFACT_SOURCE_JSON},
+${ARTIFACT_UPLOADS_JSON}
   },
   "excludes": "classyfire_seed*",
   "status": "ok"
@@ -287,6 +332,11 @@ for MFILE in ${MANIFESTS}; do
     if [ -f "${BACKUP_DIR}/${SOURCE_NAME}" ]; then
       rm "${BACKUP_DIR}/${SOURCE_NAME}"
       echo "[backup] Pruned source artifacts archive: ${SOURCE_NAME}"
+    fi
+    UPLOADS_NAME="classyfire_uploads_${TS_PART}.tar.gz"
+    if [ -f "${BACKUP_DIR}/${UPLOADS_NAME}" ]; then
+      rm "${BACKUP_DIR}/${UPLOADS_NAME}"
+      echo "[backup] Pruned uploads archive: ${UPLOADS_NAME}"
     fi
     rm "${MFILE}"
     echo "[backup] Pruned manifest: $(basename "${MFILE}")"

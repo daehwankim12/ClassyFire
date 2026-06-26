@@ -234,6 +234,45 @@ else
   echo "[restore] Source artifacts restore skipped (RESTORE_SOURCE_ARTIFACT_DIR not set or no archive in manifest)."
 fi
 
+# ── Restore uploads archive (FAIL-CLOSED when listed) ──────────────────────
+# Reads artifact_archives.uploads from the manifest. Unlike media/exports/source
+# (which only WARN on a missing archive), a manifest that LISTS an uploads
+# archive MUST restore it intact when RESTORE_UPLOAD_DIR is set: a missing
+# archive, a missing checksum, or a checksum mismatch is FATAL (R-04). User
+# uploads are not rebuildable, so a silent skip would lose data.
+UPLOADS_FILE=$(awk -F'"' '/"uploads":/{for(i=1;i<=NF;i++) if($i=="file"){print $(i+2); exit}}' "${MANIFEST}" || true)
+if [ -n "${UPLOADS_FILE:-}" ] && [ "${UPLOADS_FILE}" != "null" ]; then
+  if [ -z "${RESTORE_UPLOAD_DIR:-}" ]; then
+    echo "[restore] Uploads archive present in manifest but RESTORE_UPLOAD_DIR not set — skipping uploads restore."
+  else
+    UPLOADS_PATH="${BACKUP_DIR}/${UPLOADS_FILE}"
+    if [ ! -f "${UPLOADS_PATH}" ]; then
+      echo "[restore] ERROR: manifest lists uploads archive but it is missing: ${UPLOADS_PATH}" >&2
+      exit 1
+    fi
+    EXPECTED_UPLOADS_CHECKSUM=$(awk -F'"' '/"uploads":/{for(i=1;i<=NF;i++) if($i=="checksum"){print $(i+2); exit}}' "${MANIFEST}" || true)
+    if [ -z "${EXPECTED_UPLOADS_CHECKSUM}" ] || [ "${EXPECTED_UPLOADS_CHECKSUM}" = "null" ]; then
+      echo "[restore] ERROR: uploads archive listed without a checksum in manifest" >&2
+      exit 1
+    fi
+    echo "[restore] Verifying uploads checksum for ${UPLOADS_FILE} ..."
+    ACTUAL_UPLOADS_CHECKSUM=$(sha256sum "${UPLOADS_PATH}" | awk '{print $1}')
+    if [ "${ACTUAL_UPLOADS_CHECKSUM}" != "${EXPECTED_UPLOADS_CHECKSUM}" ]; then
+      echo "[restore] ERROR: Uploads checksum mismatch!" >&2
+      echo "[restore]   Expected: ${EXPECTED_UPLOADS_CHECKSUM}" >&2
+      echo "[restore]   Actual:   ${ACTUAL_UPLOADS_CHECKSUM}" >&2
+      exit 1
+    fi
+    echo "[restore] Uploads checksum OK: ${ACTUAL_UPLOADS_CHECKSUM}"
+    echo "[restore] Restoring uploads archive: ${UPLOADS_FILE} -> ${RESTORE_UPLOAD_DIR}"
+    mkdir -p "${RESTORE_UPLOAD_DIR}"
+    tar -xzf "${UPLOADS_PATH}" -C "$(dirname "${RESTORE_UPLOAD_DIR}")"
+    echo "[restore] Uploads restore complete."
+  fi
+else
+  echo "[restore] No uploads archive in manifest — uploads restore skipped."
+fi
+
 echo "[restore] Done."
 echo "[restore]"
 echo "[restore] NOTE: The seed tables (classyfire_seed*) were excluded from"

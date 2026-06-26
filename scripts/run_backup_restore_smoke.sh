@@ -300,6 +300,7 @@ BACKUP_DIR="${BACKUP_DIR}" \
   RESTORE_MEDIA_DIR="${RESTORE_UPLOAD_DIR}" \
   RESTORE_EXPORT_DIR="${RESTORE_EXPORT_DIR}" \
   RESTORE_SOURCE_ARTIFACT_DIR="${RESTORE_SOURCE_DIR}" \
+  RESTORE_UPLOAD_DIR="${RESTORE_UPLOAD_DIR}" \
   sh "$(dirname "$0")/../deploy/backup/restore.sh"
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,39 @@
+import re
 from pathlib import Path
 
 import pytest
+
+
+@pytest.mark.django_db
+def test_backup_manifest_includes_upload_artifacts(settings, tmp_path):
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    app_root = tmp_path / "app"
+    app_root.mkdir()
+    settings.BACKUP_DIR = str(backup_dir)
+    settings.MEDIA_ROOT = str(app_root / "media")
+    settings.EXPORT_DIR = str(app_root / "export_files")
+    settings.SOURCE_ARTIFACT_DIR = str(app_root / "source_artifacts")
+    settings.UPLOAD_ARTIFACT_DIR = str(app_root / "uploads")
+    for directory in (
+        settings.MEDIA_ROOT,
+        settings.EXPORT_DIR,
+        settings.SOURCE_ARTIFACT_DIR,
+        settings.UPLOAD_ARTIFACT_DIR,
+    ):
+        Path(directory).mkdir(parents=True)
+    (Path(settings.UPLOAD_ARTIFACT_DIR) / "raw.csv").write_text("C\n")
+
+    def fake_dump(cmd, dump_path):
+        dump_path.write_text("dump")
+
+    from apps.operations.backup import run_backup_injectable
+
+    manifest = run_backup_injectable(backup_dir, fake_dump)
+
+    uploads = manifest["artifact_archives"]["uploads"]
+    assert uploads["file"].startswith("classyfire_uploads_")
+    assert re.fullmatch(r"[0-9a-f]{64}", uploads["checksum"])
 
 
 def test_compose_backup_mounts_export_and_source_volumes():

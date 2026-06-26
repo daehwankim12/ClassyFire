@@ -1,8 +1,67 @@
 from __future__ import annotations
 
+import os
+import subprocess
+
 import pytest
 
 from apps.operations.backup import BackupConfigurationError, validate_artifact_dir
+
+
+@pytest.mark.parametrize(
+    ("env_key", "env_value"),
+    [
+        ("MEDIA_DIR", "."),
+        ("UPLOAD_DIR", "."),
+        ("UPLOAD_DIR", "{backup_dir}/uploads"),
+        ("BACKUP_DIR", "{upload_dir}/nested-backup"),
+    ],
+)
+def test_production_backup_script_rejects_unsafe_paths(
+    tmp_path,
+    monkeypatch,
+    env_key,
+    env_value,
+):
+    """The production shell backup must fail-closed on unsafe artifact roots.
+
+    Mirrors the Python ``validate_artifact_dir`` guards: a path that resolves to
+    cwd/``/``, an artifact dir inside the backup dir, or a backup dir inside an
+    artifact dir must abort BEFORE any dump is written.
+    """
+    backup_dir = tmp_path / "backups"
+    media_dir = tmp_path / "media"
+    upload_dir = tmp_path / "uploads"
+    backup_dir.mkdir()
+    media_dir.mkdir()
+    upload_dir.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "pg_dump").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "pg_dump").chmod(0o755)
+
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "POSTGRES_HOST": "db",
+        "POSTGRES_USER": "classyfire",
+        "POSTGRES_DB": "classyfire",
+        "PGPASSWORD": "pw",
+        "BACKUP_DIR": str(backup_dir),
+        "MEDIA_DIR": str(media_dir),
+        "EXPORT_DIR": str(tmp_path / "exports"),
+        "SOURCE_ARTIFACT_DIR": str(tmp_path / "source_artifacts"),
+        "UPLOAD_DIR": str(upload_dir),
+    }
+    env[env_key] = env_value.format(backup_dir=backup_dir, upload_dir=upload_dir)
+    result = subprocess.run(
+        ["sh", "deploy/backup/backup.sh"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not list(backup_dir.glob("*.dump"))
 
 
 @pytest.mark.parametrize("value", ["", ".", "/"])
