@@ -119,6 +119,31 @@ services:
       db:
         condition: service_healthy
 
+  # ── Static files (one-shot) ──────────────────────────────────────────────
+  # collectstatic must run at RUNTIME into the static_files named volume: that
+  # volume shadows the image's /app/staticfiles, so static collected at build
+  # time never reaches runtime. Re-running on every `up` keeps the volume in
+  # sync with the image (CSS/JS/htmx + the ManifestStaticFilesStorage manifest),
+  # so a rebuild no longer needs a manual `docker compose run ... collectstatic`.
+  collectstatic:
+    build: .
+    restart: "no"
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.prod
+    command:
+      - python
+      - manage.py
+      - collectstatic
+      - "--noinput"
+    volumes:
+      - static_files:/app/staticfiles
+    networks:
+      - internal
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+
   # ── Web (Gunicorn) ────────────────────────────────────────────────────────
   web:
     build: .
@@ -160,6 +185,8 @@ services:
       db:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      collectstatic:
         condition: service_completed_successfully
     expose:
       - "8000"
