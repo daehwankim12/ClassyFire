@@ -5,9 +5,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}ClassyFire Batch Cache{% endblock %}</title>
-  <script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.12/dist/htmx.min.js"
-          integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2"
-          crossorigin="anonymous"></script>
+  <!-- htmx is self-hosted (served from 'self') so the app's strict CSP
+       (script-src 'self') allows it — loading it from a CDN was being blocked. -->
+  <script src="{% static 'htmx.min.js' %}"
+          integrity="sha384-ujb1lZYygJmzgSwoxRggbCHcjc0rB2XoQrxeTUQyRjrOnlCoYta87iKBWq3EsdM2"></script>
   <link rel="stylesheet" href="{% static 'app.css' %}">
 </head>
 <body>

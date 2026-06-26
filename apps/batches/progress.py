@@ -27,12 +27,17 @@ def _humanize_eta(seconds: float) -> str:
     return f"약 {hours}시간 {rem_min}분 남음 (예상)"
 
 
-def build_job_progress(job: BatchJob) -> dict[str, Any]:
+def build_job_progress(job: BatchJob, *, is_terminal: bool) -> dict[str, Any]:
     """Return the template context for the job progress bar.
 
     Segments: completed (classified), need-structure (terminal, awaits user),
     invalid (terminal), and pending (still processing). ``resolved`` is the sum
     of the three terminal segments; ``pending`` is whatever is left of the total.
+
+    ``is_terminal`` is the caller's authoritative "the job will not change
+    anymore" signal (``_is_terminal_job``). It — not a zero pending count —
+    drives the poll-stop flag and the "완료" ETA, so a freshly created job whose
+    items have not been counted yet (total 0, status PENDING) keeps polling.
     """
     total = job.total_count or 0
     completed = job.completed_count or 0
@@ -45,12 +50,12 @@ def build_job_progress(job: BatchJob) -> dict[str, Any]:
     def pct(value: int) -> float:
         return round(100.0 * value / total, 1) if total else 0.0
 
-    is_complete = pending == 0
-    if is_complete:
+    is_complete = is_terminal
+    if is_terminal:
         eta = "완료"
     else:
         eta = "처리 중…"
-        if resolved > 0 and job.created_at is not None:
+        if pending > 0 and resolved > 0 and job.created_at is not None:
             elapsed = (timezone.now() - job.created_at).total_seconds()
             if elapsed > 0:
                 rate = resolved / elapsed  # resolved items per second

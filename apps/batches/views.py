@@ -220,7 +220,7 @@ def job_detail_view(
             "search": search,
             "job_complete": job_complete,
             "blocking_pending_count": blocking_pending_count,
-            "progress": build_job_progress(job),
+            "progress": build_job_progress(job, is_terminal=job_complete),
             "remote_delayed_breakdown": remote_delayed_breakdown,
             "remote_delayed_count": remote_delayed_count,
             "remote_delayed_default_message": REMOTE_DELAYED_DEFAULT_MESSAGE,
@@ -338,6 +338,7 @@ def job_progress_partial_view(
         return HttpResponseForbidden("Invalid secret.")
 
     job.refresh_from_db()
+    job_complete = _is_terminal_job(job)
     response = render(
         request,
         "batches/progress.html",
@@ -345,7 +346,7 @@ def job_progress_partial_view(
             "job": job,
             "secret": secret,
             "secretless": secret is None,
-            "progress": build_job_progress(job),
+            "progress": build_job_progress(job, is_terminal=job_complete),
         },
     )
     # Polling endpoint: never let the browser serve a stale cached fragment.
