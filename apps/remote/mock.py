@@ -15,6 +15,7 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Any
 
+from apps.remote.contract import MAX_ALTERNATIVE_PARENTS
 from apps.remote.provider import (
     ChemOntSlot,
     EntityLookupResult,
@@ -178,15 +179,27 @@ class MockProvider:
 
 def _slot(raw: dict[str, Any], key: str) -> ChemOntSlot | None:
     node = raw.get(key)
-    if not node:
+    if not isinstance(node, dict):
         return None
-    return ChemOntSlot(chemont_id=node.get("chemont_id"), name=node.get("name"))
+    chemont_id = node.get("chemont_id")
+    name = node.get("name")
+    return ChemOntSlot(
+        chemont_id=chemont_id if isinstance(chemont_id, str) else None,
+        name=name if isinstance(name, str) else None,
+    )
 
 
 def _normalize_inchikey(raw_value: Any) -> str | None:
     if not isinstance(raw_value, str):
         return None
     return raw_value.replace("InChIKey=", "").strip() or None
+
+
+def _alternative_parents(raw_json: dict[str, Any]) -> list[dict[str, Any]]:
+    values = raw_json.get("alternative_parents")
+    if not isinstance(values, list):
+        return []
+    return [v for v in values[:MAX_ALTERNATIVE_PARENTS] if isinstance(v, dict)]
 
 
 def parse_wishart_payload(raw_json: dict[str, Any]) -> NormalizedClassification:
@@ -202,9 +215,11 @@ def parse_wishart_payload(raw_json: dict[str, Any]) -> NormalizedClassification:
         class_=_slot(raw_json, "class"),
         subclass=_slot(raw_json, "subclass"),
         direct_parent=_slot(raw_json, "direct_parent"),
-        classification_version=raw_json.get("classification_version"),
+        classification_version=raw_json.get("classification_version")
+        if isinstance(raw_json.get("classification_version"), str)
+        else None,
         raw_json=raw_json,
-        alternative_parents=list(raw_json.get("alternative_parents") or []),
+        alternative_parents=_alternative_parents(raw_json),
     )
 
 

@@ -389,3 +389,50 @@ def test_wishart_reuses_single_http_client():
     third = provider._client()
     assert third is not first
     provider.close()
+
+
+def test_wishart_poll_rejects_oversized_content_length(settings):
+    settings.WISHART_MAX_RESPONSE_BYTES = 32
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Length": "33"},
+            content=b'{"classification_status":"Done","entities":[]}',
+        )
+
+    provider = _wishart_with(handler)
+    result = provider.poll_query("q1")
+    assert result.status == PollStatus.PROTOCOL_ERROR
+    assert "exceeds 32 bytes" in (result.detail or "")
+    assert result.raw_json is None
+
+
+def test_wishart_poll_rejects_stream_past_byte_limit(settings):
+    settings.WISHART_MAX_RESPONSE_BYTES = 32
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"classification_status":"Done","entities":[]}',
+        )
+
+    provider = _wishart_with(handler)
+    result = provider.poll_query("q1")
+    assert result.status == PollStatus.PROTOCOL_ERROR
+    assert "exceeds 32 bytes" in (result.detail or "")
+    assert result.raw_json is None
+
+
+def test_wishart_contract_limits_alternative_parents():
+    from apps.remote.contract import MAX_ALTERNATIVE_PARENTS
+    raw = build_raw(IK_A)
+    raw["alternative_parents"] = [{}] * (MAX_ALTERNATIVE_PARENTS + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=raw)
+
+    provider = _wishart_with(handler)
+    result = provider.lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.PROTOCOL_ERROR
+    assert "alternative_parents exceeds" in (result.detail or "")
