@@ -236,19 +236,60 @@ docker compose exec web python manage.py createsuperuser
 
 ## 6. 시드 데이터셋 임포트 (선택)
 
-로컬 분류 캐시를 미리 채우면 원격 호출이 줄어듭니다. Windows에서는 `make`
-대신 컨테이너 안에서 직접 실행합니다. (`FULL` 은 ~4GB 다운로드.)
+로컬 분류 캐시를 미리 채우면 원격 호출이 줄어듭니다. 시드 파일(약 2GB의
+`*.tsv.zst` 본체와 ChemOnt 사전 `chemont_dictionary.tsv`)은 용량·라이선스
+때문에 **git에도 Docker 이미지에도 포함되지 않습니다.** 따라서 호스트에 따로
+내려받아 컨테이너로 **마운트**한 뒤, 컨테이너 안에서 임포트합니다.
 
+### 6-1. 시드 파일 배치 & 마운트
+1. Zenodo 레코드 `20472700` 에서 두 파일을 받아 리포지토리 루트의 `seed_cache/`
+   폴더에 둡니다(이 폴더는 `.gitignore` 대상):
+   - `classyfire_dedup_inchikey_smiles.enriched.tsv.zst` (시드 본체)
+   - `chemont_dictionary.tsv` (ChemOnt 온톨로지)
+2. `web` 컨테이너가 이 폴더를 보도록 **`docker-compose.override.yml`** 에
+   읽기전용 바인드 마운트를 추가합니다(파일이 없으면 새로 만들고, 이미 있으면
+   `services:` 아래에 합칩니다):
+   ```yaml
+   services:
+     web:
+       volumes:
+         - ./seed_cache:/app/seed_cache:ro
+   ```
+   `docker compose` 는 override 파일을 자동으로 합치므로 별도 플래그가 필요 없습니다.
+
+### 6-2. 임포트 절차 (순서 중요)
 ```bash
+# (1) ChemOnt 온톨로지 먼저 — 감사 단계의 FK 검사가 이 테이블을 참조함
+docker compose run --rm web python manage.py import_chemont \
+  /app/seed_cache/chemont_dictionary.tsv --replace
+
+# (2) (선택) Zenodo 메타데이터 행 생성 — 체크섬/DOI 기록용
 docker compose run --rm web python manage.py seed_download
-docker compose run --rm web python manage.py seed_verify
-docker compose run --rm web python manage.py seed_import --resume
+
+# (3) (선택) 로컬 파일 SHA-256 출력
+docker compose run --rm web python manage.py seed_verify \
+  /app/seed_cache/classyfire_dedup_inchikey_smiles.enriched.tsv.zst
+
+# (4) 본체 임포트 (~2GB, 수 분 소요) — FULL 은 버전 테이블에 적재
+docker compose run --rm web python manage.py seed_import \
+  --profile FULL \
+  --source /app/seed_cache/classyfire_dedup_inchikey_smiles.enriched.tsv.zst \
+  --resume
+
+# (5) 감사 — 행 수/중복/InChIKey 형식/ChemOnt FK 검증 → AUDIT_PASS
 docker compose run --rm web python manage.py seed_audit
+
+# (6) 활성화 — classyfire_seed_current 뷰를 검증된 테이블로 원자적 교체
 docker compose run --rm web python manage.py seed_activate
 ```
 
-- `seed_import --resume` 은 중단 후 재실행해도 중복 없이 이어집니다.
-- 프로필은 `.env` 의 `SEED_PROFILE`(`FULL`|`LITE`|`CUSTOM`). 처음엔 `LITE` 권장.
+- 경로는 모두 **컨테이너 내부 경로**(`/app/seed_cache/...`)입니다. 호스트 경로가 아닙니다.
+- `import_chemont`(위치 인자 `tsv_path`), `seed_verify`(위치 인자 `source`),
+  `seed_import`(`--source`)는 **파일 경로가 필수**입니다. 인자 없이 실행하면
+  `the following arguments are required` 오류가 납니다.
+- ChemOnt를 먼저 넣지 않으면 `seed_audit` 의 ChemOnt FK 검사가 깨져
+  `AUDIT_FAIL` 이 되고, 그러면 `seed_activate` 가 "No AUDIT_PASS rows" 로 멈춥니다.
+- `seed_import --resume` 는 중단 후 재실행해도 중복 없이 이어집니다.
 
 ---
 
