@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import email.utils
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -61,9 +62,24 @@ from apps.remote.provider import (
 
 # Response headers safe to persist verbatim (no auth/cookies/PII). Lower-cased.
 SAFE_RESPONSE_HEADERS = {"content-type", "retry-after", "x-request-id"}
+DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
 
 
-def _safe_headers(response: httpx.Response) -> dict[str, str]:
+class ResponseTooLargeError(ValueError):
+    """Provider response body exceeded the configured byte cap."""
+
+
+@dataclass(frozen=True)
+class _BufferedResponse:
+    status_code: int
+    headers: httpx.Headers
+    raw_text: str
+
+    def json(self) -> Any:
+        return json.loads(self.raw_text)
+
+
+def _safe_headers(response: httpx.Response | _BufferedResponse) -> dict[str, str]:
     """Filter response headers to the auditable allow-list (lower-cased keys)."""
     return {
         name.lower(): value
@@ -72,7 +88,7 @@ def _safe_headers(response: httpx.Response) -> dict[str, str]:
     }
 
 
-def _parse_retry_after(response: httpx.Response) -> float | None:
+def _parse_retry_after(response: httpx.Response | _BufferedResponse) -> float | None:
     """Parse a ``Retry-After`` header supporting BOTH forms (F-10).
 
     * delta-seconds: ``Retry-After: 120`` → ``120.0``.
@@ -119,6 +135,49 @@ class WishartDirectProvider:
             self._http_client = httpx.Client(timeout=self.timeout)
         return self._http_client
 
+    @property
+    def max_response_bytes(self) -> int:
+        return int(
+            getattr(
+                settings,
+                "WISHART_MAX_RESPONSE_BYTES",
+                DEFAULT_MAX_RESPONSE_BYTES,
+            )
+        )
+
+    def _request(
+        self, method: str, url: str, *, json_body: dict[str, Any] | None = None
+    ) -> _BufferedResponse:
+        """Fetch a response with a hard response-body byte limit before JSON decode."""
+        max_bytes = self.max_response_bytes
+        with self._client().stream(method, url, json=json_body) as resp:
+            content_length = resp.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    declared_length = None
+                if declared_length is not None and declared_length > max_bytes:
+                    raise ResponseTooLargeError(
+                        f"response body exceeds {max_bytes} bytes"
+                    )
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ResponseTooLargeError(
+                        f"response body exceeds {max_bytes} bytes"
+                    )
+                chunks.append(chunk)
+            body = b"".join(chunks)
+            raw_text = body.decode(resp.encoding or "utf-8", errors="replace")
+            return _BufferedResponse(
+                status_code=resp.status_code,
+                headers=resp.headers,
+                raw_text=raw_text,
+            )
+
     def close(self) -> None:
         if self._http_client is not None:
             self._http_client.close()
@@ -129,7 +188,13 @@ class WishartDirectProvider:
     def lookup_entity(self, inchikey: str) -> EntityLookupResult:
         url = f"{self.base_url}/entities/{inchikey}.json"
         try:
-            resp = self._client().get(url)
+            resp = self._request("GET", url)
+        except ResponseTooLargeError as exc:
+            return EntityLookupResult(
+                status=EntityLookupStatus.PROTOCOL_ERROR,
+                inchikey=inchikey,
+                detail=str(exc),
+            )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             return EntityLookupResult(
                 status=EntityLookupStatus.RETRYABLE_ERROR,
@@ -138,7 +203,7 @@ class WishartDirectProvider:
                 raw_text=f"{exc.__class__.__name__}: {exc}",
             )
         headers = _safe_headers(resp)
-        raw_text = resp.text
+        raw_text = resp.raw_text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.NOT_FOUND:
             # 404 is a GENUINE entity miss (key absent from the cache). Surface
@@ -238,7 +303,9 @@ class WishartDirectProvider:
         }
         url = f"{self.base_url}/queries"
         try:
-            resp = self._client().post(url, json=payload)
+            resp = self._request("POST", url, json_body=payload)
+        except ResponseTooLargeError as exc:
+            raise AmbiguousSubmissionError(str(exc)) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             # The POST may have reached (and been accepted by) the provider even
             # though the local response was lost. Surface it as AMBIGUOUS so the
@@ -248,7 +315,7 @@ class WishartDirectProvider:
                 str(exc), raw_text=f"{exc.__class__.__name__}: {exc}"
             ) from exc
         headers = _safe_headers(resp)
-        raw_text = resp.text
+        raw_text = resp.raw_text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.RETRYABLE:
             raise RetryableProviderError(
@@ -315,7 +382,12 @@ class WishartDirectProvider:
     def poll_query(self, remote_query_id: str) -> PollResult:
         url = f"{self.base_url}/queries/{remote_query_id}.json"
         try:
-            resp = self._client().get(url)
+            resp = self._request("GET", url)
+        except ResponseTooLargeError as exc:
+            return PollResult(
+                status=PollStatus.PROTOCOL_ERROR,
+                detail=str(exc),
+            )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             return PollResult(
                 status=PollStatus.RETRYABLE_ERROR,
@@ -323,7 +395,7 @@ class WishartDirectProvider:
                 raw_text=f"{exc.__class__.__name__}: {exc}",
             )
         headers = _safe_headers(resp)
-        raw_text = resp.text
+        raw_text = resp.raw_text
         outcome = classify_http_status(resp.status_code)
         if outcome is HttpOutcome.RETRYABLE:
             return PollResult(

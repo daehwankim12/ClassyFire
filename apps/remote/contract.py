@@ -23,6 +23,9 @@ class QueryPollContractStatus(StrEnum):
 
 _ENTITY_SLOT_KEYS = ("kingdom", "superclass", "class", "subclass", "direct_parent")
 _INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
+MAX_STRING_LENGTH = 4096
+MAX_ALTERNATIVE_PARENTS = 100
+MAX_QUERY_ENTITIES = 1000
 _COMPLETE_STATUSES = frozenset({"done", "complete", "completed"})
 MAX_REMOTE_QUERY_ID_LENGTH = 512
 
@@ -62,6 +65,13 @@ def _status_token(value: Any) -> str:
     return token
 
 
+def _validate_string(value: Any, context: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ProviderContractError(f"{context} must be a string or null")
+    if isinstance(value, str) and len(value) > MAX_STRING_LENGTH:
+        raise ProviderContractError(f"{context} exceeds {MAX_STRING_LENGTH} characters")
+
+
 def _validate_slot(raw: dict[str, Any], key: str) -> None:
     if key not in raw:
         return
@@ -71,9 +81,7 @@ def _validate_slot(raw: dict[str, Any], key: str) -> None:
     if not isinstance(value, dict):
         raise ProviderContractError(f"{key} must be an object or null")
     for field_name in ("chemont_id", "name"):
-        field_value = value.get(field_name)
-        if field_value is not None and not isinstance(field_value, str):
-            raise ProviderContractError(f"{key}.{field_name} must be a string or null")
+        _validate_string(value.get(field_name), f"{key}.{field_name}")
 
 
 def validate_entity_lookup_payload(payload: Any) -> dict[str, Any]:
@@ -83,12 +91,15 @@ def validate_entity_lookup_payload(payload: Any) -> dict[str, Any]:
         raise ProviderContractError("entity lookup response missing valid inchikey")
     for key in _ENTITY_SLOT_KEYS:
         _validate_slot(raw, key)
-    version = raw.get("classification_version")
-    if version is not None and not isinstance(version, str):
-        raise ProviderContractError("classification_version must be a string or null")
+    _validate_string(raw.get("inchikey"), "inchikey")
+    _validate_string(raw.get("classification_version"), "classification_version")
     alternative_parents = raw.get("alternative_parents")
     if alternative_parents is not None and not isinstance(alternative_parents, list):
         raise ProviderContractError("alternative_parents must be a list or null")
+    if isinstance(alternative_parents, list) and len(alternative_parents) > MAX_ALTERNATIVE_PARENTS:
+        raise ProviderContractError(
+            f"alternative_parents exceeds {MAX_ALTERNATIVE_PARENTS} entries"
+        )
     return raw
 
 
@@ -126,6 +137,8 @@ def validate_query_poll_payload(
     entities = raw.get("entities")
     if not isinstance(entities, list):
         raise ProviderContractError("complete query poll response requires entities list")
+    if len(entities) > MAX_QUERY_ENTITIES:
+        raise ProviderContractError(f"entities exceeds {MAX_QUERY_ENTITIES} entries")
     for index, entity in enumerate(entities):
         try:
             validate_entity_lookup_payload(entity)
