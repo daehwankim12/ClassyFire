@@ -24,6 +24,7 @@ def test_download_rejects_corrupt_export_file(tmp_path):
         # SHA-256 of b"[]" — correct signature for an empty job
         rows_signature="4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
         row_count=0,
+        job_state_signature="2ca20c6897ba9311712dc13b057ed5a77ec9c5ae650b0e9a12602d69bf992677",
         expires_at=timezone.now() + timedelta(days=1),
     )
     path.write_text("bad\n")

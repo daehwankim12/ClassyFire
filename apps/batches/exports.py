@@ -459,6 +459,33 @@ def _checksum_file(path: Path) -> str:
     return _artifact_storage().checksum(path)
 
 
+def _job_state_signature(job: BatchJob) -> str:
+    """Return a cheap signature of job-level state that affects export staleness."""
+    payload = {
+        "total_count": job.total_count,
+        "completed_count": job.completed_count,
+        "local_hit_count": job.local_hit_count,
+        "seed_hit_count": job.seed_hit_count,
+        "remote_pending_count": job.remote_pending_count,
+        "need_structure_count": job.need_structure_count,
+        "invalid_count": job.invalid_count,
+        "status": job.status,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _artifact_matches_current_job_state(artifact: ExportArtifact) -> bool:
+    """Return True when an artifact's cheap job-state snapshot is current."""
+    job = BatchJob.objects.filter(pk=artifact.job_id).first()
+    if job is None:
+        return False
+    return (
+        artifact.row_count == job.total_count
+        and artifact.job_state_signature == _job_state_signature(job)
+    )
+
 def _artifact_file_checksum_matches(path: Path, artifact: ExportArtifact) -> bool:
     """Return True iff the on-disk file's SHA-256 matches the stored artifact checksum."""
     return _checksum_file(path) == artifact.checksum
@@ -485,6 +512,7 @@ def _load_meta(token: str) -> dict[str, str] | None:
             "checksum": artifact.checksum,
             "byte_size": str(artifact.byte_size),
             "row_count": str(artifact.row_count),
+            "job_state_signature": artifact.job_state_signature,
         }
 
     # Fallback: legacy JSON sidecar (for tests that write it directly)
@@ -533,26 +561,6 @@ def _find_existing_artifact(job_id: str, fmt: str, rows_signature: str) -> Expor
     if not _artifact_storage().exists(Path(artifact.path)):
         return None
     return artifact
-
-
-def _matches_current_rows_signature(meta: dict[str, str]) -> bool:
-    """Return True when metadata still matches the current job export rows.
-
-    This is used by get_export_path to verify the file corresponds to the
-    current state of the job (guards against stale tokens after job updates).
-    """
-    expected_signature = meta.get("rows_signature")
-    job_id = meta.get("job_id")
-    if not expected_signature or not job_id:
-        return False
-
-    job = BatchJob.objects.filter(pk=job_id).first()
-    if job is None:
-        return False
-
-    # Compute signature via a fresh streaming pass (memory-bounded)
-    current_sig = _compute_rows_signature(job)
-    return current_sig == expected_signature
 
 
 def _compute_rows_signature(job: BatchJob) -> str:
@@ -606,6 +614,7 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
         byte_size=byte_size,
         rows_signature=rows_signature,
         row_count=row_count,
+        job_state_signature=_job_state_signature(job),
         expires_at=expires_at,
     )
 
@@ -616,6 +625,7 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
         "fmt": fmt,
         "expires_at": expires_at_iso,
         "rows_signature": rows_signature,
+        "job_state_signature": _job_state_signature(job),
     }
     meta_bytes = json.dumps(meta_dict).encode("utf-8")
     storage = _artifact_storage()
@@ -654,41 +664,28 @@ def get_export_path(token: str) -> Path | None:
         path = Path(artifact.path)
         if not storage.exists(path):
             return None
-        job = BatchJob.objects.filter(pk=artifact.job_id).first()
-        if job is None:
+        if not _artifact_matches_current_job_state(artifact):
             return None
-        # Cheap proxy guard: a job whose row count is unchanged from when the
-        # artifact was created is overwhelmingly the common case.  Only fall
-        # back to the full streaming re-signature (one BatchItem scan) when the
-        # cheap count differs — which is the only way row CONTENT can change
-        # without changing the count, so we must still verify in that branch.
-        current_count = BatchItem.objects.filter(job=job).count()
-        if current_count == artifact.row_count:
-            # Counts match: verify content signature (rows can mutate in place,
-            # e.g. an item resolving, without changing the count).
-            current_sig = _compute_rows_signature(job)
-            if current_sig != artifact.rows_signature:
-                return None
-            if not _artifact_file_checksum_matches(path, artifact):
-                SystemEvent.objects.create(
-                    category="SECURITY",
-                    event_type="export_checksum_mismatch",
-                    payload={
-                        "artifact_id": artifact.pk,
-                        "token_prefix": artifact.token[:8],
-                        "path": str(path),
-                    },
-                )
-                return None
-            return path
-        # Count changed → definitely stale.
-        return None
+        if not _artifact_file_checksum_matches(path, artifact):
+            SystemEvent.objects.create(
+                category="SECURITY",
+                event_type="export_checksum_mismatch",
+                payload={
+                    "artifact_id": artifact.pk,
+                    "token_prefix": artifact.token[:8],
+                    "path": str(path),
+                },
+            )
+            return None
+        return path
 
     # Fallback: legacy sidecar path (for tests that write .meta.json directly)
     meta = _load_meta(token)
     if meta is None or not _is_valid_meta(meta):
         return None
-    if not _matches_current_rows_signature(meta):
+    # Legacy sidecar-only artifacts do not carry a trusted DB job-state snapshot;
+    # fail closed instead of recomputing the full row signature on download.
+    if "job_state_signature" not in meta:
         return None
     fmt = meta.get("fmt", "")
     path = storage.local_path(token, fmt)

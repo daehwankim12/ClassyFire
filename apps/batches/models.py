@@ -305,6 +305,10 @@ class ExportArtifact(models.Model):
     row_count = models.IntegerField(
         help_text="Number of data rows (excluding header/comment lines).",
     )
+    job_state_signature = models.CharField(
+        max_length=64,
+        help_text="SHA-256 hex of cheap job-level state used to invalidate stale exports.",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(
         help_text="After this timestamp the artifact is expired and may be pruned.",
@@ -324,6 +328,10 @@ class ExportArtifact(models.Model):
             models.CheckConstraint(
                 name="export_artifact_byte_size_nonneg",
                 condition=Q(byte_size__gte=0),
+            ),
+            models.CheckConstraint(
+                name="export_artifact_job_state_sig_hex64",
+                condition=Q(job_state_signature__regex=r"^[0-9a-f]{64}$"),
             ),
         ]
         indexes = [

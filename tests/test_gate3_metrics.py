@@ -71,6 +71,7 @@ def test_metrics_snapshot_reports_queue_lag_provider_and_artifacts(tmp_path, set
         byte_size=123,
         rows_signature="2" * 64,
         row_count=5,
+        job_state_signature="3" * 64,
         expires_at=now + timedelta(days=1),
     )
 

@@ -63,6 +63,7 @@ def _make_export_artifact(export_dir: Path, token: str, fmt: str, expires_delta:
         byte_size=14,
         rows_signature="b" * 64,  # 64-char hex to satisfy check constraint
         row_count=1,
+        job_state_signature="c" * 64,
         expires_at=expires_at,
     )
     return file_path
