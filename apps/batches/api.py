@@ -61,7 +61,11 @@ from apps.batches.services import (
     submit_structure_for_item,
 )
 from apps.batches.storage import get_artifact_storage
-from apps.core.enums import BatchItemStatus
+from apps.core.enums import (
+    CLAIMABLE_PROCESSING_STATES,
+    BatchItemStatus,
+    BatchProcessingState,
+)
 from apps.core.security import (
     UploadTooLargeError,
     check_upload_size,
@@ -248,6 +252,15 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
         next_action = "wait_for_remote_capacity"
     elif need_structure:
         next_action = "submit_missing_structures"
+    elif job.processing_state in CLAIMABLE_PROCESSING_STATES:
+        # Deferred work can be claimable before any BatchItem rows exist (e.g. a
+        # freshly spooled upload, or a REMOTE_PENDING job whose delayed rows were
+        # already drained). Report the accurate next step instead of "none".
+        # REMOTE_PENDING is waiting on remote capacity, not the ingest worker.
+        if job.processing_state == BatchProcessingState.REMOTE_PENDING:
+            next_action = "wait_for_remote_capacity"
+        else:
+            next_action = "wait_for_ingest_worker"
     else:
         next_action = "none"
 

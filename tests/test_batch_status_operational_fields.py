@@ -13,6 +13,7 @@ the real namespaced name used here is "batches:job_status".
 from __future__ import annotations
 
 import pytest
+from django.contrib.auth.hashers import make_password
 from django.urls import reverse
 
 from apps.batches.models import BatchItem, BatchJob
@@ -99,6 +100,11 @@ def test_status_api_no_action_needed(client):
     # Leave items in whatever state create_job_records put them in — they will
     # not be in any of the three action-state categories.
     BatchItem.objects.filter(job=job).update(status=BatchItemStatus.INVALID_INPUT)
+    # Move the job to a terminal processing_state so it is no longer claimable;
+    # only then is "none" the correct next_action.
+    BatchJob.objects.filter(pk=job.pk).update(
+        processing_state=BatchProcessingState.COMPLETE
+    )
 
     url = reverse("batches:job_status", kwargs={"job_id": job.pk})
     response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
@@ -108,6 +114,47 @@ def test_status_api_no_action_needed(client):
     assert payload["remote_delayed_count"] == 0
     assert payload["need_structure_count"] == 0
     assert payload["next_action"] == "none"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_uploading_job_without_items_waits_for_ingest_worker(client):
+    """Fresh deferred uploads have no items yet but still need worker ingest."""
+    plaintext_secret = "upload-secret"
+    job = BatchJob.objects.create(
+        secret_hash=make_password(plaintext_secret),
+        processing_state=BatchProcessingState.UPLOADING,
+        upload_artifact_path="uploads/pending.csv",
+    )
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["processing_state"] == BatchProcessingState.UPLOADING
+    assert payload["normalization_pending_count"] == 0
+    assert payload["remote_delayed_count"] == 0
+    assert payload["need_structure_count"] == 0
+    assert payload["next_action"] == "wait_for_ingest_worker"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_remote_pending_job_without_items_waits_for_remote_capacity(client):
+    """A claimable REMOTE_PENDING job with no live items waits on remote capacity."""
+    plaintext_secret = "remote-secret"
+    job = BatchJob.objects.create(
+        secret_hash=make_password(plaintext_secret),
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+    )
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["processing_state"] == BatchProcessingState.REMOTE_PENDING
+    assert payload["normalization_pending_count"] == 0
+    assert payload["remote_delayed_count"] == 0
+    assert payload["need_structure_count"] == 0
+    assert payload["next_action"] == "wait_for_remote_capacity"
 
 
 @pytest.mark.django_db(transaction=True)
