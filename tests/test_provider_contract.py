@@ -57,6 +57,32 @@ def test_entity_lookup_success_rejects_malformed_consumed_slot():
     assert "kingdom" in result.detail
 
 
+def test_entity_lookup_success_rejects_malformed_inchikey_format():
+    raw = build_raw(IK_A)
+    raw["inchikey"] = "InChIKey=rdhqfkqigngied-mrvpvssysa-n"
+
+    result = _wishart_with_json(200, raw).lookup_entity(IK_A)
+
+    assert result.status == EntityLookupStatus.PROTOCOL_ERROR
+    assert result.status != EntityLookupStatus.FOUND
+    assert result.raw_json == raw
+    assert result.detail is not None
+    assert "inchikey" in result.detail
+
+
+def test_query_poll_complete_rejects_malformed_entity_inchikey_format():
+    raw = {"classification_status": "Done", "entities": [build_raw(IK_A)]}
+    raw["entities"][0]["inchikey"] = "InChIKey=RDHQFKQIGNGIED-MRVPVSSYSA-1"
+
+    result = _wishart_with_json(200, raw).poll_query("q-bad-entity-key")
+
+    assert result.status == PollStatus.PROTOCOL_ERROR
+    assert result.status != PollStatus.COMPLETE
+    assert result.raw_json == raw
+    assert result.detail is not None
+    assert "inchikey" in result.detail
+
+
 def test_query_submit_success_requires_scalar_query_id():
     # A 2xx means the provider ACCEPTED the POST (a query was likely created);
     # a broken query-id schema is AMBIGUOUS ACCEPTANCE, not a clean failure, so

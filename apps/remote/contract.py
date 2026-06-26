@@ -5,6 +5,7 @@ original payload objects intact so callers can persist raw provider responses.
 """
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any
 
@@ -21,6 +22,7 @@ class QueryPollContractStatus(StrEnum):
 
 
 _ENTITY_SLOT_KEYS = ("kingdom", "superclass", "class", "subclass", "direct_parent")
+_INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
 _COMPLETE_STATUSES = frozenset({"done", "complete", "completed"})
 _RUNNING_STATUSES = frozenset(
     {
@@ -44,7 +46,9 @@ def _normalized_inchikey(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.replace("InChIKey=", "").strip()
-    return normalized or None
+    if not normalized or _INCHIKEY_RE.fullmatch(normalized) is None:
+        return None
+    return normalized
 
 
 def _status_token(value: Any) -> str:
