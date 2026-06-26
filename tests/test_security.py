@@ -15,11 +15,13 @@ from __future__ import annotations
 import importlib
 import io
 import json
+import logging
 import os
 import sys
 import types
 import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import yaml
@@ -34,6 +36,7 @@ from apps.core.security import (
     DecompressionBombError,
     RowTooLongError,
     SdfPropertyTooLargeError,
+    SecretRedactionFilter,
     UploadTooLargeError,
     check_decompression_ratio,
     check_sdf_property_length,
@@ -41,6 +44,32 @@ from apps.core.security import (
     check_upload_size,
     redact_for_log,
 )
+
+
+def test_secret_redaction_filter_redacts_claim_and_legacy_paths():
+    """Claim-path and legacy job-path secrets are redacted, not just query secrets."""
+    secret = "sentinel-invalid-claim-secret"
+    job_id = "00000000-0000-0000-0000-000000000000"
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.addFilter(SecretRedactionFilter())
+    logger = logging.getLogger("test.secret.redaction")
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+    try:
+        logger.warning("Forbidden: /jobs/%s/claim/%s/", job_id, secret)
+        logger.warning("Forbidden: /api/jobs/%s?secret=%s", job_id, secret)
+        logger.warning("Forbidden: /jobs/%s/items/%s/", job_id, secret)
+        logger.warning("Forbidden: /jobs/%s/structure/%s/", job_id, secret)
+    finally:
+        logger.removeHandler(handler)
+
+    output = stream.getvalue()
+    assert secret not in output
+    assert quote(secret) not in output
+    assert "[REDACTED]" in output
 
 ASPIRIN_SMILES = "CC(=O)Oc1ccccc1C(=O)O"
 GHOST_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"

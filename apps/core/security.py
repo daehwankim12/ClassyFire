@@ -992,6 +992,11 @@ class SecretRedactionFilter(logging.Filter):
     - ``?secret=<value>`` / ``&secret=<value>`` query parameters with
       ``?secret=[REDACTED]`` / ``&secret=[REDACTED]``.
     - ``/api/exports/<token>`` path segments with ``/api/exports/[REDACTED]``.
+    - ``/jobs/<uuid>/claim/<secret>`` capability secrets carried IN the PATH
+      (Django's "Forbidden: <path>" request-log lines expose these on a 403).
+    - legacy ``/jobs/<uuid>/(items|structure|result[s])/<secret>`` path secrets.
+    - ``/api/jobs/<uuid>/...?secret=<value>`` (covered by the query rule too, but
+      matched explicitly for defence in depth).
 
     Attach to any handler that writes Django request/access log lines to
     prevent plaintext secrets reaching log storage.
@@ -999,11 +1004,21 @@ class SecretRedactionFilter(logging.Filter):
 
     QUERY_SECRET_RE = re.compile(r"([?&]secret=)[^&\s]+")
     EXPORT_PATH_RE = re.compile(r"(/api/exports/)[^/?\s]+")
+    CLAIM_PATH_RE = re.compile(r"(/jobs/[0-9a-fA-F-]{36}/claim/)[^/?\s]+")
+    LEGACY_JOB_PATH_RE = re.compile(
+        r"(/jobs/[0-9a-fA-F-]{36}/(?:items|structure|results?)/)[^/?\s]+"
+    )
+    API_JOB_SECRET_RE = re.compile(
+        r"(/api/jobs/[0-9a-fA-F-]{36}/[^?\s]*[?&]secret=)[^&\s]+"
+    )
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
         message = self.QUERY_SECRET_RE.sub(r"\1[REDACTED]", message)
         message = self.EXPORT_PATH_RE.sub(r"\1[REDACTED]", message)
+        message = self.CLAIM_PATH_RE.sub(r"\1[REDACTED]", message)
+        message = self.LEGACY_JOB_PATH_RE.sub(r"\1[REDACTED]", message)
+        message = self.API_JOB_SECRET_RE.sub(r"\1[REDACTED]", message)
         record.msg = message
         record.args = ()
         return True

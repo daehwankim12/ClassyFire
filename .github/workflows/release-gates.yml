@@ -53,20 +53,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra dev
+      - name: Write a complete .env with a hash derived from the sentinel plaintext
+        run: |
+          HASH="$(uv run python -c '
+          from django.conf import settings
+          settings.configure(PASSWORD_HASHERS=["django.contrib.auth.hashers.PBKDF2PasswordHasher"])
+          from django.contrib.auth.hashers import make_password
+          print(make_password("sentinel-release-gate-secret"))
+          ')"
+          cat > .env <<EOF
+          POSTGRES_DB=classyfire
+          POSTGRES_USER=classyfire
+          POSTGRES_PASSWORD=classyfire
+          DJANGO_SECRET_KEY=sentinel-django-secret
+          WISHART_BASE_URL=http://mock-provider.invalid
+          REMOTE_ENABLED=false
+          SHARED_ACCESS_PASSWORD_HASH=${HASH}
+          NGROK_AUTHTOKEN=
+          NGROK_DOMAIN=localhost
+          EOF
+      - run: docker compose config >/tmp/classyfire-compose.yml
       - run: docker compose up -d --build db migrate web worker ingest-worker proxy
-        env:
-          DJANGO_SECRET_KEY: sentinel-django-secret
-          POSTGRES_PASSWORD: classyfire
-          SHARED_ACCESS_PASSWORD_HASH: pbkdf2_sha256$1000000$sentinel$HcS2C1kMIEVvE6bXKqJtV3J3W1Id0s9UiB57QjXaXoY=
-          NGROK_DOMAIN: localhost
-      - run: CLASSYFIRE_BASE_URL=http://127.0.0.1 CLASSYFIRE_SENTINEL_SECRET=sentinel-release-gate-secret bash scripts/exercise_secret_routes.sh
+      - run: CLASSYFIRE_BASE_URL=http://127.0.0.1 CLASSYFIRE_SECRET_OUTPUT=/tmp/classyfire-generated-secrets.txt CLASSYFIRE_SENTINEL_SECRET=sentinel-release-gate-secret bash scripts/exercise_secret_routes.sh
       - run: |
           docker compose logs > compose.log
-          docker compose logs ngrok-agent >> compose.log || true
-          find . -path '*caddy*log*' -type f -print -exec cat {} \; >> compose.log || true
-      - run: bash scripts/check_proxy_logs_for_secrets.sh compose.log sentinel-job-secret sentinel-upload-filename sentinel-django-secret "$CLASSYFIRE_SENTINEL_SECRET"
-        env:
-          CLASSYFIRE_SENTINEL_SECRET: sentinel-release-gate-secret
+          docker compose logs proxy >> compose.log
+          docker compose logs web >> compose.log
+          if docker compose ps --services --status running | grep -Fx ngrok-agent >/dev/null; then
+            docker compose logs ngrok-agent >> compose.log
+          fi
+          test -s compose.log
+      - run: bash scripts/check_proxy_logs_for_secrets.sh --secret-file /tmp/classyfire-generated-secrets.txt compose.log sentinel-django-secret sentinel-release-gate-secret
       - if: always()
         run: docker compose down -v
 
