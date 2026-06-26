@@ -6,7 +6,7 @@ Covers:
 - CSRF policy: csrf_exempt endpoints require auth token (MEDIUM finding)
 - Result URL secret validation: wrong/missing -> 403; correct -> 200
 - prod settings: HSTS, secure cookies, SECURE_PROXY_SSL_HEADER
-- Docker Compose port exposure: only proxy publishes host ports
+- Docker Compose port exposure: no services publish host ports
 - Upload safety: size limit, row length, decompression ratio, SDF property
 - Secret redaction: logging helper never leaks secrets or structures
 """
@@ -873,13 +873,10 @@ class TestDockerComposePortExposure:
         backup = data["services"]["backup"]
         assert "ports" not in backup, "backup service must not publish host ports"
 
-    def test_proxy_publishes_80_and_443(self) -> None:
+    def test_proxy_has_no_host_ports(self) -> None:
         data = self._load_compose()
         proxy = data["services"]["proxy"]
-        ports = proxy.get("ports", [])
-        port_strings = [str(p) for p in ports]
-        assert any("80" in p for p in port_strings), "proxy should publish port 80"
-        assert any("443" in p for p in port_strings), "proxy should publish port 443"
+        assert "ports" not in proxy, "proxy must not publish host ports"
 
     def test_web_gunicorn_access_log_disabled_but_error_log_kept(self) -> None:
         data = self._load_compose()

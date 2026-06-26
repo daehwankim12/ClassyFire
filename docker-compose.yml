@@ -4,7 +4,7 @@
 # Network topology
 # ─────────────────
 #   internal  : db, backup              (no internet access)
-#   external  : proxy, ngrok-agent      (may publish 80/443 to host)
+#   external  : proxy, ngrok-agent      (outbound/ngrok-facing only)
 #   web and worker are on BOTH networks so they can reach db (internal)
 #   and also make outbound internet requests (external).
 #   proxy and ngrok-agent are also on `internal` so they can reach `web`.
@@ -12,7 +12,7 @@
 # Port policy
 # ───────────
 #   db, web, worker, backup → NO host-published ports
-#   proxy                   → publishes 80 and 443 to the host
+#   proxy                   → NO host-published ports; ngrok reaches proxy internally
 #   ngrok-agent             → connects outbound to ngrok cloud (no inbound port)
 #
 # Usage
@@ -289,9 +289,10 @@ services:
       - external
     depends_on:
       - web
-    ports:
-      - "80:80"
-      - "443:443"
+    # NO ports: ngrok reaches Caddy over the internal Docker network (proxy:80).
+    # Publishing this HTTP listener to the host would let direct cleartext
+    # requests bypass Django's SECURE_SSL_REDIRECT because Caddy must mark
+    # ngrok-forwarded requests as HTTPS.
 
   # ── ngrok agent ───────────────────────────────────────────────────────────
   ngrok-agent:

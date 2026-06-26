@@ -47,7 +47,7 @@ This starts seven services:
 | `web` | Gunicorn (internal only, accessed via proxy) |
 | `worker` | Classification worker (`python manage.py runworker`) |
 | `backup` | Daily backup cron |
-| `proxy` | Caddy reverse proxy (publishes ports 80 and 443) |
+| `proxy` | Caddy reverse proxy (internal-only; reached by ngrok over Docker network) |
 | `ngrok-agent` | Optional ngrok tunnel (requires NGROK_AUTHTOKEN) |
 
 `web` and `worker` wait for the one-shot `migrate` service before starting.

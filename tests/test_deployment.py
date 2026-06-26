@@ -141,7 +141,7 @@ def test_backup_volume_mounted():
 
 def test_no_host_ports():
     compose = load_compose()
-    for svc_name in ["db", "web", "worker", "backup"]:
+    for svc_name in ["db", "web", "worker", "backup", "proxy"]:
         svc = compose["services"].get(svc_name, {})
         assert not svc.get("ports"), f"{svc_name} should not publish host ports"
 
