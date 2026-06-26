@@ -103,13 +103,17 @@ def test_dockerfile_creates_runtime_writable_directories():
 
 
 def test_ngrok_agent_config_uses_v3_https_endpoint_to_proxy_http():
-    config = yaml.safe_load(read_file("deploy/ngrok/ngrok.yml.template"))
+    compose = load_compose()
+    ngrok_agent = compose["services"]["ngrok-agent"]
 
-    assert "tunnels" not in config
-    assert config["version"] == "3"
-    assert config["agent"]["authtoken"] == "${NGROK_AUTHTOKEN}"
-    assert config["endpoints"][0]["url"] == "https://${NGROK_DOMAIN}"
-    assert config["endpoints"][0]["upstream"]["url"] == "http://proxy:80"
+    assert ngrok_agent["environment"]["NGROK_AUTHTOKEN"] == "${NGROK_AUTHTOKEN}"
+    assert ngrok_agent["command"] == [
+        "http",
+        "proxy:80",
+        "--url=https://${NGROK_DOMAIN}",
+        "--log=stdout",
+        "--log-format=json",
+    ]
 
 
 def test_db_no_external_network():
