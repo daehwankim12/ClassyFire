@@ -338,7 +338,7 @@ def job_progress_partial_view(
         return HttpResponseForbidden("Invalid secret.")
 
     job.refresh_from_db()
-    return render(
+    response = render(
         request,
         "batches/progress.html",
         {
@@ -348,6 +348,9 @@ def job_progress_partial_view(
             "progress": build_job_progress(job),
         },
     )
+    # Polling endpoint: never let the browser serve a stale cached fragment.
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 def _filter_items(job: BatchJob, status_filter: str, search: str) -> QuerySet:

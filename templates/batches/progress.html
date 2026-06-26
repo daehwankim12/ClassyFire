@@ -1,7 +1,6 @@
 <div id="job-progress" class="job-progress"
-     {% if secretless %}hx-get="/jobs/{{ job.id }}/progress"{% else %}hx-get="/jobs/{{ job.id }}/{{ secret }}/progress"{% endif %}
-     hx-swap="outerHTML"
-     {% if not progress.is_complete %}hx-trigger="every 5s"{% endif %}>
+     data-progress-url="{% if secretless %}/jobs/{{ job.id }}/progress{% else %}/jobs/{{ job.id }}/{{ secret }}/progress{% endif %}"
+     data-complete="{{ progress.is_complete|yesno:'true,false' }}">
   <div class="job-progress__head">
     <strong class="job-progress__count">{{ progress.resolved }} / {{ progress.total }}</strong>
     <span class="job-progress__pct">{{ progress.resolved_pct }}%</span>
