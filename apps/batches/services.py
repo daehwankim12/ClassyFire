@@ -395,7 +395,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                     item.save(update_fields=["status", "message"])
                 except RemoteQueueBackpressure:
                     item.status = BatchItemStatus.REMOTE_DELAYED
-                    item.message = "Remote queue is at capacity; retrying later."
+                    item.message = _REMOTE_QUEUE_BACKPRESSURE_MESSAGE
                     item.save(update_fields=["status", "message"])
             else:
                 item.status = BatchItemStatus.REMOTE_DELAYED
@@ -554,7 +554,7 @@ def _process_item(
             item.message = "Remote budget exceeded for this principal."
             return BatchItemStatus.REMOTE_DELAYED
         except RemoteQueueBackpressure:
-            item.message = "Remote queue is at capacity; retrying later."
+            item.message = _REMOTE_QUEUE_BACKPRESSURE_MESSAGE
             return BatchItemStatus.REMOTE_DELAYED
         return BatchItemStatus.PENDING_CLASSIFICATION
 
@@ -867,6 +867,70 @@ def _commit_prepared_chunk(
         )
 
 
+_REMOTE_QUEUE_BACKPRESSURE_MESSAGE = "Remote queue is at capacity; retrying later."
+
+
+def _retry_backpressured_remote_delayed_items(
+    claim: IngestJobClaim,
+    *,
+    remote_enabled: bool,
+    remote_principal: str = "system",
+) -> None:
+    """Retry durable enqueue for items delayed only by remote queue capacity.
+
+    Backpressure happens before a RemoteTask can be inserted, so the BatchItem is
+    the durable retry record.  Once a REMOTE_PENDING job is reclaimed by the
+    ingest worker, retry only rows carrying the capacity message; budget-denied,
+    remote-disabled, and other REMOTE_DELAYED rows remain user/action-gated.
+    """
+    if not remote_enabled:
+        return
+
+    with transaction.atomic():
+        locked_job = _lock_owned_job(claim)
+        items = list(
+            BatchItem.objects.select_for_update()
+            .filter(
+                job=locked_job,
+                status=BatchItemStatus.REMOTE_DELAYED,
+                message=_REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+                inchikey__isnull=False,
+            )
+            .order_by("row_order")
+        )
+        for item in items:
+            result = lookup_current_classification(item.inchikey)
+            if result is not None:
+                item.classification_snapshot = classification_lookup_snapshot(result)
+                _pin_resolved_classification(item, item.classification_snapshot)
+                item.status = (
+                    BatchItemStatus.FOUND_LIVE_CACHE
+                    if result.tier == LookupTier.LIVE
+                    else BatchItemStatus.FOUND_SEED_CACHE
+                )
+                item.message = None
+                item.save(update_fields=_ITEM_UPDATE_FIELDS)
+                continue
+
+            try:
+                _get_or_create_remote_task(
+                    item.inchikey,
+                    item.compound,
+                    principal=remote_principal,
+                )
+            except RemoteBudgetExceededError:
+                item.message = "Remote budget exceeded for this principal."
+                item.save(update_fields=["message"])
+            except RemoteQueueBackpressure:
+                # Capacity is still exhausted. Leave the item as the durable
+                # retry record for a later ingest-worker pass.
+                continue
+            else:
+                item.status = BatchItemStatus.PENDING_CLASSIFICATION
+                item.message = None
+                item.save(update_fields=["status", "message"])
+
+
 class IngestLeaseLost(Exception):  # noqa: N818 - mirrors remote LeaseLost contract
     """Raised when a fenced ingest write hits 0 rows.
 
@@ -1099,6 +1163,11 @@ def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> 
             checkpoint_row_order=chunk[-1].row_order,
         )
 
+    _retry_backpressured_remote_delayed_items(
+        claim,
+        remote_enabled=job.remote_enabled,
+        remote_principal=job.remote_principal,
+    )
     recompute_job_counters(job.pk)
     # Refresh in-memory
     job.refresh_from_db()

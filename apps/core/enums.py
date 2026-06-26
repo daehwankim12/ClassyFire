@@ -132,9 +132,17 @@ class BatchProcessingState(models.TextChoices):
         durable worker should claim. PARSING is included so a job whose items
         were persisted in-request (PENDING_NORMALIZATION) but not yet normalized
         is picked up; NORMALIZING/LOCAL_LOOKUP cover a worker that crashed
-        mid-run and must resume from its checkpoint.
+        mid-run and must resume from its checkpoint. REMOTE_PENDING is included
+        so REMOTE_DELAYED rows parked by transient queue backpressure can retry
+        enqueueing once capacity is available.
         """
-        return (cls.UPLOADING, cls.PARSING, cls.NORMALIZING, cls.LOCAL_LOOKUP)
+        return (
+            cls.UPLOADING,
+            cls.PARSING,
+            cls.NORMALIZING,
+            cls.LOCAL_LOOKUP,
+            cls.REMOTE_PENDING,
+        )
 
 
 # Raw string values of the processing states the ingest worker may claim, handy

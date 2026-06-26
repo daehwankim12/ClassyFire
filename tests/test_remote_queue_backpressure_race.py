@@ -49,3 +49,36 @@ def test_global_queue_depth_is_race_safe(settings):
     assert sum(1 for status, _ in results if status == "created") == 3
     assert sum(1 for status, _ in results if status == "blocked") == 3
     assert RemoteTask.objects.filter(state__in=[TaskState.READY]).count() == 3
+
+
+@pytest.mark.django_db(transaction=True)
+def test_backpressured_batch_item_is_retried_by_ingest_worker(settings):
+    from apps.batches.ingest import parse_text_input
+    from apps.batches.models import BatchItem
+    from apps.batches.services import create_job, run_pending_jobs
+    from apps.core.enums import BatchItemStatus, BatchProcessingState
+
+    settings.REMOTE_MAX_QUEUE_DEPTH = 1
+    blocker = RemoteTask.objects.create(inchikey=KEYS[0], state=TaskState.READY)
+
+    job, _secret = create_job(
+        parse_text_input("C1CCCCC1"),
+        remote_enabled=True,
+        remote_principal="principal-a",
+    )
+    item = BatchItem.objects.get(job=job)
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.message == "Remote queue is at capacity; retrying later."
+    assert job.processing_state == BatchProcessingState.REMOTE_PENDING
+    assert RemoteTask.objects.filter(inchikey=item.inchikey).count() == 0
+
+    blocker.state = TaskState.DONE
+    blocker.save(update_fields=["state"])
+
+    assert run_pending_jobs("worker-1", max_jobs=1) == 1
+    item.refresh_from_db()
+    job.refresh_from_db()
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert item.message is None
+    assert job.processing_state == BatchProcessingState.REMOTE_PENDING
+    assert RemoteTask.objects.filter(inchikey=item.inchikey, state=TaskState.READY).count() == 1
