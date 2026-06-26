@@ -432,12 +432,13 @@ def restore_round_trip():
             SRC_DB,
             "INSERT INTO export_artifacts "
             "(job_id, fmt, token, path, checksum, byte_size, "
-            " rows_signature, row_count, created_at, expires_at) "
+            " rows_signature, job_state_signature, row_count, created_at, expires_at) "
             "SELECT "
             "  id, 'csv', 'test-export-token-abc123', '/tmp/export_test.csv', "
             "  'c2d3e4f5a6b7c2d3e4f5a6b7c2d3e4f5a6b7c2d3e4f5a6b7c2d3e4f5a6b7c2d3', "
             "  512, "
             "  'd3e4f5a6b7c8d3e4f5a6b7c8d3e4f5a6b7c8d3e4f5a6b7c8d3e4f5a6b7c8d3e4', "
+            "  'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2', "
             "  1, NOW(), NOW() + INTERVAL '1 day' "
             "FROM batch_jobs ORDER BY created_at DESC LIMIT 1;",
         )
