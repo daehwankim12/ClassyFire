@@ -685,8 +685,11 @@ def get_export_path(token: str) -> Path | None:
     if meta is None or not _is_valid_meta(meta):
         return None
     # Legacy sidecar-only artifacts do not carry a trusted DB job-state snapshot;
-    # fail closed instead of recomputing the full row signature on download.
-    if "job_state_signature" not in meta:
+    # fail closed instead of recomputing the full row signature on download. Both
+    # the job-state snapshot AND the rows_signature must be present — without the
+    # rows_signature the artifact's integrity cannot be vouched for, so a sidecar
+    # missing either field is not served.
+    if "job_state_signature" not in meta or "rows_signature" not in meta:
         return None
     fmt = meta.get("fmt", "")
     path = storage.local_path(token, fmt)
