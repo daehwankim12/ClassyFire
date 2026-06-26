@@ -380,6 +380,9 @@ class RemoteWorker:
             # failure, not provider instability: do not submit a calculation, do
             # not burn retry attempts, and do not trip the shared circuit breaker.
             def write_permanent(locked: RemoteTask) -> None:
+                # The provider responded definitively, so a HALF_OPEN probe must
+                # complete successfully even though this specific input is invalid.
+                self.circuit.record_success()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="PERMANENT",
