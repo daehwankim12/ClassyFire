@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -42,6 +43,15 @@ from apps.classifications.models import (
 )
 from apps.core.enums import SOURCE_PRIORITY, ResultKind, SourceType
 from apps.remote.provider import ChemOntSlot, NormalizedClassification
+
+_INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
+
+
+def persistable_returned_inchikey(value: str | None) -> str | None:
+    """Return ``value`` only when it fits ClassificationResult constraints."""
+    if value is None:
+        return None
+    return value if _INCHIKEY_RE.fullmatch(value) else None
 
 
 @dataclass(frozen=True)
@@ -244,7 +254,7 @@ def write_live_result(
     if norm.inchikey != inchikey:
         event = _append_event(
             requested_inchikey=inchikey,
-            returned_inchikey=norm.inchikey,
+            returned_inchikey=persistable_returned_inchikey(norm.inchikey),
             kind=ResultKind.REJECTED_MISMATCH,
             source_type=source_type,
             priority=priority,

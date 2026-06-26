@@ -118,7 +118,7 @@ class _MismatchScenario:
     requested = IK
     returned = IK_RETURNED
 
-    def run(self) -> tuple[str, str]:
+    def run(self, returned: str | None = None) -> tuple[str, str]:
         from apps.remote import queue
 
         job = BatchJob.objects.create(secret_hash="x", total_count=0)
@@ -135,7 +135,8 @@ class _MismatchScenario:
         )
         queue.enqueue_task(self.requested, compound_id=compound.id)
 
-        provider = MockProvider(entities={self.requested: build_raw(self.returned)})
+        returned_key = returned or self.returned
+        provider = MockProvider(entities={self.requested: build_raw(returned_key)})
         worker = RemoteWorker(
             provider,
             worker_id="w-mismatch",
@@ -143,7 +144,7 @@ class _MismatchScenario:
             circuit=CircuitBreaker(failure_threshold=1000),
         )
         worker.tick()
-        return self.requested, self.returned
+        return self.requested, returned_key
 
 
 @pytest.fixture
@@ -160,6 +161,32 @@ def test_remote_key_mismatch_appends_rejected_event(remote_mismatch_scenario):
     assert event.raw_json
 
     # The mismatch must remain TERMINAL but never advance the live pointer.
+    task = RemoteTask.objects.get(inchikey=requested_key)
+    assert task.state == TaskState.DONE
+    assert not ClassyfireLive.objects.filter(inchikey=requested_key).exists()
+    assert (
+        BatchItem.objects.get(inchikey=requested_key).status
+        == BatchItemStatus.RESULT_KEY_MISMATCH
+    )
+
+
+@pytest.mark.parametrize("malformed_returned", ["X", "A" * 128])
+def test_remote_key_mismatch_with_malformed_returned_key_is_terminal(
+    remote_mismatch_scenario, malformed_returned
+):
+    requested_key, returned_key = remote_mismatch_scenario.run(malformed_returned)
+
+    event = ClassificationResult.objects.get(requested_inchikey=requested_key)
+    assert returned_key == malformed_returned
+    assert event.returned_inchikey is None
+    assert event.kind == ResultKind.REJECTED_MISMATCH
+    assert event.raw_json["inchikey"] == malformed_returned
+
+    attempt = RemoteAttempt.objects.get(classification="RESULT_KEY_MISMATCH")
+    assert attempt.request_inchikey == requested_key
+    assert attempt.returned_inchikey is None
+    assert malformed_returned in (attempt.detail or "")
+
     task = RemoteTask.objects.get(inchikey=requested_key)
     assert task.state == TaskState.DONE
     assert not ClassyfireLive.objects.filter(inchikey=requested_key).exists()

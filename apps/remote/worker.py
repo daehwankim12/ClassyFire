@@ -35,7 +35,10 @@ from django.conf import settings
 from django.db import DataError, IntegrityError, transaction
 from django.utils import timezone
 
-from apps.classifications.result_writer import write_live_result
+from apps.classifications.result_writer import (
+    persistable_returned_inchikey,
+    write_live_result,
+)
 from apps.core.enums import (
     BatchItemStatus,
     ProviderControlState,
@@ -407,7 +410,7 @@ class RemoteWorker:
                     http_status=result.http_status,
                     task=locked,
                     request_inchikey=locked.inchikey,
-                    returned_inchikey=norm.inchikey,
+                    returned_inchikey=persistable_returned_inchikey(norm.inchikey),
                     raw_body_text=result.raw_text,
                     safe_headers=result.safe_headers,
                 )
@@ -1821,7 +1824,7 @@ class RemoteWorker:
                 ),
                 task=locked,
                 request_inchikey=locked.inchikey,
-                returned_inchikey=norm.inchikey,
+                returned_inchikey=persistable_returned_inchikey(norm.inchikey),
             )
             outcome = write_live_result(
                 locked.inchikey,
