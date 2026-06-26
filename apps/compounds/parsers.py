@@ -214,9 +214,68 @@ def _read_prefix(stream: IO[str], n: int) -> str:
 
 
 def _prepend(prefix: str, stream: IO[str]) -> IO[str]:
-    """Return a new stream that yields *prefix* then the remaining *stream*."""
-    remaining = stream.read()
-    return io.StringIO(prefix + remaining)
+    """Return a stream that yields *prefix* before *stream* without buffering.
+
+    The returned wrapper only keeps the sniffed prefix in memory, then proxies
+    subsequent reads to the original stream.  This preserves CSV/TSV
+    auto-detection laziness instead of reading the rest of the upload into a
+    StringIO before the csv module can yield the first row.
+    """
+    return _PrefixedTextIO(prefix, stream)
+
+
+class _PrefixedTextIO(io.TextIOBase):
+    """Text stream wrapper that replays a prefix before an existing stream."""
+
+    def __init__(self, prefix: str, stream: IO[str]) -> None:
+        self._prefix = prefix
+        self._prefix_pos = 0
+        self._stream = stream
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> str:
+        prefix = self._read_prefix(size)
+        if size is not None and size >= 0:
+            remaining_size = size - len(prefix)
+            if remaining_size <= 0:
+                return prefix
+            return prefix + self._stream.read(remaining_size)
+        return prefix + self._stream.read(size)
+
+    def readline(self, size: int = -1) -> str:
+        if self._prefix_pos >= len(self._prefix):
+            return self._stream.readline(size)
+
+        newline_pos = self._prefix.find("\n", self._prefix_pos)
+        if newline_pos == -1:
+            end = len(self._prefix)
+        else:
+            end = newline_pos + 1
+
+        if size is not None and size >= 0:
+            end = min(end, self._prefix_pos + size)
+
+        chunk = self._prefix[self._prefix_pos:end]
+        self._prefix_pos = end
+
+        if (size is not None and size >= 0 and len(chunk) >= size) or chunk.endswith("\n"):
+            return chunk
+
+        suffix_size = -1 if size is None or size < 0 else size - len(chunk)
+        return chunk + self._stream.readline(suffix_size)
+
+    def _read_prefix(self, size: int = -1) -> str:
+        if self._prefix_pos >= len(self._prefix):
+            return ""
+        if size is None or size < 0:
+            end = len(self._prefix)
+        else:
+            end = min(len(self._prefix), self._prefix_pos + size)
+        chunk = self._prefix[self._prefix_pos:end]
+        self._prefix_pos = end
+        return chunk
 
 
 def _resolve_col(

@@ -25,7 +25,12 @@ from typing import ClassVar
 import pytest
 
 from apps.compounds.detection import detect_input_type
-from apps.compounds.parsers import parse_csv_tsv, parse_sdf, parse_txt
+from apps.compounds.parsers import (
+    _PrefixedTextIO,
+    parse_csv_tsv,
+    parse_sdf,
+    parse_txt,
+)
 from apps.compounds.validators import normalize_row
 from apps.core.enums import DetectedInputType
 
@@ -330,6 +335,72 @@ class TestParseCsvTsv:
         rows = list(parse_csv_tsv(self._csv_stream(csv_text)))
         assert rows[0]["raw"] == "CC(=O)O"
 
+    def test_auto_detect_does_not_read_remaining_stream_before_first_row(self):
+        class TrackingStringIO(io.StringIO):
+            def __init__(self, value: str) -> None:
+                super().__init__(value)
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int = -1) -> str:
+                self.read_sizes.append(size)
+                return super().read(size)
+
+        csv_text = "smiles,name\nCC(=O)O,acetic acid\n" + ("CC,tail\n" * 100)
+        stream = TrackingStringIO(csv_text)
+        gen = parse_csv_tsv(stream, smiles_col="smiles")
+
+        first = next(gen)
+
+        assert first["raw"] == "CC(=O)O"
+        assert -1 not in stream.read_sizes
+
+
+# ---------------------------------------------------------------------------
+# Prefix-replay wrapper used by CSV/TSV auto-detection
+# ---------------------------------------------------------------------------
+
+class TestPrefixedTextIO:
+    """Direct coverage for the non-buffering prefix-replay wrapper.
+
+    These exercise the boundary between the sniffed prefix and the underlying
+    stream, which is the part the CSV ``DictReader`` relies on for lazy reads.
+    """
+
+    def test_full_read_concatenates_prefix_then_stream(self):
+        wrapped = _PrefixedTextIO("ab", io.StringIO("cdef"))
+        assert wrapped.read() == "abcdef"
+        assert wrapped.read() == ""  # exhausted
+
+    def test_sized_read_spanning_boundary(self):
+        wrapped = _PrefixedTextIO("ab", io.StringIO("cdef"))
+        assert wrapped.read(3) == "abc"  # 2 from prefix + 1 from stream
+        assert wrapped.read(2) == "de"
+        assert wrapped.read() == "f"
+
+    def test_sized_read_within_prefix_only(self):
+        wrapped = _PrefixedTextIO("abcd", io.StringIO("ef"))
+        assert wrapped.read(2) == "ab"  # stays inside the prefix
+        assert wrapped.read() == "cdef"
+
+    def test_readline_stitches_line_split_across_boundary(self):
+        # Prefix ends mid-line; the first line must be completed from the stream.
+        wrapped = _PrefixedTextIO("he", io.StringIO("llo\nworld\n"))
+        assert wrapped.readline() == "hello\n"
+        assert wrapped.readline() == "world\n"
+        assert wrapped.readline() == ""
+
+    def test_readline_returns_complete_prefix_lines(self):
+        wrapped = _PrefixedTextIO("a\nb", io.StringIO("c\n"))
+        assert wrapped.readline() == "a\n"  # whole line lives in the prefix
+        assert wrapped.readline() == "bc\n"  # remainder stitched from stream
+
+    def test_iteration_reconstructs_full_content(self):
+        # csv.DictReader iterates the wrapper line by line; the reconstructed
+        # text must exactly equal prefix + stream regardless of split point.
+        full = "smiles,name\nCC,one\nCCO,two\n"
+        wrapped = _PrefixedTextIO(full[:5], io.StringIO(full[5:]))
+        assert "".join(wrapped) == full
+
 
 # ---------------------------------------------------------------------------
 # Streaming parser: SDF
@@ -403,6 +474,25 @@ class TestParseSdf:
         first = next(gen)
         assert first["row_index"] == 0
         assert first.get("external_id") == "CPD-001"
+
+    def test_does_not_read_all_sdf_records_before_first_row(self):
+        class TrackingStringIO(io.StringIO):
+            def __init__(self, value: str) -> None:
+                super().__init__(value)
+                self.readline_count = 0
+
+            def readline(self, size: int = -1) -> str:
+                self.readline_count += 1
+                return super().readline(size)
+
+        stream = TrackingStringIO(_SDF_TWO_RECORDS + (_SDF_RECORD * 10))
+        gen = parse_sdf(stream)  # type: ignore[arg-type]
+
+        first = next(gen)
+
+        assert first["row_index"] == 0
+        assert first.get("external_id") == "CPD-001"
+        assert stream.readline_count < len(stream.getvalue().splitlines())
 
     def test_malformed_property_header_does_not_abort_iteration(self):
         malformed_record = _SDF_RECORD.replace("> <EXTERNAL_ID>", "> <EXTERNAL_ID")
