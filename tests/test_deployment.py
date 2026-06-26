@@ -1,9 +1,7 @@
-import pytest
 import yaml
 from django.test import Client
 
 
-@pytest.mark.django_db
 def test_health_endpoint():
     client = Client()
     response = client.get("/health/")

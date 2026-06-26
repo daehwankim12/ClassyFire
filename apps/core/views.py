@@ -1,4 +1,3 @@
-from django.db import connection
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import render
 from django.utils.http import url_has_allowed_host_and_scheme
@@ -10,11 +9,8 @@ from apps.core.security import (
 )
 
 
-def health(request):
-    try:
-        connection.cursor().execute("SELECT 1")
-    except Exception:
-        return JsonResponse({"status": "db_unavailable"}, status=503)
+def health(request: HttpRequest) -> JsonResponse:
+    """Return process liveness without exposing dependency health."""
     return JsonResponse({"status": "ok"}, status=200)
 
 
