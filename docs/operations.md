@@ -145,6 +145,41 @@ This command:
 3. Records a `BACKUP_OK` system event visible on the stats page.
 4. Applies retention policy: keeps 7 daily, 4 weekly, and 12 monthly backups.
 
+### Portable backup bundle
+
+Use a portable bundle when you need to copy a backup out to an external disk,
+another host, or a remote storage tool. The bundle contains one backup manifest
+and every dump/artifact archive referenced by that manifest.
+
+```bash
+# Create a regular backup first.
+docker compose exec web python manage.py run_backup
+
+# Package the newest backup into one tarball.
+docker compose exec web python manage.py export_backup_bundle \
+  --output /backups/classyfire-portable-backup.tar.gz
+
+# Copy the tarball from the web container to the host.
+WEB=$(docker compose ps -q web)
+docker cp "$WEB:/backups/classyfire-portable-backup.tar.gz" ./classyfire-portable-backup.tar.gz
+```
+
+To import a bundle back into a backup store:
+
+```bash
+# Copy the bundle into the web container.
+WEB=$(docker compose ps -q web)
+docker cp ./classyfire-portable-backup.tar.gz "$WEB:/tmp/classyfire-portable-backup.tar.gz"
+
+# Verify and stage the bundle into /backups.
+docker compose exec web python manage.py import_backup_bundle \
+  /tmp/classyfire-portable-backup.tar.gz
+```
+
+Import is non-destructive: it verifies checksums and stages files in the backup
+directory, but it does not restore the live database. Run the explicit restore
+procedure only after stopping writers and confirming the imported manifest.
+
 ### Restore smoke test
 
 To verify the most recent backup is readable:
