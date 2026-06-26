@@ -176,3 +176,35 @@ def test_live_export_file_never_deleted(tmp_path, monkeypatch, settings):
 
     assert live_file.exists(), "Live export file must never be deleted"
     assert result.export_orphans_deleted == 0
+
+
+def test_live_legacy_sidecar_export_is_not_deleted_after_grace(tmp_path, monkeypatch, settings):
+    """An unexpired legacy sidecar-only export remains valid without a DB row."""
+    from apps.operations.cleanup import cleanup_expired
+
+    export_dir = tmp_path / "export_cache"
+    export_dir.mkdir()
+    monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
+    settings.EXPORT_RETENTION_DAYS = 14
+    settings.EXPORT_ORPHAN_GRACE_SECONDS = _GRACE
+
+    token = "legacylive"
+    payload = export_dir / f"{token}.csv"
+    sidecar = export_dir / f"{token}.meta.json"
+    payload.write_text("legacy export")
+    sidecar.write_text(
+        '{'
+        f'"token": "{token}", '
+        '"fmt": "csv", '
+        f'"expires_at": "{(timezone.now() + timedelta(days=7)).isoformat()}"'
+        '}'
+    )
+    old_ts = (datetime.now(tz=UTC) - timedelta(seconds=_GRACE + 300)).timestamp()
+    os.utime(payload, (old_ts, old_ts))
+    os.utime(sidecar, (old_ts, old_ts))
+
+    result = cleanup_expired(actor="test")
+
+    assert payload.exists(), "Live legacy payload should be kept until sidecar expiry"
+    assert sidecar.exists(), "Live legacy sidecar should be kept until sidecar expiry"
+    assert result.export_orphans_deleted == 0

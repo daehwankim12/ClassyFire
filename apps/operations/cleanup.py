@@ -211,6 +211,24 @@ def _cleanup_orphan_exports(now: datetime, grace_seconds: int) -> int:
     }
     protected_basenames = live_basenames | live_sidecar_basenames
 
+    # Legacy sidecar-only exports remain valid until their sidecar expires.
+    # The expired-export phase retains their payloads, and this later orphan
+    # pass must preserve both the payload and sidecar even without a DB row.
+    for meta_path in export_dir.glob("*.meta.json"):
+        try:
+            raw = json.loads(meta_path.read_text())
+            token = str(raw["token"])
+            fmt = str(raw["fmt"])
+            expires_at = datetime.fromisoformat(str(raw["expires_at"]))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            payload_path = _safe_export_payload_path(export_dir, token, fmt)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if expires_at > now and payload_path is not None:
+            protected_basenames.add(meta_path.name)
+            protected_basenames.add(payload_path.name)
+
     orphans_deleted = 0
     for entry in export_dir.iterdir():
         # Only regular files — skip directories and symlinks.
