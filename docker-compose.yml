@@ -293,12 +293,17 @@ services:
     env_file: .env
     environment:
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    # ngrok reads the authtoken natively from NGROK_AUTHTOKEN (above). The agent
+    # does NOT expand ${...} placeholders inside a YAML config file, so the old
+    # mounted ngrok.yml.template passed the literal "${NGROK_AUTHTOKEN}" and
+    # failed with ERR_NGROK_105. Forward the reserved domain straight to the Caddy
+    # proxy; docker compose substitutes ${NGROK_DOMAIN} from .env at parse time.
     command:
-      - "start"
-      - "--config=/etc/ngrok/ngrok.yml"
-      - "--all"
-    volumes:
-      - ./deploy/ngrok/ngrok.yml.template:/etc/ngrok/ngrok.yml:ro
+      - "http"
+      - "proxy:80"
+      - "--url=https://${NGROK_DOMAIN}"
+      - "--log=stdout"
+      - "--log-format=json"
     networks:
       - internal
       - external

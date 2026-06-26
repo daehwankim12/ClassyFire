@@ -312,7 +312,7 @@ docker compose down -v     # ⚠️ 데이터까지 전부 삭제(DB/업로드/�
 | 공개 URL `https://<도메인>/...` → **404 (endpoint offline)** | `ngrok-agent` 가 안 떠 있음. `docker compose up -d ngrok-agent` 후 `docker compose logs -f ngrok-agent` 로 터널 연결 확인. |
 | 공개 URL 접속이 **멈춤(행)** | URL에 포트(`:8000` 등)를 붙임. ngrok 엣지는 443만 받음 → `https://<도메인>/` 로만 접속. |
 | 컨테이너 내부 `http://localhost:8000/...` 호출이 **400 (DisallowedHost)** | `ALLOWED_HOSTS=[NGROK_DOMAIN, www.…]` 라 Host=`localhost` 거부. 앱 정상. 내부 점검은 **5-2 (B)** 의 Host 헤더 방식으로. |
-| `ngrok-agent` 가 계속 재시작 | `NGROK_AUTHTOKEN` 미설정/오타, 또는 예약 도메인과 `NGROK_DOMAIN` 불일치. |
+| `ngrok-agent` 가 계속 재시작 + `ERR_NGROK_105` (`Your authtoken: ${NGROK_AUTHTOKEN}`) | `.env` 의 `NGROK_AUTHTOKEN` 이 비었거나 잘못됨 → **대시보드 authtoken을 그대로** 붙여넣으세요. ngrok는 authtoken을 환경변수로 읽고, 예약 도메인은 compose의 `--url=https://${NGROK_DOMAIN}` 로 전달됩니다(config 파일 미사용). |
 | `proxy` 가 80/443 바인딩 실패 | 호스트의 IIS·"World Wide Web Publishing Service"·일부 VPN 등이 점유. **9-1** 로 회피(ngrok 전용이면 호스트 포트는 사실상 불필요). |
 | `backup`/`restore` 가 `\r`·`not found` 로 실패 | `.sh` 가 CRLF. **2장**(WSL2에 클론 또는 `autocrlf=false`). |
 | CSS 깨짐 | **5-1** `collectstatic`. |
