@@ -58,6 +58,27 @@ _realpath() {
 
 BACKUP_DIR_REAL="$(_realpath "${BACKUP_DIR}")"
 
+_safe_backup_file() {
+  _name="$1"
+  case "${_name}" in
+    ""|/*|*/*|*\\*)
+      return 1
+      ;;
+  esac
+  _path="${BACKUP_DIR}/${_name}"
+  _real="$(_realpath "${_path}")"
+  case "${_real}" in
+    "${BACKUP_DIR_REAL}/"*)
+      [ -f "${_real}" ] || return 1
+      printf '%s\n' "${_real}"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 _check_artifact_dir() {
   _label="$1"
   _dir="$2"
@@ -309,8 +330,9 @@ for MFILE in ${MANIFESTS}; do
   if [ "${KEEP}" = "0" ]; then
     # Extract dump filename from manifest using awk (no python3 needed).
     DUMP_NAME=$(awk -F'"' '/"file"/{print $4; exit}' "${MFILE}" 2>/dev/null || true)
-    if [ -n "${DUMP_NAME}" ] && [ -f "${BACKUP_DIR}/${DUMP_NAME}" ]; then
-      rm "${BACKUP_DIR}/${DUMP_NAME}"
+    DUMP_PATH="$(_safe_backup_file "${DUMP_NAME}" 2>/dev/null || true)"
+    if [ -n "${DUMP_PATH}" ]; then
+      rm "${DUMP_PATH}"
       echo "[backup] Pruned dump: ${DUMP_NAME}"
     fi
     # Also prune associated artifact archives (same timestamp stem).
@@ -319,23 +341,27 @@ for MFILE in ${MANIFESTS}; do
     # Extract timestamp from stem: classyfire_<TIMESTAMP>
     TS_PART=$(echo "${STEM}" | sed 's/^classyfire_//')
     MEDIA_NAME="classyfire_media_${TS_PART}.tar.gz"
-    if [ -f "${BACKUP_DIR}/${MEDIA_NAME}" ]; then
-      rm "${BACKUP_DIR}/${MEDIA_NAME}"
+    MEDIA_NAME_PATH="$(_safe_backup_file "${MEDIA_NAME}" 2>/dev/null || true)"
+    if [ -n "${MEDIA_NAME_PATH}" ]; then
+      rm "${MEDIA_NAME_PATH}"
       echo "[backup] Pruned media archive: ${MEDIA_NAME}"
     fi
     EXPORTS_NAME="classyfire_exports_${TS_PART}.tar.gz"
-    if [ -f "${BACKUP_DIR}/${EXPORTS_NAME}" ]; then
-      rm "${BACKUP_DIR}/${EXPORTS_NAME}"
+    EXPORTS_NAME_PATH="$(_safe_backup_file "${EXPORTS_NAME}" 2>/dev/null || true)"
+    if [ -n "${EXPORTS_NAME_PATH}" ]; then
+      rm "${EXPORTS_NAME_PATH}"
       echo "[backup] Pruned exports archive: ${EXPORTS_NAME}"
     fi
     SOURCE_NAME="classyfire_source_artifacts_${TS_PART}.tar.gz"
-    if [ -f "${BACKUP_DIR}/${SOURCE_NAME}" ]; then
-      rm "${BACKUP_DIR}/${SOURCE_NAME}"
+    SOURCE_NAME_PATH="$(_safe_backup_file "${SOURCE_NAME}" 2>/dev/null || true)"
+    if [ -n "${SOURCE_NAME_PATH}" ]; then
+      rm "${SOURCE_NAME_PATH}"
       echo "[backup] Pruned source artifacts archive: ${SOURCE_NAME}"
     fi
     UPLOADS_NAME="classyfire_uploads_${TS_PART}.tar.gz"
-    if [ -f "${BACKUP_DIR}/${UPLOADS_NAME}" ]; then
-      rm "${BACKUP_DIR}/${UPLOADS_NAME}"
+    UPLOADS_NAME_PATH="$(_safe_backup_file "${UPLOADS_NAME}" 2>/dev/null || true)"
+    if [ -n "${UPLOADS_NAME_PATH}" ]; then
+      rm "${UPLOADS_NAME_PATH}"
       echo "[backup] Pruned uploads archive: ${UPLOADS_NAME}"
     fi
     rm "${MFILE}"

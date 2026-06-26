@@ -98,6 +98,20 @@ def _classify_backup_age(ts: datetime, now: datetime) -> str:
         return "monthly"
 
 
+def _backup_child_path(backup_dir: Path, filename: Any) -> Path | None:
+    """Return a safe child path for a manifest-controlled backup filename."""
+    if not isinstance(filename, str) or not filename:
+        return None
+    candidate = Path(filename)
+    if candidate.is_absolute() or candidate.name != filename:
+        return None
+    backup_root = backup_dir.resolve()
+    resolved = (backup_root / candidate).resolve()
+    if not resolved.is_relative_to(backup_root):
+        return None
+    return resolved
+
+
 def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]:
     """Delete old backups per retention policy. Returns list of deleted paths."""
     if now is None:
@@ -136,8 +150,8 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
         for p in lst[keep:]:
             try:
                 data = json.loads(p.read_text())
-                dump_path = backup_dir / data.get("file", "")
-                if dump_path.exists():
+                dump_path = _backup_child_path(backup_dir, data.get("file", ""))
+                if dump_path is not None and dump_path.exists():
                     dump_path.unlink()
                 # Collect archive files to delete, starting with the legacy
                 # media_file field (old manifests only have this).
@@ -157,8 +171,8 @@ def apply_retention(backup_dir: Path, now: datetime | None = None) -> list[Path]
                         except (KeyError, TypeError):
                             pass
                 for fname in archives_to_delete:
-                    archive_path = backup_dir / fname
-                    if archive_path.exists():
+                    archive_path = _backup_child_path(backup_dir, fname)
+                    if archive_path is not None and archive_path.exists():
                         archive_path.unlink()
             except (KeyError, OSError, json.JSONDecodeError):
                 pass

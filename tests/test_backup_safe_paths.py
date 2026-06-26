@@ -102,3 +102,41 @@ def test_backup_allows_nonexistent_dedicated_artifact_dir(tmp_path):
     media = tmp_path / "dedicated-media"
     resolved = validate_artifact_dir(str(media), backup_dir=tmp_path / "backups", label="media")
     assert resolved == media.resolve()
+
+
+def test_retention_rejects_manifest_path_traversal(tmp_path, settings):
+    """Pruning must not unlink manifest-controlled paths outside backup_dir."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from apps.operations.backup import apply_retention
+
+    settings.BACKUP_DAILY_COUNT = 0
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not delete")
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir()
+    manifest = {
+        "timestamp": (datetime.now(tz=UTC) - timedelta(hours=1)).isoformat(),
+        "file": "../victim.txt",
+        "media_file": "/tmp/also-unsafe.tar.gz",
+        "artifact_archives": {"exports": {"file": "../victim.txt"}},
+        "checksum": "abc",
+        "status": "ok",
+    }
+    (backup_dir / "classyfire_unsafe.manifest.json").write_text(json.dumps(manifest))
+
+    apply_retention(backup_dir, now=datetime.now(tz=UTC))
+
+    assert victim.read_text() == "do not delete"
+    assert not (backup_dir / "classyfire_unsafe.manifest.json").exists()
+
+
+def test_production_backup_script_validates_manifest_dump_name():
+    script = os.path.join("deploy", "backup", "backup.sh")
+    text = open(script, encoding="utf-8").read()
+
+    assert "_safe_backup_file()" in text
+    assert '""|/*|*/*|*\\\\*)' in text
+    assert 'DUMP_PATH="$(_safe_backup_file "${DUMP_NAME}"' in text
+    assert 'rm "${BACKUP_DIR}/${DUMP_NAME}"' not in text
