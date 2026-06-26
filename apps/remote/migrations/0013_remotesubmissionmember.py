@@ -21,6 +21,7 @@ def backfill_live_submission_members(apps, schema_editor):
 
     for submission in (
         RemoteSubmission.objects.filter(state__in=["PENDING", "SUBMITTED", "UNKNOWN"])
+        .exclude(query__state="COMPLETE", query__completed_at__isnull=False)
         .only("id", "provider", "request_payload")
         .iterator()
     ):

@@ -281,3 +281,58 @@ def test_submit_2xx_bad_query_id_schema_parks_unknown_without_repost(settings):
     assert transport.submit_count == 1
     submission.refresh_from_db()
     assert submission.state == SubmissionState.UNKNOWN
+
+
+@pytest.mark.django_db(transaction=True)
+def test_member_backfill_skips_already_completed_submitted_queries():
+    from importlib import import_module
+
+    from django.apps import apps
+
+    from apps.core.enums import QueryState
+    from apps.remote.models import RemoteQuery
+
+    migration = import_module("apps.remote.migrations.0013_remotesubmissionmember")
+    query = RemoteQuery.objects.create(
+        provider="wishart",
+        remote_query_id="completed-backfill",
+        payload_hash="completed-hash",
+        state=QueryState.COMPLETE,
+        completed_at=timezone.now(),
+    )
+    submission = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="completed-submission-hash",
+        state=SubmissionState.SUBMITTED,
+        query=query,
+        remote_query_id="completed-backfill",
+        request_payload={"structures": [["LFQSCWFLJHTTHZ-UHFFFAOYSA-N", "CCO"]]},
+    )
+
+    migration.backfill_live_submission_members(apps, None)
+
+    assert not RemoteSubmissionMember.objects.filter(submission=submission).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_member_backfill_keeps_unfinished_live_submissions_reserved():
+    from importlib import import_module
+
+    from django.apps import apps
+
+    migration = import_module("apps.remote.migrations.0013_remotesubmissionmember")
+    submission = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="pending-submission-hash",
+        state=SubmissionState.PENDING,
+        request_payload={"structures": [["LFQSCWFLJHTTHZ-UHFFFAOYSA-N", "CCO"]]},
+    )
+
+    migration.backfill_live_submission_members(apps, None)
+
+    assert RemoteSubmissionMember.objects.filter(
+        submission=submission,
+        provider="wishart",
+        inchikey="LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
+        active=True,
+    ).exists()
