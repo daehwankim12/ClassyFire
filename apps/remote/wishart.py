@@ -24,6 +24,7 @@ NB: tests never exercise this class against the network — they use
 :class:`apps.remote.mock.MockProvider` or an ``httpx.MockTransport``. A guarded
 live smoke test against the real Wishart service is deferred/manual.
 """
+
 from __future__ import annotations
 
 import email.utils
@@ -89,7 +90,10 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
     except (TypeError, ValueError):
         pass
     # HTTP-date form.
-    parsed = email.utils.parsedate_to_datetime(raw)
+    try:
+        parsed = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
     if parsed is None:
         return None
     if parsed.tzinfo is None:
@@ -104,13 +108,9 @@ class WishartDirectProvider:
     Reuses a single ``httpx.Client`` (connection pooling) across calls.
     """
 
-    def __init__(
-        self, base_url: str | None = None, timeout: float | None = None
-    ) -> None:
+    def __init__(self, base_url: str | None = None, timeout: float | None = None) -> None:
         self.base_url = (base_url or settings.WISHART_BASE_URL).rstrip("/")
-        self.timeout = (
-            timeout if timeout is not None else settings.REMOTE_TIMEOUT_SECONDS
-        )
+        self.timeout = timeout if timeout is not None else settings.REMOTE_TIMEOUT_SECONDS
         self._http_client: httpx.Client | None = None
 
     def _client(self) -> httpx.Client:
@@ -229,9 +229,7 @@ class WishartDirectProvider:
             safe_headers=headers,
         )
 
-    def submit_structures(
-        self, structures: list[tuple[str, str]]
-    ) -> SubmitResult:
+    def submit_structures(self, structures: list[tuple[str, str]]) -> SubmitResult:
         query_input = "\n".join(f"{label}\t{struct}" for label, struct in structures)
         payload = {
             "label": "classyfire-batch",

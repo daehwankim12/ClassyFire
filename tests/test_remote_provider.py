@@ -3,6 +3,7 @@
 Covers the MockProvider (used by the whole suite) plus the WishartDirectProvider
 HTTP outcome classification using httpx's MockTransport — NO real network.
 """
+
 from __future__ import annotations
 
 from datetime import UTC
@@ -380,6 +381,33 @@ def test_wishart_retry_after_http_date_form():
     assert result.status == EntityLookupStatus.RETRYABLE_ERROR
     assert result.retry_after is not None
     assert 110 < result.retry_after <= 121
+
+
+def test_wishart_retry_after_malformed_header_is_ignored_for_entity():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "not-a-date"})
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after is None
+
+
+def test_wishart_retry_after_malformed_header_is_ignored_for_submit():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": "not-a-date"})
+
+    with pytest.raises(RetryableProviderError) as excinfo:
+        _wishart_with(handler).submit_structures([(IK_A, "CCO")])
+    assert excinfo.value.retry_after is None
+
+
+def test_wishart_retry_after_malformed_header_is_ignored_for_poll():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(408, headers={"Retry-After": "not-a-date"})
+
+    result = _wishart_with(handler).poll_query("q1")
+    assert result.status == PollStatus.RETRYABLE_ERROR
+    assert result.retry_after is None
 
 
 def test_wishart_reuses_single_http_client():
