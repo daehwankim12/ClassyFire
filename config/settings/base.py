@@ -169,7 +169,7 @@ SEED_AUTO_UPDATE: bool = env_bool("SEED_AUTO_UPDATE", False)
 # ---------------------------------------------------------------------------
 
 WISHART_BASE_URL: str = env_str(
-    "WISHART_BASE_URL", "https://classyfire.wishartlab.com"
+    "WISHART_BASE_URL", "http://classyfire.wishartlab.com"
 )
 REMOTE_ENABLED: bool = env_bool("REMOTE_ENABLED", True)
 REMOTE_ENTITY_REQUESTS_PER_MIN: int = env_int("REMOTE_ENTITY_REQUESTS_PER_MIN", 10)

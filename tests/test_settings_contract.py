@@ -149,7 +149,15 @@ class TestBaseSettingsContract:
 
     def test_wishart_base_url(self, settings: object) -> None:
         assert hasattr(settings, "WISHART_BASE_URL")
-        assert "classyfire" in str(settings.WISHART_BASE_URL).lower()
+        assert str(settings.WISHART_BASE_URL).startswith(("http://", "https://"))
+
+    def test_wishart_default_matches_live_http_endpoint(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        base_settings = (root / "config/settings/base.py").read_text()
+        env_example = (root / ".env.example").read_text()
+
+        assert '"WISHART_BASE_URL", "http://classyfire.wishartlab.com"' in base_settings
+        assert "WISHART_BASE_URL=http://classyfire.wishartlab.com" in env_example
 
     def test_remote_enabled(self, settings: object) -> None:
         assert hasattr(settings, "REMOTE_ENABLED")
