@@ -29,9 +29,11 @@ http://{$NGROK_DOMAIN} {
         X-XSS-Protection "1; mode=block"
         # HSTS: 1 year, include subdomains, allow preload
         Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        # Referrer policy — no-referrer so the per-job secret embedded in the
-        # result URL path never appears in any Referer header (even same-origin).
-        Referrer-Policy "no-referrer"
+        # Referrer policy — strict-origin trims the Referer to the origin only
+        # (no path), so the per-job secret embedded in a URL path never appears
+        # in any Referer header, while keeping a valid Origin header. ("no-referrer"
+        # makes browsers send "Origin: null" on POSTs, which breaks Django CSRF.)
+        Referrer-Policy "strict-origin"
         # Content-Security-Policy — tightened in Task 11
         Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
         # Remove server identification headers

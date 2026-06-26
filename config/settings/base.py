@@ -238,12 +238,15 @@ EXPORT_ORPHAN_GRACE_SECONDS: int = env_int("EXPORT_ORPHAN_GRACE_SECONDS", 3600)
 
 # ---------------------------------------------------------------------------
 # Referrer policy (defence-in-depth: URL path embeds a per-job secret)
-# no-referrer prevents the secret from appearing in any Referer header,
-# including same-origin requests (which would otherwise leak it into logs).
-# SecurityMiddleware emits Referrer-Policy when this setting is present.
+# strict-origin trims the Referer to the origin only (scheme+host, no path), so
+# the secret in a URL path never appears in any Referer header — while STILL
+# sending a real Origin header. The latter matters behind the HTTPS proxy:
+# "no-referrer" makes browsers send "Origin: null" on form POSTs, which fails
+# Django's CSRF origin check and 403s every POST. SecurityMiddleware emits
+# Referrer-Policy when this setting is present.
 # ---------------------------------------------------------------------------
 
-SECURE_REFERRER_POLICY = "no-referrer"
+SECURE_REFERRER_POLICY = "strict-origin"
 
 # ---------------------------------------------------------------------------
 # Circuit breaker (Task 9 remote worker — read via getattr for backwards compat)

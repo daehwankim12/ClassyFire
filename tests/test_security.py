@@ -1184,15 +1184,19 @@ class TestSecurityImplementationGuards:
 
 
 # ===========================================================================
-# 10. Referrer-Policy: no-referrer header (defence-in-depth for URL secrets)
+# 10. Referrer-Policy: strict-origin header (defence-in-depth for URL secrets)
+#
+# strict-origin (not no-referrer) so the Referer is trimmed to the origin only
+# — the secret-bearing URL path never leaks — WITHOUT nulling the Origin header,
+# which "no-referrer" does and which 403s every CSRF-protected POST behind HTTPS.
 # ===========================================================================
 
 
 class TestReferrerPolicy:
-    """Responses must carry Referrer-Policy: no-referrer for defense in depth."""
+    """Responses must carry Referrer-Policy: strict-origin for defense in depth."""
 
     @pytest.mark.django_db(transaction=True)
-    def test_result_page_has_no_referrer_policy(self) -> None:
+    def test_result_page_has_strict_origin_policy(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
@@ -1200,13 +1204,13 @@ class TestReferrerPolicy:
         assert claim_response.status_code == 303
         response = client.get(f"/jobs/{job.pk}/")
         assert response.status_code == 200
-        assert response.headers.get("Referrer-Policy") == "no-referrer", (
-            f"Expected Referrer-Policy: no-referrer, got: {response.headers.get('Referrer-Policy')}"
+        assert response.headers.get("Referrer-Policy") == "strict-origin", (
+            f"Expected Referrer-Policy: strict-origin, got: {response.headers.get('Referrer-Policy')}"
         )
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
-    def test_api_response_has_no_referrer_policy(self) -> None:
+    def test_api_response_has_strict_origin_policy(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client()
@@ -1217,8 +1221,8 @@ class TestReferrerPolicy:
             HTTP_X_JOB_SECRET=secret,
         )
         assert response.status_code == 200
-        assert response.headers.get("Referrer-Policy") == "no-referrer", (
-            f"Expected Referrer-Policy: no-referrer, got: {response.headers.get('Referrer-Policy')}"
+        assert response.headers.get("Referrer-Policy") == "strict-origin", (
+            f"Expected Referrer-Policy: strict-origin, got: {response.headers.get('Referrer-Policy')}"
         )
 
 

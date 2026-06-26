@@ -180,8 +180,9 @@ embeds this secret in the path (e.g. `/jobs/<id>/<secret>/`).
 **Treat the result URL like a password:**
 - Do not share it in public channels.
 - Do not post it in bug reports or screenshots.
-- The `Referrer-Policy: no-referrer` header is set on result pages to prevent
-  the URL from leaking to third-party resources.
+- The `Referrer-Policy: strict-origin` header is set on result pages, so the
+  Referer is trimmed to the origin only — the secret-bearing URL path never
+  leaks to third-party resources.
 
 **Preferred approach for API clients:** pass the secret via the `X-Job-Secret`
 header rather than the `?secret=` query parameter.  The header is not logged
