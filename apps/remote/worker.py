@@ -1496,7 +1496,12 @@ class RemoteWorker:
             )
             self.circuit.record_failure()
             for member in members:
-                self._dispatch_member(claim, member, query, None)
+                # A malformed response is unusable for EVERY member: retry each
+                # without a terminal apply state so the query is not completed on
+                # a bad response (surplus/garbled entities must not "resolve").
+                self._dispatch_member(
+                    claim, member, query, None, mark_missing_terminal=False
+                )
             self._complete_query_if_terminal(query)
             return
 
@@ -1526,6 +1531,8 @@ class RemoteWorker:
         member: RemoteTask,
         query: RemoteQuery,
         norm: NormalizedClassification | None,
+        *,
+        mark_missing_terminal: bool = True,
     ) -> None:
         """Resolve ONE batched member, recording a DURABLE apply outcome (Task 15).
 
@@ -1533,9 +1540,12 @@ class RemoteWorker:
         ``RemoteQueryItem`` stamped APPLIED/MISMATCH inside the fenced txn. A
         member actively owned by ANOTHER worker is NOT applied (and never
         silently skipped): its item is parked PENDING_OWNER so the owner's later
-        poll/apply completes it. A member with no entity in the response is marked
-        FAILED for this completed query before its task retries independently,
-        preventing ragged provider responses from keeping the query open.
+        poll/apply completes it. A member missing from an otherwise-COMPLETE
+        provider response is marked FAILED before its task retries independently,
+        preventing ragged provider responses from keeping the query open. When the
+        WHOLE response was rejected as malformed, ``mark_missing_terminal`` is
+        False so the member retries WITHOUT a terminal apply state, leaving the
+        query open rather than completing it on an unusable response.
         """
         member_claim = self._member_claim(member, claim)
         if member_claim is None:
@@ -1556,7 +1566,13 @@ class RemoteWorker:
             .exists()
         ):
             return
-        self._dispatch_resolved(member_claim, member, query, norm)
+        self._dispatch_resolved(
+            member_claim,
+            member,
+            query,
+            norm,
+            mark_missing_terminal=mark_missing_terminal,
+        )
 
     def _park_member_pending_owner(
         self, query: RemoteQuery, member: RemoteTask
@@ -1661,6 +1677,8 @@ class RemoteWorker:
         task: RemoteTask,
         query: RemoteQuery,
         norm: NormalizedClassification | None,
+        *,
+        mark_missing_terminal: bool = True,
     ) -> None:
         if norm is None:
             # No entity for this task's InChIKey: unresolved miss → retry per the
@@ -1670,17 +1688,25 @@ class RemoteWorker:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
                     queue.schedule_retry(locked)
-                    RemoteQueryItem.objects.filter(query=query, task=locked).exclude(
-                        apply_state__in=[
-                            RemoteQueryItemApplyState.APPLIED,
-                            RemoteQueryItemApplyState.MISMATCH,
-                            RemoteQueryItemApplyState.FAILED,
-                        ]
-                    ).update(
-                        apply_state=RemoteQueryItemApplyState.FAILED,
-                        apply_detail="missing from completed provider response; retry scheduled",
-                        applied_at=timezone.now(),
-                    )
+                    # Only mark the member terminally FAILED when it is genuinely
+                    # absent from an otherwise-COMPLETE response, so the query can
+                    # finish. When the WHOLE response was rejected as malformed,
+                    # leave the item non-terminal so the query stays open and the
+                    # member is reconciled on a later, well-formed response.
+                    if mark_missing_terminal:
+                        RemoteQueryItem.objects.filter(
+                            query=query, task=locked
+                        ).exclude(
+                            apply_state__in=[
+                                RemoteQueryItemApplyState.APPLIED,
+                                RemoteQueryItemApplyState.MISMATCH,
+                                RemoteQueryItemApplyState.FAILED,
+                            ]
+                        ).update(
+                            apply_state=RemoteQueryItemApplyState.FAILED,
+                            apply_detail="missing from completed provider response; retry scheduled",
+                            applied_at=timezone.now(),
+                        )
             except LeaseLost:
                 logger.warning(
                     "lease lost dispatching miss-retry for task %s (inchikey=%s); "
