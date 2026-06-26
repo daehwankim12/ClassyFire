@@ -195,6 +195,6 @@ def import_official_file(
     return import_official_artifact(
         raw,
         name=p.name,
-        uri=uri if uri is not None else p.as_uri(),
+        uri=uri if uri is not None else p.resolve().as_uri(),
         metadata=metadata,
     )

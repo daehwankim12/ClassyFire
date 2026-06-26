@@ -1,13 +1,16 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
+from apps.classifications import official_import
 from apps.classifications.models import SourceArtifact
 from apps.classifications.official_import import (
     FULL_INCHIKEY_RE,
     OfficialImportError,
     import_official_artifact,
+    import_official_file,
 )
 
 FULL_INCHIKEY = "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"
@@ -48,6 +51,31 @@ def test_full_inchikey_re_rejects_lowercase():
 
 def test_full_inchikey_re_accepts_valid_key():
     assert FULL_INCHIKEY_RE.fullmatch(FULL_INCHIKEY) is not None
+
+
+def test_import_official_file_accepts_relative_path_without_uri(tmp_path, monkeypatch):
+    artifact_path = tmp_path / "official.json"
+    raw = json.dumps([{"inchikey": FULL_INCHIKEY, "raw": {"relative": True}}]).encode()
+    artifact_path.write_bytes(raw)
+
+    captured = {}
+
+    def fake_import_official_artifact(raw_bytes, *, name, uri=None, metadata=None):
+        captured.update({"raw": raw_bytes, "name": name, "uri": uri, "metadata": metadata})
+        return object()
+
+    monkeypatch.setattr(official_import, "import_official_artifact", fake_import_official_artifact)
+    monkeypatch.chdir(tmp_path)
+
+    result = import_official_file(Path("official.json"))
+
+    assert result is not None
+    assert captured == {
+        "raw": raw,
+        "name": "official.json",
+        "uri": artifact_path.resolve().as_uri(),
+        "metadata": None,
+    }
 
 
 # ---------------------------------------------------------------------------
