@@ -45,6 +45,9 @@ class CleanupResult:
     # upload_temps_deleted counts stale *.tmp partials in UPLOAD_ARTIFACT_DIR
     # (crashed spool writes) older than the upload-temp grace window.
     upload_temps_deleted: int = 0
+    # upload_artifacts_deleted counts FINAL spooled upload artifacts unlinked
+    # because their owning job was pruned by retention (R-07).
+    upload_artifacts_deleted: int = 0
 
 
 _EXPORT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -292,7 +295,21 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
         Q(completed_at__lt=job_cutoff)
         | Q(completed_at__isnull=True, created_at__lt=job_cutoff)
     )
+    # Collect linked FINAL upload artifact paths BEFORE deleting the rows — once
+    # the jobs are gone the relative paths are unrecoverable. Unlink each after
+    # the rows are deleted so a retention prune does not orphan the spool (R-07).
+    from apps.batches.ingest import unlink_upload_artifact
+
+    upload_paths = list(
+        delete_qs.exclude(upload_artifact_path__isnull=True)
+        .exclude(upload_artifact_path="")
+        .values_list("upload_artifact_path", flat=True)
+    )
     jobs_deleted, _ = delete_qs.delete()
+    upload_artifacts_deleted = 0
+    for relative_path in upload_paths:
+        if unlink_upload_artifact(relative_path):
+            upload_artifacts_deleted += 1
 
     exports_deleted, export_files_deleted = _cleanup_expired_exports(now, export_days)
 
@@ -309,6 +326,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
         export_files_deleted=export_files_deleted,
         export_orphans_deleted=export_orphans_deleted,
         upload_temps_deleted=upload_temps_deleted,
+        upload_artifacts_deleted=upload_artifacts_deleted,
     )
 
     SystemEvent.objects.create(
@@ -322,6 +340,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             "export_files_deleted": export_files_deleted,
             "export_orphans_deleted": export_orphans_deleted,
             "upload_temps_deleted": upload_temps_deleted,
+            "upload_artifacts_deleted": upload_artifacts_deleted,
             "upload_retention_days": upload_days,
             "job_retention_days": job_days,
             "export_retention_days": export_days,

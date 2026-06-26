@@ -80,6 +80,28 @@ def validate_upload_root(value: str) -> Path:
     return root
 
 
+def unlink_upload_artifact(relative_path: str | None) -> bool:
+    """Delete a spooled FINAL upload artifact by its stored relative path (R-07).
+
+    Returns True iff a file was removed. Guards against path traversal: the
+    resolved artifact MUST live under the configured upload root; a path that
+    escapes the root is skipped (returns False) rather than deleted. Used to
+    compensate a rolled-back job-create and to prune artifacts of deleted jobs.
+    """
+    if not relative_path:
+        return False
+    root = validate_upload_root(getattr(settings, "UPLOAD_ARTIFACT_DIR", ""))
+    artifact = (root / relative_path).resolve()
+    try:
+        artifact.relative_to(root)
+    except ValueError:
+        return False
+    if artifact.exists():
+        artifact.unlink()
+        return True
+    return False
+
+
 def spool_upload_file(upload: object, *, max_bytes: int | None = None) -> SpooledUpload:
     """Atomically spool *upload* to ``<UPLOAD_ARTIFACT_DIR>/<uuid><suffix>``.
 

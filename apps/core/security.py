@@ -746,6 +746,7 @@ def spool_upload_under_quota(
         UploadTooLarge,
         spool_text_input,
         spool_upload_file,
+        unlink_upload_artifact,
     )
     from apps.batches.models import BatchJob, BatchQuotaEvent
     from apps.core.enums import BatchProcessingState
@@ -773,26 +774,33 @@ def spool_upload_under_quota(
             transaction.set_rollback(True)
             return None, "", _quota_response(str(exc), status=413)
 
-        plaintext_secret = secrets.token_urlsafe(32)
-        job = BatchJob.objects.create(
-            secret_hash=make_password(plaintext_secret),
-            remote_enabled=remote_enabled,
-            remote_principal=normalize_principal(principal),
-            processing_state=BatchProcessingState.UPLOADING,
-            upload_artifact_path=spooled.relative_path,
-            upload_original_name=spooled.original_name,
-            upload_content_type=spooled.content_type,
-            upload_size_bytes=spooled.size_bytes,
-            upload_sha256=spooled.sha256,
-        )
-        # The quota event is recorded with a zero row count up front; the worker
-        # re-records the real row count when it stages the spooled artifact.
-        BatchQuotaEvent.objects.create(
-            kind=BatchQuotaEvent.KIND_JOB_CREATE,
-            principal=principal,
-            ip_address=ip_address,
-            row_count=0,
-        )
+        # The artifact is now on disk OUTSIDE the DB transaction. If ANY later
+        # step fails the atomic block rolls the row back but the spooled file
+        # would remain — compensate by unlinking it so no orphan survives (R-07).
+        try:
+            plaintext_secret = secrets.token_urlsafe(32)
+            job = BatchJob.objects.create(
+                secret_hash=make_password(plaintext_secret),
+                remote_enabled=remote_enabled,
+                remote_principal=normalize_principal(principal),
+                processing_state=BatchProcessingState.UPLOADING,
+                upload_artifact_path=spooled.relative_path,
+                upload_original_name=spooled.original_name,
+                upload_content_type=spooled.content_type,
+                upload_size_bytes=spooled.size_bytes,
+                upload_sha256=spooled.sha256,
+            )
+            # The quota event is recorded with a zero row count up front; the
+            # worker re-records the real row count when it stages the artifact.
+            BatchQuotaEvent.objects.create(
+                kind=BatchQuotaEvent.KIND_JOB_CREATE,
+                principal=principal,
+                ip_address=ip_address,
+                row_count=0,
+            )
+        except Exception:
+            unlink_upload_artifact(spooled.relative_path)
+            raise
 
     return job, plaintext_secret, None
 
