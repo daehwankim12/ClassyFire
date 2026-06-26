@@ -416,30 +416,32 @@ def test_requested_status_field_present():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_citation_metadata_csv():
+def test_csv_export_has_no_citation_header():
+    """Exports no longer carry an inline citation/comment header — attribution
+    for the CC-BY seed dataset lives in NOTICE.md. The CSV must begin directly
+    with the column header row, with no leading ``#`` comment lines."""
     job, secret = _create_simple_job()
     client = Client()
-    raw = _get_export_bytes(client, str(job.pk), secret, "csv")
-    text = raw.decode("utf-8")
-    assert text.startswith("# ClassyFire"), (
-        f"CSV should start with citation header, got: {text[:100]!r}"
-    )
+    text = _get_export_bytes(client, str(job.pk), secret, "csv").decode("utf-8")
+    assert not text.startswith("#"), f"unexpected comment header: {text[:80]!r}"
+    assert "Citation:" not in text
+    assert "Seed dataset:" not in text
 
 
 # ---------------------------------------------------------------------------
-# 10. Citation metadata in JSON (_citation key)
+# 10. No citation metadata in JSON (no per-row _citation key)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.django_db(transaction=True)
-def test_citation_metadata_json():
+def test_json_export_has_no_citation_key():
+    """JSON rows no longer carry the per-row ``_citation`` attribution key."""
     job, secret = _create_simple_job()
     client = Client()
     raw = _get_export_bytes(client, str(job.pk), secret, "json")
     data = json.loads(raw.decode("utf-8"))
     assert len(data) >= 1
-    row = data[0]
-    assert "_citation" in row, "JSON row should have '_citation' key"
+    assert "_citation" not in data[0]
 
 
 # ---------------------------------------------------------------------------

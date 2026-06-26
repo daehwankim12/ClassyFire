@@ -19,7 +19,6 @@ EXPORT_DIR: Path — directory where export files are stored.
 
 Formats supported: csv, tsv, json, csv.gz, tsv.gz
 
-Citation header (FR-028): prepended to CSV/TSV formats as # comment lines.
 Injection escaping (FR-028): cells starting with =, +, -, @ are prefixed with '.
 Token expiry: settings.EXPORT_RETENTION_DAYS days from creation.
 Deduplication: same job+format with valid non-expired token returns same token.
@@ -74,23 +73,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 EXPORT_DIR: Path = Path(getattr(settings, "EXPORT_DIR", settings.BASE_DIR / "export_cache"))
-
-CITATION_LINES = [
-    "# ClassyFire Batch Cache Web — Export",
-    "# Citation: Djoumbou Feunang et al., J. Cheminformatics 8:61 (2016). DOI: 10.1186/s13321-016-0174-y",
-    "# Seed dataset: Zenodo record 20472700 — InChIKey-Deduplicated ClassyFire/ChemOnt Label Collection v3 (CC BY 4.0)",
-    "# ChemOnt taxonomy: http://classyfire.wishartlab.com/tax_nodes/C0000000",
-    "# See NOTICE.md for full attribution.",
-]
-
-CITATION_TEXT = "\n".join(CITATION_LINES) + "\n"
-
-CITATION_DICT = (
-    "ClassyFire Batch Cache Web — Export. "
-    "Citation: Djoumbou Feunang et al., J. Cheminformatics 8:61 (2016). DOI: 10.1186/s13321-016-0174-y. "
-    "Seed dataset: Zenodo record 20472700 (CC BY 4.0). "
-    "ChemOnt: http://classyfire.wishartlab.com/tax_nodes/C0000000"
-)
 
 COLUMNS = [
     "InChIKey",
@@ -369,7 +351,6 @@ def _write_export_to_temp(
                 delimiter = "," if fmt == "csv.gz" else "\t"
                 with gzip.GzipFile(fileobj=raw_fh, mode="wb") as gz_fh:
                     gz_text = io.TextIOWrapper(cast(io.BufferedWriter, gz_fh), encoding="utf-8")
-                    gz_text.write(CITATION_TEXT)
                     gz_writer = csv.DictWriter(
                         gz_text,
                         fieldnames=COLUMNS,
@@ -389,7 +370,6 @@ def _write_export_to_temp(
             elif fmt in ("csv", "tsv"):
                 delimiter = "," if fmt == "csv" else "\t"
                 plain_text = io.TextIOWrapper(raw_fh, encoding="utf-8")
-                plain_text.write(CITATION_TEXT)
                 plain_writer = csv.DictWriter(
                     plain_text,
                     fieldnames=COLUMNS,
@@ -412,7 +392,7 @@ def _write_export_to_temp(
                 first = True
                 for row in _iter_rows_for_job(job):
                     sig_hasher.update(row)
-                    d: dict[str, object] = {"_citation": CITATION_DICT}
+                    d: dict[str, object] = {}
                     for col in COLUMNS:
                         d[col] = row.get(col)
                     entry = json.dumps(d, ensure_ascii=False, default=str)
