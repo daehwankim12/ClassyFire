@@ -274,12 +274,12 @@ class RemoteWorker:
             # attempt, durably block the provider for ALL workers (H-03), and
             # defer this task. Never burns an attempt. Every write is lease-fenced
             # so a stale worker writes nothing (R-02).
-            self.circuit.record_failure()
             # Bind to a stable local: Python deletes the ``except ... as exc``
             # name at block exit, but the fenced closure references it.
             auth_exc = exc
 
             def write_auth_raised(locked: RemoteTask) -> None:
+                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="AUTH_FAILURE",
@@ -304,9 +304,8 @@ class RemoteWorker:
             return
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
-            self.circuit.record_failure()
-
             def write_retryable(locked: RemoteTask) -> None:
+                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="RETRYABLE",
@@ -330,9 +329,8 @@ class RemoteWorker:
 
         if result.status == EntityLookupStatus.AUTH_FAILURE:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
-            self.circuit.record_failure()
-
             def write_auth(locked: RemoteTask) -> None:
+                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="AUTH_FAILURE",
@@ -366,7 +364,6 @@ class RemoteWorker:
             # (F-10): a malformed request must not burn a remote calculation. We
             # record the attempt — preserving the real http_status + raw body —
             # surface it, and schedule a retry, but NEVER call ``_submit_batch``.
-            self.circuit.record_failure()
             classification = (
                 "PERMANENT"
                 if result.status == EntityLookupStatus.PERMANENT_ERROR
@@ -374,6 +371,7 @@ class RemoteWorker:
             )
 
             def write_permanent(locked: RemoteTask) -> None:
+                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification=classification,
@@ -397,12 +395,11 @@ class RemoteWorker:
                 fanout.mark_items_delayed(task.inchikey)
             return
 
-        self.circuit.record_success()
-
         if result.status == EntityLookupStatus.FOUND and result.raw_json is not None:
             norm = self.provider.parse_result(result.raw_json)
 
             def write_found(locked: RemoteTask) -> None:
+                self.circuit.record_success()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="FOUND",
@@ -444,6 +441,7 @@ class RemoteWorker:
             structure = self._structure_for(task)
 
             def write_miss(locked: RemoteTask) -> None:
+                self.circuit.record_success()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification=str(result.status),
@@ -471,6 +469,7 @@ class RemoteWorker:
         # Unexpected/unmapped status with circuit success recorded: surface it as a
         # protocol error rather than silently submitting or dropping the task.
         def write_unexpected(locked: RemoteTask) -> None:
+            self.circuit.record_success()
             self._record_attempt(
                 RemoteAttempt.OPERATION_ENTITY,
                 classification="PROTOCOL_ERROR",
@@ -1056,12 +1055,13 @@ class RemoteWorker:
         reservations (R-01) MUST be released too — otherwise a legitimate retry of
         a member that merely hit a retryable submit error could never re-POST.
         """
-        submission.state = SubmissionState.FAILED
-        submission.detail = detail
-        submission.save(update_fields=["state", "detail", "updated_at"])
-        RemoteWorker._release_submission_members(
-            submission, reason="submission_failed"
-        )
+        with transaction.atomic():
+            submission.state = SubmissionState.FAILED
+            submission.detail = detail
+            submission.save(update_fields=["state", "detail", "updated_at"])
+            RemoteWorker._release_submission_members(
+                submission, reason="submission_failed"
+            )
 
     def _record_attempt(
         self,
@@ -1491,27 +1491,34 @@ class RemoteWorker:
 
     def _complete_query_if_terminal(self, query: RemoteQuery) -> None:
         """Flip the query to COMPLETE only when no member remains non-terminal."""
-        pending_exists = query.items.exclude(
-            apply_state__in=[
-                RemoteQueryItemApplyState.APPLIED,
-                RemoteQueryItemApplyState.MISMATCH,
-                RemoteQueryItemApplyState.FAILED,
-            ]
-        ).exists()
-        if pending_exists:
-            return
-        query.refresh_from_db(fields=["state"])
-        if query.state == QueryState.COMPLETE and query.completed_at is not None:
-            return
-        query.state = QueryState.COMPLETE
-        query.completed_at = timezone.now()
-        query.save(update_fields=["state", "completed_at"])
-        # Every member reached a terminal apply state, so the submission(s)
-        # backing this query no longer need to hold their per-member
-        # reservations (R-01): release them so future work for the same key can
-        # submit again.
-        for submission in query.submissions.all():
-            self._release_submission_members(submission, reason="query_complete")
+        terminal_states = [
+            RemoteQueryItemApplyState.APPLIED,
+            RemoteQueryItemApplyState.MISMATCH,
+            RemoteQueryItemApplyState.FAILED,
+        ]
+        with transaction.atomic():
+            locked_query = RemoteQuery.objects.select_for_update().get(pk=query.pk)
+            pending_exists = locked_query.items.exclude(
+                apply_state__in=terminal_states
+            ).exists()
+            if pending_exists:
+                return
+            if (
+                locked_query.state == QueryState.COMPLETE
+                and locked_query.completed_at is not None
+            ):
+                return
+            locked_query.state = QueryState.COMPLETE
+            locked_query.completed_at = timezone.now()
+            locked_query.save(update_fields=["state", "completed_at"])
+            query.state = locked_query.state
+            query.completed_at = locked_query.completed_at
+            # Every member reached a terminal apply state, so the submission(s)
+            # backing this query no longer need to hold their per-member
+            # reservations (R-01): release them in the same transaction that
+            # marks the query complete, avoiding stranded active reservations.
+            for submission in locked_query.submissions.all():
+                self._release_submission_members(submission, reason="query_complete")
 
     def _member_claim(
         self, member: RemoteTask, claim: queue.TaskClaim
