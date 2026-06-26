@@ -97,6 +97,11 @@ def test_query_submit_success_requires_present_query_id():
         _wishart_with_json(201, {}).submit_structures([(IK_A, "CCO")])
 
 
+def test_query_submit_success_rejects_oversized_query_id():
+    with pytest.raises(AmbiguousSubmissionError, match="at most"):
+        _wishart_with_json(201, {"id": "q" * 513}).submit_structures([(IK_A, "CCO")])
+
+
 def test_query_poll_success_rejects_unknown_classification_status():
     raw = {"classification_status": "Banana", "entities": [build_raw(IK_A)]}
 

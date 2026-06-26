@@ -24,6 +24,8 @@ class QueryPollContractStatus(StrEnum):
 _ENTITY_SLOT_KEYS = ("kingdom", "superclass", "class", "subclass", "direct_parent")
 _INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
 _COMPLETE_STATUSES = frozenset({"done", "complete", "completed"})
+MAX_REMOTE_QUERY_ID_LENGTH = 512
+
 _RUNNING_STATUSES = frozenset(
     {
         "in progress",
@@ -101,6 +103,10 @@ def validate_query_submit_payload(payload: Any) -> tuple[dict[str, Any], str]:
     remote_query_id = str(query_id).strip()
     if not remote_query_id:
         raise ProviderContractError("query id must not be empty")
+    if len(remote_query_id) > MAX_REMOTE_QUERY_ID_LENGTH:
+        raise ProviderContractError(
+            f"query id must be at most {MAX_REMOTE_QUERY_ID_LENGTH} characters"
+        )
     return raw, remote_query_id
 
 

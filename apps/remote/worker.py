@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from typing import Protocol
 
 from django.conf import settings
-from django.db import IntegrityError, transaction
+from django.db import DataError, IntegrityError, transaction
 from django.utils import timezone
 
 from apps.classifications.result_writer import write_live_result
@@ -864,26 +864,57 @@ class RemoteWorker:
         poll_at = timezone.now() + timedelta(
             seconds=settings.REMOTE_POLL_MIN_SECONDS
         )
-        with transaction.atomic():
-            query = RemoteQuery.objects.create(
-                remote_query_id=submit.remote_query_id,
-                payload_hash=payload_hash,
-                state=QueryState.SUBMITTED,
-                next_poll_at=poll_at,
-                # True send time (F-18): the moment just before this POST, not now.
-                submitted_at=submission.request_started_at or timezone.now(),
+        try:
+            with transaction.atomic():
+                query = RemoteQuery.objects.create(
+                    remote_query_id=submit.remote_query_id,
+                    payload_hash=payload_hash,
+                    state=QueryState.SUBMITTED,
+                    next_poll_at=poll_at,
+                    # True send time (F-18): the moment just before this POST, not now.
+                    submitted_at=submission.request_started_at or timezone.now(),
+                )
+                submission.state = SubmissionState.SUBMITTED
+                submission.query = query
+                submission.remote_query_id = submit.remote_query_id
+                submission.save(
+                    update_fields=["state", "query", "remote_query_id", "updated_at"]
+                )
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_SUBMIT,
+                    classification="SUCCESS",
+                    raw_payload=submit.raw_json,
+                    query=query,
+                    http_status=submit.http_status,
+                    remote_query_id=submit.remote_query_id,
+                    task=representative,
+                    submission=submission,
+                    request_inchikey=representative.inchikey,
+                    request_payload_hash=payload_hash,
+                    request_structure_hash=structure_hash_by_key[representative.inchikey],
+                    raw_body_text=submit.raw_text,
+                    safe_headers=submit.safe_headers,
+                )
+                for member in members:
+                    RemoteQueryItem.objects.get_or_create(
+                        query=query,
+                        task=member,
+                        defaults={
+                            "compound": member.compound,
+                            "inchikey": member.inchikey,
+                        },
+                    )
+        except (IntegrityError, DataError) as exc:
+            detail = (
+                "provider returned a remote query id that could not be persisted; "
+                "automatic re-submit is blocked"
             )
-            submission.state = SubmissionState.SUBMITTED
-            submission.query = query
-            submission.remote_query_id = submit.remote_query_id
-            submission.save(
-                update_fields=["state", "query", "remote_query_id", "updated_at"]
-            )
+            logger.error("remote submit persistence failure: %s", exc)
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
-                classification="SUCCESS",
+                classification="UNKNOWN_ACCEPTANCE",
                 raw_payload=submit.raw_json,
-                query=query,
+                detail=f"{detail}: {exc}",
                 http_status=submit.http_status,
                 remote_query_id=submit.remote_query_id,
                 task=representative,
@@ -894,15 +925,16 @@ class RemoteWorker:
                 raw_body_text=submit.raw_text,
                 safe_headers=submit.safe_headers,
             )
+            submission.state = SubmissionState.UNKNOWN
+            submission.remote_query_id = submit.remote_query_id
+            submission.detail = detail
+            submission.save(
+                update_fields=["state", "remote_query_id", "detail", "updated_at"]
+            )
             for member in members:
-                RemoteQueryItem.objects.get_or_create(
-                    query=query,
-                    task=member,
-                    defaults={
-                        "compound": member.compound,
-                        "inchikey": member.inchikey,
-                    },
-                )
+                queue.defer_task(member, delay_seconds=self.lease_seconds)
+                fanout.mark_items_delayed(member.inchikey)
+            return
 
         # Step 2: park each member in POLL_WAIT, tolerating a per-member
         # LeaseLost. A member whose lease was stolen mid-batch is SKIPPED (left

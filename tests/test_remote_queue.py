@@ -1289,6 +1289,26 @@ def test_submit_writes_outbox_intent_and_links_query():
     assert submission.request_payload["query_type"] == "STRUCTURE"
 
 
+def test_duplicate_provider_query_id_parks_unknown_without_crashing():
+    job = _job()
+    comp = _compound(IK_A)
+    _item(job, IK_A, 0, compound=comp)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+    RemoteQuery.objects.create(remote_query_id="q-dup", payload_hash="existing")
+
+    provider = MockProvider(submit_query_ids=["q-dup"])
+    worker = _worker(provider)
+
+    assert worker.tick() is True
+
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == "UNKNOWN"
+    assert submission.remote_query_id == "q-dup"
+    assert RemoteQuery.objects.filter(remote_query_id="q-dup").count() == 1
+    assert RemoteAttempt.objects.filter(classification="UNKNOWN_ACCEPTANCE").exists()
+    assert RemoteTask.objects.get(inchikey=IK_A).state == TaskState.DEFERRED
+
+
 def test_crash_after_post_before_commit_does_not_double_submit(monkeypatch):
     # ACCEPTANCE (F-06): a crash AFTER the provider POST but BEFORE the local
     # commit must NOT cause a second POST on the next worker tick.
