@@ -404,6 +404,16 @@ class TestParseSdf:
         assert first["row_index"] == 0
         assert first.get("external_id") == "CPD-001"
 
+    def test_malformed_property_header_does_not_abort_iteration(self):
+        malformed_record = _SDF_RECORD.replace("> <EXTERNAL_ID>", "> <EXTERNAL_ID")
+        rows = list(parse_sdf(self._stream(_SDF_RECORD + malformed_record + _SDF_RECORD)))
+
+        assert len(rows) == 3
+        assert rows[0].get("external_id") == "CPD-001"
+        assert "external_id" not in rows[1]
+        assert rows[1]["row_index"] == 1
+        assert rows[2].get("external_id") == "CPD-001"
+
 
 # ---------------------------------------------------------------------------
 # No class-prediction API guard

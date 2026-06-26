@@ -178,7 +178,10 @@ def _extract_sdf_props(block: str) -> dict[str, str]:
         if stripped.startswith(">") and "<" in stripped:
             # e.g.  "> <EXTERNAL_ID>" or "> <EXTERNAL_ID>  (optional comment)"
             start = stripped.index("<") + 1
-            end = stripped.index(">", start)
+            end = stripped.find(">", start)
+            if end == -1:
+                current_prop = None
+                continue
             current_prop = stripped[start:end]
         elif current_prop is not None:
             if stripped:
