@@ -15,7 +15,7 @@ curl -fsS -H "X-Shared-Access-Token: ${shared}" "${base}/stats/" >/dev/null
 legacy_status="$(curl -sS -o /dev/null -w '%{http_code}' "${base}/api/jobs/00000000-0000-0000-0000-000000000000?secret=${job_secret}")"
 test "$legacy_status" != "200"
 
-submit_response="$(curl -fsS -H "Authorization: Bearer ${shared}" -F "file=@${upload_file};filename=${upload_name};type=text/csv" "${base}/api/jobs")"
+submit_response="$(curl -fsS -H "Authorization: Bearer ${shared}" -F "input_file=@${upload_file};filename=${upload_name};type=text/csv" "${base}/api/jobs")"
 job_id="$(printf '%s' "$submit_response" | python -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')"
 result_secret="$(printf '%s' "$submit_response" | python -c 'import json,sys; print(json.load(sys.stdin)["result_secret"])')"
 

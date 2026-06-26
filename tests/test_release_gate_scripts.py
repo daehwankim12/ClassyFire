@@ -59,6 +59,23 @@ def test_secret_route_exerciser_hits_sensitive_routes():
         "sentinel-upload-filename",
     ]:
         assert needle in script
+    assert '-F "input_file=@${upload_file};filename=${upload_name};type=text/csv"' in script
+    assert '-F "file=@${upload_file};filename=${upload_name};type=text/csv"' not in script
+
+
+def test_secret_route_exerciser_records_dynamic_secrets_for_log_scan():
+    script = Path("scripts/exercise_secret_routes.sh").read_text()
+    log_script = Path("scripts/check_proxy_logs_for_secrets.sh").read_text()
+
+    for needle in [
+        "CLASSYFIRE_SECRET_OUTPUT",
+        "printf '%s\\n' \"$result_secret\"",
+        "printf '%s\\n' \"$token\"",
+        "urllib.parse.quote",
+    ]:
+        assert needle in script
+    assert "--secret-file FILE" in log_script
+    assert 'if [ "${1:-}" = "--secret-file" ]; then' in log_script
 
 
 def test_secret_route_exerciser_does_not_follow_secure_cookie_redirect_locally():
