@@ -580,6 +580,39 @@ def test_partial_response_resolves_present_and_retries_absent(settings):
     )
 
 
+def test_surplus_query_entities_are_rejected_before_apply(settings):
+    # Provider-controlled surplus entities are malformed: the worker should not
+    # normalize/apply beyond the submitted batch members.
+    settings.REMOTE_BATCH_SIZE = 1
+    job = _job()
+    comp = _compound(IK_A)
+    _item(job, IK_A, 0, compound=comp)
+    queue.enqueue_task(IK_A, compound_id=comp.id)
+
+    response = build_query_response([build_raw(IK_A), build_raw(IK_B)])
+    provider = MockProvider(
+        submit_query_ids=["q-batch"],
+        poll_script={"q-batch": [response]},
+    )
+    worker = _worker(provider)
+    _drain_batch_query(provider, worker)
+
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state in {
+        TaskState.RETRY_WAIT,
+        TaskState.READY,
+        TaskState.DEFERRED,
+    }
+    assert task.attempt >= 1
+    assert not ClassyfireLive.objects.filter(inchikey=IK_A).exists()
+    assert BatchItem.objects.get(job=job, inchikey=IK_A).status == (
+        BatchItemStatus.REMOTE_DELAYED
+    )
+    assert RemoteQuery.objects.get(remote_query_id="q-batch").state != (
+        QueryState.COMPLETE
+    )
+
+
 def test_mismatch_key_in_batch_marks_offending_task(settings):
     # A batched task whose response entity carries a DIFFERENT key (but the key
     # IS present in the response, mapped to that slot) -> RESULT_KEY_MISMATCH for
@@ -603,8 +636,8 @@ def test_mismatch_key_in_batch_marks_offending_task(settings):
 
     real_parse = mock_mod.parse_wishart_results
 
-    def mismatched(raw):
-        norms = real_parse(raw)
+    def mismatched(raw, *, max_entities=None):
+        norms = real_parse(raw, max_entities=max_entities)
         out = []
         for n in norms:
             if n.inchikey == IK_B:

@@ -23,6 +23,7 @@ from apps.remote.provider import (
     NormalizedClassification,
     PollResult,
     PollStatus,
+    ProtocolProviderError,
     RetryableProviderError,
     SubmitResult,
 )
@@ -170,10 +171,10 @@ class MockProvider:
         return parse_wishart_payload(raw_json)
 
     def parse_results(
-        self, raw_json: dict[str, Any]
+        self, raw_json: dict[str, Any], *, max_entities: int | None = 25
     ) -> list[NormalizedClassification]:
         self.parse_calls += 1
-        return parse_wishart_results(raw_json)
+        return parse_wishart_results(raw_json, max_entities=max_entities)
 
 
 def _slot(raw: dict[str, Any], key: str) -> ChemOntSlot | None:
@@ -209,9 +210,9 @@ def parse_wishart_payload(raw_json: dict[str, Any]) -> NormalizedClassification:
 
 
 def parse_wishart_results(
-    raw_json: dict[str, Any],
+    raw_json: dict[str, Any], *, max_entities: int | None = 25
 ) -> list[NormalizedClassification]:
-    """Parse EVERY entity in a Wishart query response into a list.
+    """Parse bounded entities in a Wishart query response into a list.
 
     A completed /queries response wraps one classification per submitted
     structure under ``entities``; each is parsed independently so the worker can
@@ -221,11 +222,13 @@ def parse_wishart_results(
     """
     entities = raw_json.get("entities")
     if isinstance(entities, list):
-        return [
-            parse_wishart_payload(entity)
-            for entity in entities
-            if isinstance(entity, dict)
-        ]
+        dict_entities = [entity for entity in entities if isinstance(entity, dict)]
+        if max_entities is not None and len(dict_entities) > max_entities:
+            raise ProtocolProviderError(
+                "Wishart query response contained "
+                f"{len(dict_entities)} entities, expected at most {max_entities}"
+            )
+        return [parse_wishart_payload(entity) for entity in dict_entities]
     if raw_json:
         return [parse_wishart_payload(raw_json)]
     return []

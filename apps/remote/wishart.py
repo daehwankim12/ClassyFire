@@ -418,8 +418,9 @@ class WishartDirectProvider:
         return parse_wishart_payload(payload)
 
     def parse_results(
-        self, raw_json: dict[str, Any]
+        self, raw_json: dict[str, Any], *, max_entities: int | None = 25
     ) -> list[NormalizedClassification]:
         # A completed /queries response wraps one entity per submitted
-        # structure; parse EVERY entity so every batched task can be resolved.
-        return parse_wishart_results(raw_json)
+        # structure; parse only the expected bounded set so surplus provider
+        # entities are treated as malformed before normalization.
+        return parse_wishart_results(raw_json, max_entities=max_entities)

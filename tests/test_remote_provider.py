@@ -123,6 +123,14 @@ def test_mock_parse_results_empty_response():
     assert provider.parse_results(build_query_response([])) == []
 
 
+def test_mock_parse_results_rejects_surplus_entities_before_normalizing():
+    provider = MockProvider()
+    raw = build_query_response([build_raw(IK_A), build_raw(IK_B)])
+
+    with pytest.raises(ProtocolProviderError, match="expected at most 1"):
+        provider.parse_results(raw, max_entities=1)
+
+
 # ---------------------------------------------------------------------------
 # WishartDirectProvider HTTP outcome classification (httpx MockTransport)
 # ---------------------------------------------------------------------------

@@ -1436,8 +1436,6 @@ class RemoteWorker:
         ``task`` (the one we polled with) is resolved on the same footing as its
         batch siblings via the RemoteQueryItem set.
         """
-        results = self.provider.parse_results(raw)
-
         # Members in deterministic submit order (== the order entities arrive).
         members: list[RemoteTask] = []
         seen_task_ids: set[int] = set()
@@ -1451,6 +1449,19 @@ class RemoteWorker:
         # RemoteQueryItem link was severed (SET_NULL).
         if task.id not in seen_task_ids:
             members.append(task)
+
+        max_entities = min(len(members), settings.REMOTE_BATCH_SIZE)
+        try:
+            results = self.provider.parse_results(raw, max_entities=max_entities)
+        except ProtocolProviderError as exc:
+            logger.error(
+                "remote query malformed for %s: %s", query.remote_query_id, exc
+            )
+            self.circuit.record_failure()
+            for member in members:
+                self._dispatch_member(claim, member, query, None)
+            self._complete_query_if_terminal(query)
+            return
 
         if len(results) == len(members):
             # Clean one-entity-per-task response: pair positionally and validate
