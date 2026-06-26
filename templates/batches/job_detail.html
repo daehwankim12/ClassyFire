@@ -10,18 +10,7 @@
 {% if job.completed_at %}<p><strong>Completed:</strong> {{ job.completed_at }}</p>{% endif %}
 
 <h2>Progress</h2>
-<table>
-  <tr><th>Total</th><th>Completed</th><th>Local hits</th><th>Seed hits</th><th>Pending</th><th>Need structure</th><th>Invalid</th></tr>
-  <tr>
-    <td>{{ job.total_count }}</td>
-    <td>{{ job.completed_count }}</td>
-    <td>{{ job.local_hit_count }}</td>
-    <td>{{ job.seed_hit_count }}</td>
-    <td>{{ blocking_pending_count }}</td>
-    <td>{{ job.need_structure_count }}</td>
-    <td>{{ job.invalid_count }}</td>
-  </tr>
-</table>
+{% include "batches/progress.html" %}
 
 {% if remote_delayed_breakdown %}
 <section class="remote-delay-summary">

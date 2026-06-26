@@ -104,3 +104,90 @@ button:hover, input[type="submit"]:hover {
 .pagination a {
   margin: 0 0.3rem;
 }
+
+/* ── Job progress bar ─────────────────────────────────────────────────────── */
+.job-progress {
+  margin-bottom: 1.25rem;
+}
+
+.job-progress__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  margin-bottom: 0.4rem;
+}
+
+.job-progress__count {
+  font-size: 1.05rem;
+}
+
+.job-progress__pct {
+  color: #2c5f8a;
+  font-weight: 600;
+}
+
+.job-progress__eta {
+  margin-left: auto;
+  color: #555;
+  font-size: 0.9rem;
+}
+
+.job-progress__bar {
+  display: flex;
+  height: 1.25rem;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #e8eff6;
+  border: 1px solid #cbd8e6;
+}
+
+.job-progress__bar .seg {
+  display: block;
+  height: 100%;
+  transition: width 0.4s ease;
+}
+
+.seg--done { background: #2e7d32; }
+.seg--needs { background: #f9a825; }
+.seg--invalid { background: #e53935; }
+.seg--pending {
+  background: repeating-linear-gradient(
+    45deg, #c3cfdb, #c3cfdb 8px, #d8e0e8 8px, #d8e0e8 16px);
+}
+
+.job-progress__legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0;
+  margin: 0.5rem 0 0;
+}
+
+.job-progress__legend .chip {
+  display: inline-block;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  color: #fff;
+  white-space: nowrap;
+}
+
+.chip--done { background: #2e7d32; }
+.chip--needs { background: #f9a825; color: #222; }
+.chip--invalid { background: #e53935; }
+.chip--pending { background: #6b7c8e; }
+
+/* Wide results table scrolls horizontally instead of breaking the layout. */
+#job-items-table {
+  overflow-x: auto;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  main { padding: 0 0.6rem; }
+  table { font-size: 0.85rem; }
+  th, td { padding: 0.3rem 0.4rem; }
+  .job-progress__eta { margin-left: 0; width: 100%; }
+}

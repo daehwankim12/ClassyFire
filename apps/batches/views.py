@@ -21,6 +21,7 @@ from django.http import HttpRequest, HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 
 from apps.batches.models import BatchItem, BatchJob
+from apps.batches.progress import build_job_progress
 from apps.batches.remote_delay import (
     REMOTE_DELAYED_DEFAULT_MESSAGE,
     build_remote_delayed_breakdown,
@@ -219,6 +220,7 @@ def job_detail_view(
             "search": search,
             "job_complete": job_complete,
             "blocking_pending_count": blocking_pending_count,
+            "progress": build_job_progress(job),
             "remote_delayed_breakdown": remote_delayed_breakdown,
             "remote_delayed_count": remote_delayed_count,
             "remote_delayed_default_message": REMOTE_DELAYED_DEFAULT_MESSAGE,
@@ -308,6 +310,42 @@ def item_table_partial_view(
             "job_complete": job_complete,
             "blocking_pending_count": blocking_pending_count,
             "remote_delayed_default_message": REMOTE_DELAYED_DEFAULT_MESSAGE,
+        },
+    )
+
+
+def job_progress_partial_view(
+    request: HttpRequest,
+    job_id: str,
+    secret: str | None = None,
+) -> HttpResponse:
+    """GET /jobs/{uuid}/progress or /jobs/{uuid}/{secret}/progress — HTMX fragment.
+
+    Returns the self-polling progress bar. It re-renders its own ``hx-trigger``
+    only while the job is still processing, so polling stops automatically once
+    the job is complete. Auth mirrors the item-table partial: a secret in the
+    path is exchanged for the job-access cookie; otherwise the cookie is required.
+    """
+    job = get_object_or_404(BatchJob, pk=job_id)
+    if secret is not None:
+        if not check_password(secret, job.secret_hash):
+            return HttpResponseForbidden("Invalid secret.")
+        return _redirect_with_job_access_cookie(
+            request, job, f"/jobs/{job.pk}/progress"
+        )
+
+    if not _has_job_access(request, job, secret):
+        return HttpResponseForbidden("Invalid secret.")
+
+    job.refresh_from_db()
+    return render(
+        request,
+        "batches/progress.html",
+        {
+            "job": job,
+            "secret": secret,
+            "secretless": secret is None,
+            "progress": build_job_progress(job),
         },
     )
 
