@@ -28,47 +28,20 @@ class PostgresClassificationLookupBackend:
     """Current lookup backend backed by the existing PostgreSQL tables/views."""
 
     def lookup_one(self, inchikey: str) -> ClassificationLookupResult | None:
-        from apps.classifications.selectors import (
-            get_live_classification,
-            get_seed_classification,
-        )
-        from apps.classifications.services import (
-            _live_row_to_result,
-            _seed_row_to_result,
-        )
+        from apps.classifications.selectors import get_current_classification
+        from apps.classifications.services import _current_row_to_result
 
-        row = get_live_classification(inchikey)
-        if row is not None:
-            return _live_row_to_result(row)
-
-        row = get_seed_classification(inchikey)
-        if row is not None:
-            return _seed_row_to_result(row)
-
-        return None
+        row = get_current_classification(inchikey)
+        if row is None:
+            return None
+        return _current_row_to_result(row)
 
     def lookup_many(
         self,
         inchikeys: list[str],
     ) -> dict[str, ClassificationLookupResult]:
-        from apps.classifications.selectors import (
-            get_live_classifications,
-            get_seed_classifications,
-        )
-        from apps.classifications.services import (
-            _live_row_to_result,
-            _seed_row_to_result,
-        )
+        from apps.classifications.selectors import get_current_classifications
+        from apps.classifications.services import _current_row_to_result
 
-        live = get_live_classifications(inchikeys)
-        out: dict[str, ClassificationLookupResult] = {
-            key: _live_row_to_result(row) for key, row in live.items()
-        }
-
-        seed_needed = [key for key in inchikeys if key not in out]
-        if seed_needed:
-            seed = get_seed_classifications(seed_needed)
-            for key, row in seed.items():
-                out[key] = _seed_row_to_result(row)
-
-        return out
+        rows = get_current_classifications(inchikeys)
+        return {key: _current_row_to_result(row) for key, row in rows.items()}

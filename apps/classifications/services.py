@@ -188,6 +188,18 @@ def _seed_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
     )
 
 
+def _current_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
+    """Map one ``classyfire_current`` view row to a result.
+
+    The view emits a ``tier`` discriminator ('live' | 'seed'); we dispatch to the
+    existing per-tier converters so the public result is identical to the former
+    two-query (live-then-seed) path.
+    """
+    if row.get("tier") == "live":
+        return _live_row_to_result(row)
+    return _seed_row_to_result(row)
+
+
 def lookup_current_classification(inchikey: str) -> ClassificationLookupResult | None:
     """Look up classification for an exact 27-char InChIKey.
 
