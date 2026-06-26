@@ -98,3 +98,48 @@ def test_entity_400_does_not_trigger_submit(entity_error_harness):
     assert provider.submit_calls == 0
     attempt = RemoteAttempt.objects.latest("id")
     assert attempt.http_status == 400
+
+
+@pytest.mark.django_db(transaction=True)
+def test_entity_422_is_terminal_invalid_input_not_retry_or_circuit(entity_error_harness):
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.core.enums import BatchItemStatus, CircuitState, TaskState
+    from apps.remote.circuit import DbCircuitBreaker
+    from apps.remote.models import RemoteCircuit, RemoteTask
+
+    provider = entity_error_harness.provider_for_status(422, body="bad entity request")
+    comp = entity_error_harness._compound()
+    job = BatchJob.objects.create(secret_hash="permanent-entity", total_count=1)
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=entity_error_harness.inchikey,
+        inchikey=entity_error_harness.inchikey,
+        compound=comp,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    queue.enqueue_task(entity_error_harness.inchikey, compound_id=comp.id)
+    circuit = DbCircuitBreaker(failure_threshold=1)
+
+    RemoteWorker(
+        provider,
+        worker_id="w-perm-terminal",
+        rate_limiter=RateLimiter(1000, 1000),
+        circuit=circuit,
+    ).tick()
+
+    task = RemoteTask.objects.get(inchikey=entity_error_harness.inchikey)
+    task.refresh_from_db()
+    item.refresh_from_db()
+    circuit_row = RemoteCircuit.objects.get(provider="wishart")
+    attempt = RemoteAttempt.objects.latest("id")
+
+    assert provider.submit_calls == 0
+    assert task.state == TaskState.DONE
+    assert task.attempt == 0
+    assert item.status == BatchItemStatus.INVALID_INPUT
+    assert attempt.classification == "PERMANENT"
+    assert attempt.http_status == 422
+    assert attempt.raw_body_text == "bad entity request"
+    assert circuit_row.state == CircuitState.CLOSED
+    assert circuit_row.consecutive_failures == 0

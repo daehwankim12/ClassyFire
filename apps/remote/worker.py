@@ -9,6 +9,7 @@ flow against the swappable :class:`~apps.remote.provider.Provider`:
    * MISS + structure → submit a /queries batch (up to ``REMOTE_BATCH_SIZE``),
      record a RemoteQuery, park the task in POLL_WAIT.
    * MISS, no structure → fan-out waiting items to NEED_STRUCTURE + DONE.
+   * PERMANENT_ERROR → fan-out waiting items to INVALID_INPUT + DONE.
    * RETRYABLE_ERROR → backoff (honour Retry-After) and circuit-record.
 2. For SUBMITTED/POLL_WAIT tasks resumed at their poll window, ``poll_query``:
    * RUNNING  → re-park POLL_WAIT.
@@ -357,27 +358,43 @@ class RemoteWorker:
                 fanout.mark_items_delayed(task.inchikey)
             return
 
-        if result.status in (
-            EntityLookupStatus.PROTOCOL_ERROR,
-            EntityLookupStatus.PERMANENT_ERROR,
-        ):
-            # PERMANENT_ERROR (a definite non-404 4xx — bad key / 400 / 422) and
-            # PROTOCOL_ERROR (an unmapped/structurally-broken response) are both
-            # non-miss outcomes that must NEVER escalate to a structure submit
-            # (F-10): a malformed request must not burn a remote calculation. We
-            # record the attempt — preserving the real http_status + raw body —
-            # surface it, and schedule a retry, but NEVER call ``_submit_batch``.
-            classification = (
-                "PERMANENT"
-                if result.status == EntityLookupStatus.PERMANENT_ERROR
-                else "PROTOCOL_ERROR"
-            )
-
+        if result.status == EntityLookupStatus.PERMANENT_ERROR:
+            # A definite non-404 4xx (bad key / 400 / 422) is a terminal input
+            # failure, not provider instability: do not submit a calculation, do
+            # not burn retry attempts, and do not trip the shared circuit breaker.
             def write_permanent(locked: RemoteTask) -> None:
+                self._record_attempt(
+                    RemoteAttempt.OPERATION_ENTITY,
+                    classification="PERMANENT",
+                    raw_payload=result.raw_json,
+                    http_status=result.http_status,
+                    detail=result.detail,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                    raw_body_text=result.raw_text,
+                    safe_headers=result.safe_headers,
+                )
+                fanout.fan_out_result(locked.inchikey, BatchItemStatus.INVALID_INPUT)
+                queue.finish_task(locked)
+
+            if self._with_owned_claim(claim, write_permanent):
+                logger.warning(
+                    "remote entity permanent input error for %s: %s",
+                    task.inchikey,
+                    result.detail,
+                )
+            return
+
+        if result.status == EntityLookupStatus.PROTOCOL_ERROR:
+            # Unmapped/structurally-broken provider responses are not a cache miss
+            # and must never escalate to a structure submit. Unlike definite 4xx
+            # input failures above, keep treating these as provider failures that
+            # may be resolved by an upstream fix or deploy rollback.
+            def write_protocol_error(locked: RemoteTask) -> None:
                 self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
-                    classification=classification,
+                    classification="PROTOCOL_ERROR",
                     raw_payload=result.raw_json,
                     http_status=result.http_status,
                     detail=result.detail,
@@ -388,10 +405,9 @@ class RemoteWorker:
                 )
                 queue.schedule_retry(locked)
 
-            if self._with_owned_claim(claim, write_permanent):
+            if self._with_owned_claim(claim, write_protocol_error):
                 logger.error(
-                    "remote entity %s for %s: %s",
-                    classification,
+                    "remote entity PROTOCOL_ERROR for %s: %s",
                     task.inchikey,
                     result.detail,
                 )
