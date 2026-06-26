@@ -62,6 +62,7 @@ MAX_SDF_PROPERTY_LEN: int = 10_000  # bytes per SDF property value
 MAX_DECOMPRESSION_RATIO: float = 100.0  # reject if expanded > N x compressed
 
 SHARED_ACCESS_SESSION_KEY = "shared_access_authenticated"
+SHARED_ACCESS_PRINCIPAL_SESSION_KEY = "shared_access_principal"
 JOB_ACCESS_COOKIE_PREFIX = "cf_job_access_"
 JOB_ACCESS_COOKIE_SALT = "classyfire-job-access"
 
@@ -89,6 +90,11 @@ def _shared_access_token_from_request(request: HttpRequest) -> tuple[str, str] |
     if token:
         return "shared-token", token
     return None
+
+
+def _shared_access_principal_for_token(token: str) -> str:
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
+    return f"shared-access:{digest}"
 
 
 def _check_bearer(request: HttpRequest) -> bool:
@@ -233,6 +239,9 @@ def authenticate_shared_password(request: HttpRequest, password: str) -> bool:
     else:
         request.session.cycle_key()
     request.session[SHARED_ACCESS_SESSION_KEY] = True
+    request.session[SHARED_ACCESS_PRINCIPAL_SESSION_KEY] = (
+        _shared_access_principal_for_token(password)
+    )
     clear_shared_access_login_failures(request)
     return True
 
@@ -444,13 +453,13 @@ def _principal(request: HttpRequest) -> str:
         return f"user:{request.user.pk}"
     token_info = _shared_access_token_from_request(request)
     if token_info is not None and _check_bearer(request):
-        token_kind, token = token_info
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
-        return f"{token_kind}:{digest}"
+        return _shared_access_principal_for_token(token_info[1])
     if hasattr(request, "session") and request.session.get(SHARED_ACCESS_SESSION_KEY) is True:
-        session_key = request.session.session_key or "unsaved"
-        digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
-        return f"session:{digest}"
+        principal = request.session.get(SHARED_ACCESS_PRINCIPAL_SESSION_KEY)
+        if isinstance(principal, str) and principal.startswith("shared-access:"):
+            return principal
+        digest = hashlib.sha256(_get_shared_hash().encode("utf-8")).hexdigest()[:32]
+        return f"shared-access-session:{digest}"
     ip_digest = hashlib.sha256(_client_ip(request).encode("utf-8")).hexdigest()[:32]
     return f"ip:{ip_digest}"
 

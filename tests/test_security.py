@@ -1081,7 +1081,46 @@ class TestSecurityImplementationGuards:
         )
 
         with override_settings(SHARED_ACCESS_PASSWORD_HASH=make_password("correct")):
-            assert _principal(request).startswith("session:")
+            assert _principal(request).startswith("shared-access-session:")
+
+    def test_shared_access_principal_canonicalizes_bearer_whitespace(self) -> None:
+        from django.contrib.auth.hashers import make_password
+        from django.test import RequestFactory
+
+        from apps.core.security import _principal
+
+        factory = RequestFactory()
+        compact = factory.post("/api/jobs", HTTP_AUTHORIZATION="Bearer correct")
+        padded = factory.post("/api/jobs", HTTP_AUTHORIZATION="Bearer    correct")
+
+        with override_settings(SHARED_ACCESS_PASSWORD_HASH=make_password("correct")):
+            assert _principal(compact) == _principal(padded)
+            assert _principal(compact).startswith("shared-access:")
+
+    def test_shared_access_session_principal_survives_session_rotation(self) -> None:
+        from django.contrib.auth.hashers import make_password
+        from django.test import RequestFactory
+
+        from apps.core.security import (
+            SHARED_ACCESS_PRINCIPAL_SESSION_KEY,
+            SHARED_ACCESS_SESSION_KEY,
+            _principal,
+        )
+
+        principal = "shared-access:stable"
+        first = RequestFactory().post("/api/jobs")
+        first.session = {
+            SHARED_ACCESS_SESSION_KEY: True,
+            SHARED_ACCESS_PRINCIPAL_SESSION_KEY: principal,
+        }
+        second = RequestFactory().post("/api/jobs")
+        second.session = {
+            SHARED_ACCESS_SESSION_KEY: True,
+            SHARED_ACCESS_PRINCIPAL_SESSION_KEY: principal,
+        }
+
+        with override_settings(SHARED_ACCESS_PASSWORD_HASH=make_password("correct")):
+            assert _principal(first) == _principal(second) == principal
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(INGEST_DEFER_HEAVY_PROCESSING=False)
