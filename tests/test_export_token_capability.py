@@ -141,17 +141,17 @@ def test_download_expired_token_404() -> None:
 def test_query_secret_no_longer_authenticates_shared_access() -> None:
     job, secret = _create_simple_job()
 
-    # ONLY ?secret= in the query string, no header/bearer/cookie. The query
-    # fallback in _job_secret_from_request is gone, and api._job_secret rejects
-    # query secrets — so the shared-access gate denies the request.
+    # ONLY ?secret= in the query string, no header/bearer/cookie. The
+    # query fallback is gone, and api._job_secret rejects query secrets — so the
+    # shared-access gate denies the request.
     query_resp = Client().get(f"/api/jobs/{job.pk}?secret={secret}")
     assert query_resp.status_code in (400, 401, 403), (
         f"Query-string secret must NOT authenticate a job-scoped route, "
         f"got {query_resp.status_code}"
     )
 
-    # The same secret via the X-Job-Secret header authenticates (plus a bearer to
-    # clear the shared-access gate in SECURE mode).
+    # The same secret via the X-Job-Secret header authorizes the job-scoped
+    # response only after a bearer clears the shared-access gate in SECURE mode.
     header_resp = Client().get(
         f"/api/jobs/{job.pk}",
         HTTP_X_JOB_SECRET=secret,

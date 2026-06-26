@@ -112,44 +112,13 @@ def _check_bearer(request: HttpRequest) -> bool:
     return bool(check_password(token, stored_hash))
 
 
-def _job_secret_from_request(request: HttpRequest) -> str:
-    """Return the per-job secret from the X-Job-Secret header only.
-
-    Query-string secrets (``?secret=``) are NOT accepted: a secret in the URL
-    leaks into access logs, browser history, and Referer headers. This is the
-    single chokepoint feeding ``_check_job_secret`` / ``_is_authenticated`` /
-    ``request_has_shared_access`` / ``require_csrf_for_cookie_auth``, so dropping
-    the query fallback here removes query-secret acceptance from EVERY job-scoped
-    route at once.
-    """
-    return request.headers.get("X-Job-Secret", "")
-
-
-def _check_job_secret(request: HttpRequest, job_id: object | None) -> bool:
-    if job_id is None:
-        return False
-    secret = _job_secret_from_request(request)
-    if not secret:
-        return False
-
-    from apps.batches.models import BatchJob
-
-    job = BatchJob.objects.filter(pk=str(job_id)).only("secret_hash").first()
-    if job is None:
-        return False
-    return bool(check_password(secret, job.secret_hash))
-
-
 def _is_authenticated(request: HttpRequest, job_id: str | None = None) -> bool:
     """Return True if the request carries valid credentials."""
     if _is_dev_open():
         return True
 
-    if job_id is not None:
-        if request_has_job_access_cookie(request, job_id):
-            return True
-        if _check_job_secret(request, job_id):
-            return True
+    if job_id is not None and request_has_job_access_cookie(request, job_id):
+        return True
 
     if _check_bearer(request):
         return True
@@ -190,8 +159,7 @@ def require_csrf_for_cookie_auth(view_func: Callable) -> Callable:
     def wrapper(request: HttpRequest, *args, **kwargs):
         if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
             return view_func(request, *args, **kwargs)
-        job_id = _job_id_from_view_kwargs(kwargs)
-        if _is_dev_open() or _check_bearer(request) or _check_job_secret(request, job_id):
+        if _is_dev_open() or _check_bearer(request):
             return view_func(request, *args, **kwargs)
 
         csrf = CsrfViewMiddleware(lambda _request: HttpResponse())
@@ -249,24 +217,6 @@ def authenticate_shared_password(request: HttpRequest, password: str) -> bool:
 def request_has_shared_access(request: HttpRequest, job_id: object | None = None) -> bool:
     """Return True when request carries app-level or job-cookie credentials."""
     return _is_authenticated(request, str(job_id) if job_id is not None else None)
-
-
-def _job_id_from_view_kwargs(kwargs: dict[str, object]) -> object | None:
-    job_id = kwargs.get("job_id")
-    if job_id is not None:
-        return job_id
-
-    item_id = kwargs.get("item_id")
-    if item_id is None:
-        return None
-
-    from apps.batches.models import BatchItem
-
-    return (
-        BatchItem.objects.filter(pk=str(item_id))
-        .values_list("job_id", flat=True)
-        .first()
-    )
 
 
 def throttle_key_for_ip(ip_address: str) -> str:

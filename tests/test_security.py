@@ -1251,7 +1251,7 @@ class TestXJobSecretHeader:
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
-    def test_job_secret_header_allows_job_status_without_shared_bearer(self) -> None:
+    def test_job_secret_header_does_not_bypass_shared_access_for_job_status(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client(enforce_csrf_checks=True)
@@ -1261,11 +1261,11 @@ class TestXJobSecretHeader:
             HTTP_X_JOB_SECRET=secret,
         )
 
-        assert response.status_code == 200, response.content
+        assert response.status_code == 401, response.content
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
-    def test_job_secret_header_allows_export_without_shared_bearer(self) -> None:
+    def test_job_secret_header_does_not_bypass_shared_access_for_export(self) -> None:
         rows = list(parse_text_input(ASPIRIN_SMILES))
         job, secret = create_job(rows, remote_enabled=False)
         client = Client(enforce_csrf_checks=True)
@@ -1277,7 +1277,7 @@ class TestXJobSecretHeader:
             HTTP_X_JOB_SECRET=secret,
         )
 
-        assert response.status_code == 201, response.content
+        assert response.status_code == 401, response.content
 
     @pytest.mark.django_db(transaction=True)
     @override_settings(SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH)
