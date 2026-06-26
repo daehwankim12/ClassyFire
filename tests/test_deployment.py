@@ -76,6 +76,34 @@ def test_dockerfile_uses_uv_locked_runtime_install():
     assert '".[dev]"' not in dockerfile
 
 
+def test_dockerfile_pins_postgres_client_major_to_compose_db():
+    dockerfile = read_file("Dockerfile")
+
+    assert "FROM postgres:16-bookworm AS pg-client" in dockerfile
+    for tool in ["pg_dump", "pg_restore", "psql"]:
+        assert (
+            f"COPY --from=pg-client /usr/lib/postgresql/16/bin/{tool}"
+            in dockerfile
+        )
+        assert f"{tool} --version" in dockerfile
+    assert "grep -q ' 16\\.'" in dockerfile
+
+
+def test_dockerfile_creates_runtime_writable_directories():
+    dockerfile = read_file("Dockerfile")
+
+    assert "mkdir -p" in dockerfile
+    for path in [
+        "/app/staticfiles",
+        "/app/media",
+        "/app/export_files",
+        "/app/source_artifacts",
+        "/app/uploads",
+    ]:
+        assert path in dockerfile
+    assert "chown -R appuser:appgroup /app" in dockerfile
+
+
 def test_db_no_external_network():
     compose = load_compose()
     db_networks = compose["services"]["db"]["networks"]

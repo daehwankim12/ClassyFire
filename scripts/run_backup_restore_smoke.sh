@@ -146,6 +146,7 @@ from django.utils import timezone
 from apps.batches.models import BatchJob, ExportArtifact
 from apps.batches.ingest import parse_text_input
 from apps.batches.services import create_job
+from apps.batches.exports import _compute_rows_signature
 
 rows = list(parse_text_input('${SMOKE_SMILES}'))
 job, secret = create_job(rows, remote_enabled=False)
@@ -159,7 +160,7 @@ export_path = export_dir / (token + '.csv')
 export_path.write_bytes(payload)
 
 checksum = hashlib.sha256(payload).hexdigest()
-rows_sig = hashlib.sha256(b'smoke').hexdigest()
+rows_sig = _compute_rows_signature(job)
 
 ExportArtifact.objects.create(
     job=job,
@@ -390,12 +391,9 @@ echo "==> smoke: Step 14 — verify export download via restore_smoke_test"
 POSTGRES_DB="${RESTORE_DB}" \
   python manage.py restore_smoke_test \
     --check-export-token "smoke-export-token" \
-    --export-dir "${RESTORE_EXPORT_DIR}" \
-  || {
-    echo "[smoke] NOTE: restore_smoke_test --check-export-token not yet supported; skipping HTTP check"
-  }
+    --export-dir "${RESTORE_EXPORT_DIR}"
 
-# Fallback: verify the export file itself was restored and contains expected bytes
+# Verify the export file itself was restored and contains expected bytes.
 EXPORT_FILE_NAME="smoke-export-token.csv"
 # Tar extracts into parent(RESTORE_EXPORT_DIR)/export_files/...
 RESTORED_EXPORT=$(find "${RESTORE_EXPORT_DIR}" -name "${EXPORT_FILE_NAME}" 2>/dev/null | head -1 || true)

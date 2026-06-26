@@ -7,7 +7,7 @@
 #
 # Environment variables available at runtime via `{env.VAR}` syntax:
 #   NGROK_DOMAIN  — the public hostname (e.g. myapp.ngrok-free.app)
-#   MAX_UPLOAD_MB — maximum body size for file uploads
+#   MAX_UPLOAD_MB — maximum body size for file uploads; defaults to 100
 # =============================================================================
 
 {env.NGROK_DOMAIN} {
@@ -15,7 +15,7 @@
     # ── Upload size limit ────────────────────────────────────────────────────
     # MAX_UPLOAD_MB defaults to 100 when the env var is unset.
     request_body {
-        max_size {env.MAX_UPLOAD_MB}mb
+        max_size {$MAX_UPLOAD_MB:100}mb
     }
 
     # ── Security headers ─────────────────────────────────────────────────────
@@ -51,6 +51,10 @@
         health_interval 30s
         health_timeout 5s
         health_status 200
+        health_headers {
+            Host {env.NGROK_DOMAIN}
+            X-Forwarded-Proto https
+        }
     }
 
     # Claim and legacy result/structure URLs carry one-time job secrets. Do
@@ -87,7 +91,15 @@
     # ── Logging ──────────────────────────────────────────────────────────────
     log {
         output stdout
-        format json
+        format filter {
+            wrap json
+            fields {
+                request>headers>Authorization delete
+                request>headers>Cookie delete
+                request>headers>X-Job-Secret delete
+                request>headers>X-Shared-Access-Token delete
+            }
+        }
         level INFO
     }
 }

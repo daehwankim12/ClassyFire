@@ -749,6 +749,35 @@ class TestResultUrlSecret:
         assert "itemLegacyStructureSecret" in content
         assert "^/items/[0-9]+/[^/]+/structure/?$" in content
 
+    def test_caddy_active_health_check_uses_prod_safe_headers(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "health_headers" in content
+        assert "Host {env.NGROK_DOMAIN}" in content
+        assert "X-Forwarded-Proto https" in content
+
+    def test_caddy_upload_limit_has_parseable_default(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "{$MAX_UPLOAD_MB:100}mb" in content
+        assert "{env.MAX_UPLOAD_MB}mb" not in content
+
+    def test_caddy_access_logs_drop_secret_bearing_headers(self) -> None:
+        caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"
+        content = caddyfile.read_text()
+
+        assert "format filter" in content
+        assert "wrap json" in content
+        for header in [
+            "request>headers>Authorization delete",
+            "request>headers>Cookie delete",
+            "request>headers>X-Job-Secret delete",
+            "request>headers>X-Shared-Access-Token delete",
+        ]:
+            assert header in content
+
 
 # ===========================================================================
 # 5. Production settings

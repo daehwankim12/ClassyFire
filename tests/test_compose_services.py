@@ -78,3 +78,48 @@ def test_uploads_volume_shared_between_web_and_ingest_worker():
     assert cleanup_upload_sources == ["uploads"], (
         f"cleanup must mount 'uploads' volume at /app/uploads; got: {cleanup_upload_sources}"
     )
+
+
+def test_app_owned_volumes_are_initialized_before_runtime_services():
+    """Named volumes mounted over absent image paths are root-owned by default.
+
+    The app runs as uid/gid 1001 and must be able to write upload/export/media
+    artifacts in production, so compose needs a root one-shot initializer before
+    app services start.
+    """
+    data = yaml.safe_load(Path("docker-compose.yml").read_text())
+    services = data["services"]
+    volume_init = services["volume-init"]
+
+    assert volume_init["restart"] == "no"
+    assert str(volume_init["user"]) == "0:0"
+    assert volume_init["network_mode"] == "none"
+
+    command = " ".join(volume_init["command"])
+    for path in [
+        "/app/staticfiles",
+        "/app/media",
+        "/app/export_files",
+        "/app/source_artifacts",
+        "/app/uploads",
+    ]:
+        assert path in command
+    assert "chown -R 1001:1001" in command
+
+    init_mounts = _volume_mounts(volume_init)
+    for volume, target in [
+        ("static_files", "/app/staticfiles"),
+        ("media_files", "/app/media"),
+        ("export_files", "/app/export_files"),
+        ("source_artifacts", "/app/source_artifacts"),
+        ("uploads", "/app/uploads"),
+    ]:
+        sources = [src for src, tgt, _ in init_mounts if tgt == target]
+        assert sources == [volume], f"{target} must be initialized from {volume}"
+
+    assert services["migrate"]["depends_on"]["volume-init"][
+        "condition"
+    ] == "service_completed_successfully"
+    assert services["backup"]["depends_on"]["volume-init"][
+        "condition"
+    ] == "service_completed_successfully"

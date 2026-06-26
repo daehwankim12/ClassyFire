@@ -10,7 +10,7 @@ trap 'rm -f "$upload_file" /tmp/export.json' EXIT
 printf 'id,smiles\nrow1,CCO\n' > "$upload_file"
 
 curl -fsS -H "Authorization: Bearer ${shared}" "${base}/health/" >/dev/null
-curl -fsS -H "X-Shared-Access-Token: ${shared}" "${base}/api/stats/" >/dev/null
+curl -fsS -H "X-Shared-Access-Token: ${shared}" "${base}/stats/" >/dev/null
 
 legacy_status="$(curl -sS -o /dev/null -w '%{http_code}' "${base}/api/jobs/00000000-0000-0000-0000-000000000000?secret=${job_secret}")"
 test "$legacy_status" != "200"
@@ -20,7 +20,8 @@ job_id="$(printf '%s' "$submit_response" | python -c 'import json,sys; print(jso
 result_secret="$(printf '%s' "$submit_response" | python -c 'import json,sys; print(json.load(sys.stdin)["result_secret"])')"
 
 curl -fsS -H "X-Job-Secret: ${result_secret}" "${base}/api/jobs/${job_id}" >/dev/null
-curl -fsS -L "${base}/jobs/${job_id}/claim/${result_secret}/" >/dev/null
+claim_status="$(curl -sS -o /dev/null -w '%{http_code}' "${base}/jobs/${job_id}/claim/${result_secret}/")"
+test "$claim_status" = "303"
 curl -fsS -H "X-Job-Secret: ${result_secret}" -X POST -H "Content-Type: application/json" -d '{"format":"csv"}' "${base}/api/jobs/${job_id}/exports" >/tmp/export.json
 token="$(python -c 'import json; print(json.load(open("/tmp/export.json"))["token"])')"
 curl -fsS "${base}/api/exports/${token}" >/dev/null || true

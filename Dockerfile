@@ -10,13 +10,15 @@
 #   docker build -t classyfire .
 # =============================================================================
 
+FROM postgres:16-bookworm AS pg-client
+
 FROM python:3.12-slim AS base
 
 # ── System packages ──────────────────────────────────────────────────────────
 # libpq5            : PostgreSQL client runtime library
-# postgresql-client : pg_dump / pg_restore / psql — required by the in-container
-#                     backup/restore smoke (docker compose run --rm web
-#                     scripts/run_backup_restore_smoke.sh) and operator restores.
+# postgresql-client : supplies lib/client dependencies; exact pg_dump /
+#                     pg_restore / psql binaries are copied from pg-client below
+#                     so their major version matches the postgres:16 DB image.
 # libxrender1, libxext6 : RDKit rendering (optional but avoids runtime warnings)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
@@ -24,6 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxrender1 \
         libxext6 \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=pg-client /usr/lib/postgresql/16/bin/pg_dump /usr/local/bin/pg_dump
+COPY --from=pg-client /usr/lib/postgresql/16/bin/pg_restore /usr/local/bin/pg_restore
+COPY --from=pg-client /usr/lib/postgresql/16/bin/psql /usr/local/bin/psql
+RUN pg_dump --version | grep -q ' 16\.' \
+ && pg_restore --version | grep -q ' 16\.' \
+ && psql --version | grep -q ' 16\.'
 
 # ── Non-root user ────────────────────────────────────────────────────────────
 RUN groupadd --gid 1001 appgroup \
@@ -78,7 +87,16 @@ RUN POSTGRES_HOST=localhost POSTGRES_PASSWORD=placeholder \
     python manage.py collectstatic --noinput
 
 # ── Runtime ownership ────────────────────────────────────────────────────────
-RUN chown -R appuser:appgroup /app
+# Create all writable runtime mount points in the image. Docker's named-volume
+# copy-up then preserves sane ownership on fresh volumes; compose also runs a
+# one-shot volume initializer for existing/root-owned volumes.
+RUN mkdir -p \
+        /app/staticfiles \
+        /app/media \
+        /app/export_files \
+        /app/source_artifacts \
+        /app/uploads \
+ && chown -R appuser:appgroup /app
 
 USER appuser
 

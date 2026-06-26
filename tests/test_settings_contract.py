@@ -10,6 +10,7 @@ import importlib
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
@@ -299,3 +300,12 @@ class TestProdRequiredVars:
         mod = _reload_prod_settings(monkeypatch, {"NGROK_DOMAIN": "myapp.ngrok-free.app"})
         origins = getattr(mod, "CSRF_TRUSTED_ORIGINS", [])
         assert any("myapp.ngrok-free.app" in o for o in origins)
+
+    def test_prod_collectstatic_includes_project_static_dir(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mod = _reload_prod_settings(monkeypatch, {})
+        project_static_dir = Path(mod.BASE_DIR) / "static"
+
+        assert project_static_dir in getattr(mod, "STATICFILES_DIRS", [])
+        assert (project_static_dir / "app.css").is_file()
