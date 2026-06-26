@@ -1533,8 +1533,9 @@ class RemoteWorker:
         ``RemoteQueryItem`` stamped APPLIED/MISMATCH inside the fenced txn. A
         member actively owned by ANOTHER worker is NOT applied (and never
         silently skipped): its item is parked PENDING_OWNER so the owner's later
-        poll/apply completes it. A member with no entity in the response retries
-        and is left in a non-terminal apply state.
+        poll/apply completes it. A member with no entity in the response is marked
+        FAILED for this completed query before its task retries independently,
+        preventing ragged provider responses from keeping the query open.
         """
         member_claim = self._member_claim(member, claim)
         if member_claim is None:
@@ -1669,6 +1670,17 @@ class RemoteWorker:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
                     queue.schedule_retry(locked)
+                    RemoteQueryItem.objects.filter(query=query, task=locked).exclude(
+                        apply_state__in=[
+                            RemoteQueryItemApplyState.APPLIED,
+                            RemoteQueryItemApplyState.MISMATCH,
+                            RemoteQueryItemApplyState.FAILED,
+                        ]
+                    ).update(
+                        apply_state=RemoteQueryItemApplyState.FAILED,
+                        apply_detail="missing from completed provider response; retry scheduled",
+                        applied_at=timezone.now(),
+                    )
             except LeaseLost:
                 logger.warning(
                     "lease lost dispatching miss-retry for task %s (inchikey=%s); "

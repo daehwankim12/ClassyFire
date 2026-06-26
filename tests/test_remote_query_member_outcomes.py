@@ -23,6 +23,7 @@ from apps.compounds.models import CompoundStructure
 from apps.core.enums import (
     BatchItemStatus,
     QueryState,
+    RemoteQueryItemApplyState,
     TaskState,
 )
 from apps.remote import queue
@@ -48,7 +49,15 @@ class _QueryCompleteHarness:
         )
         self.query: RemoteQuery | None = None
 
-    def make_two_member_query(self) -> tuple[RemoteQuery, RemoteTask, RemoteTask]:
+    def make_two_member_query(
+        self, *, response_inchikeys: list[str] | None = None
+    ) -> tuple[RemoteQuery, RemoteTask, RemoteTask]:
+        if response_inchikeys is not None:
+            self.response = build_query_response([
+                build_raw(ik) for ik in response_inchikeys
+            ])
+            self.provider.poll_script = {"q-batch": [self.response]}
+
         job = BatchJob.objects.create(secret_hash="x", total_count=2)
         query = RemoteQuery.objects.create(
             remote_query_id="q-batch",
@@ -162,3 +171,33 @@ def test_stale_pending_owner_park_cannot_clobber_applied_member(
     assert item_b.apply_state == "APPLIED"
     assert item_b.apply_detail == "applied by owner"
     assert query.state == QueryState.COMPLETE
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ragged_complete_response_marks_missing_member_terminal(
+    query_complete_harness,
+):
+    query, task_a, task_b = query_complete_harness.make_two_member_query(
+        response_inchikeys=[IK_A]
+    )
+    task_a.lock_owner = "worker-a"
+    task_a.lease_version = 1
+    task_a.locked_at = timezone.now()
+    task_a.state = TaskState.LOCKED
+    task_a.save()
+    task_b.state = TaskState.POLL_WAIT
+    task_b.save()
+
+    query_complete_harness.poll_as("worker-a", task_a)
+
+    query.refresh_from_db()
+    item_a = RemoteQueryItem.objects.get(query=query, task=task_a)
+    item_b = RemoteQueryItem.objects.get(query=query, task=task_b)
+    task_b.refresh_from_db()
+
+    assert item_a.apply_state == RemoteQueryItemApplyState.APPLIED
+    assert item_b.apply_state == RemoteQueryItemApplyState.FAILED
+    assert "missing from completed provider response" in item_b.apply_detail
+    assert item_b.applied_at is not None
+    assert query.state == QueryState.COMPLETE
+    assert task_b.state == TaskState.RETRY_WAIT
