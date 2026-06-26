@@ -12,12 +12,16 @@ from __future__ import annotations
 import json
 
 import pytest
+from django.contrib.auth.hashers import make_password
 from django.test import Client
+from django.utils import timezone
 
 from apps.batches.ingest import parse_text_input
+from apps.batches.models import BatchItem, BatchJob
 from apps.batches.services import create_job
-from apps.core.enums import BatchItemStatus
+from apps.core.enums import BatchItemStatus, BatchProcessingState, TaskState
 from apps.core.security import MAX_STRUCTURE_LEN
+from apps.remote.models import RemoteAttempt, RemoteTask
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -32,6 +36,7 @@ CAFFEINE_SMILES = "Cn1cnc2c1c(=O)n(c(=O)n2C)C"
 # The SMILES that yields this InChIKey via RDKit.
 GHOST_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"
 GHOST_SMILES = "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O"
+ETHANOL_INCHIKEY = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +118,50 @@ def test_job_detail_shows_counters():
     content = response.content.decode()
     # UUID should appear somewhere on the page
     assert str(job.pk) in content
+
+
+@pytest.mark.django_db(transaction=True)
+def test_job_detail_explains_remote_delayed_wishart_outage():
+    plaintext_secret = "remote-ui-secret"
+    job = BatchJob.objects.create(
+        secret_hash=make_password(plaintext_secret),
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        remote_pending_count=1,
+        total_count=1,
+    )
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=ETHANOL_INCHIKEY,
+        inchikey=ETHANOL_INCHIKEY,
+        status=BatchItemStatus.REMOTE_DELAYED,
+    )
+    task = RemoteTask.objects.create(
+        inchikey=ETHANOL_INCHIKEY,
+        state=TaskState.RETRY_WAIT,
+        next_run_at=timezone.now(),
+    )
+    RemoteAttempt.objects.create(
+        provider="wishart",
+        operation=RemoteAttempt.OPERATION_ENTITY,
+        task=task,
+        request_inchikey=ETHANOL_INCHIKEY,
+        classification="RETRYABLE",
+        http_status=503,
+        detail="HTTP 503",
+    )
+
+    client = Client()
+    claim_response = client.get(f"/jobs/{job.pk}/claim/{plaintext_secret}/")
+    assert claim_response.status_code == 303
+    response = client.get(f"/jobs/{job.pk}/")
+
+    assert response.status_code == 200
+    content = response.content.decode()
+    assert "Remote delayed details" in content
+    assert "Wishart outage / retrying" in content
+    assert "Workers will retry automatically" in content
+    assert "Waiting on remote retry, circuit recovery, or operator action." in content
 
 
 # ---------------------------------------------------------------------------

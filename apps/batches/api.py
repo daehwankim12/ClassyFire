@@ -54,6 +54,10 @@ from apps.batches.exports import (
     get_export_path,
 )
 from apps.batches.models import BatchItem, BatchJob
+from apps.batches.remote_delay import (
+    build_remote_delayed_breakdown,
+    next_action_for_remote_delayed,
+)
 from apps.batches.services import (
     StructureKeyMismatchError,
     StructureSubmissionConflictError,
@@ -245,11 +249,14 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
     ).count()
     remote_delayed = job.items.filter(status=BatchItemStatus.REMOTE_DELAYED).count()
     need_structure = job.items.filter(status=BatchItemStatus.NEED_STRUCTURE).count()
+    remote_delayed_breakdown = (
+        build_remote_delayed_breakdown(job) if remote_delayed else []
+    )
 
     if pending_normalization:
         next_action = "wait_for_ingest_worker"
     elif remote_delayed:
-        next_action = "wait_for_remote_capacity"
+        next_action = next_action_for_remote_delayed(remote_delayed_breakdown)
     elif need_structure:
         next_action = "submit_missing_structures"
     elif job.processing_state in CLAIMABLE_PROCESSING_STATES:
@@ -277,6 +284,7 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
             "need_structure_count": need_structure,
             "normalization_pending_count": pending_normalization,
             "remote_delayed_count": remote_delayed,
+            "remote_delayed_breakdown": remote_delayed_breakdown,
             "invalid_count": job.invalid_count,
             "remote_enabled": job.remote_enabled,
             "created_at": job.created_at.isoformat() if job.created_at else None,

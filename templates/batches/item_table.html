@@ -21,7 +21,13 @@
       <td>{{ item.detected_type }}</td>
       <td>{{ item.inchikey|default:'' }}</td>
       <td>{{ item.status }}</td>
-      <td>{{ item.message|default:'' }}</td>
+      <td>
+        {% if item.message %}
+        {{ item.message }}
+        {% elif item.status == 'REMOTE_DELAYED' %}
+        {{ remote_delayed_default_message }}
+        {% endif %}
+      </td>
       <td>
         {% if item.status == 'NEED_STRUCTURE' %}
         {% if secretless %}

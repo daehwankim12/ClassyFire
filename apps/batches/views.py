@@ -21,6 +21,10 @@ from django.http import HttpRequest, HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 
 from apps.batches.models import BatchItem, BatchJob
+from apps.batches.remote_delay import (
+    REMOTE_DELAYED_DEFAULT_MESSAGE,
+    build_remote_delayed_breakdown,
+)
 from apps.batches.services import (
     StructureKeyMismatchError,
     StructureSubmissionConflictError,
@@ -197,6 +201,10 @@ def job_detail_view(
 
     job_complete = _is_terminal_job(job)
     blocking_pending_count = _blocking_pending_count(job)
+    remote_delayed_breakdown = build_remote_delayed_breakdown(job)
+    remote_delayed_count = sum(
+        int(entry["count"]) for entry in remote_delayed_breakdown
+    )
 
     return render(
         request,
@@ -211,6 +219,9 @@ def job_detail_view(
             "search": search,
             "job_complete": job_complete,
             "blocking_pending_count": blocking_pending_count,
+            "remote_delayed_breakdown": remote_delayed_breakdown,
+            "remote_delayed_count": remote_delayed_count,
+            "remote_delayed_default_message": REMOTE_DELAYED_DEFAULT_MESSAGE,
         },
     )
 
@@ -296,6 +307,7 @@ def item_table_partial_view(
             "search": search,
             "job_complete": job_complete,
             "blocking_pending_count": blocking_pending_count,
+            "remote_delayed_default_message": REMOTE_DELAYED_DEFAULT_MESSAGE,
         },
     )
 

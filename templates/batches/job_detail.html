@@ -23,6 +23,31 @@
   </tr>
 </table>
 
+{% if remote_delayed_breakdown %}
+<section class="remote-delay-summary">
+  <h2>Remote delayed details</h2>
+  <p>{{ remote_delayed_count }} row{{ remote_delayed_count|pluralize }} delayed.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Cause</th>
+        <th>Rows</th>
+        <th>What it means</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for entry in remote_delayed_breakdown %}
+      <tr>
+        <td><strong>{{ entry.label }}</strong></td>
+        <td>{{ entry.count }}</td>
+        <td>{{ entry.description }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
 <h2>Export</h2>
 <form method="post" action="/api/jobs/{{ job.id }}/exports" id="export-form">
   {% if secret %}

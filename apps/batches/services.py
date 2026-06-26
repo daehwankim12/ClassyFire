@@ -70,6 +70,7 @@ from apps.batches.ingest import (
     validate_upload_root,
 )
 from apps.batches.models import BatchItem, BatchJob
+from apps.batches.remote_delay import REMOTE_DISABLED_MESSAGE
 from apps.classifications.services import (
     ClassificationLookupResult,
     LookupTier,
@@ -399,7 +400,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                     item.save(update_fields=["status", "message"])
             else:
                 item.status = BatchItemStatus.REMOTE_DELAYED
-                item.message = "Structure provided; remote classification disabled."
+                item.message = REMOTE_DISABLED_MESSAGE
                 item.save(
                     update_fields=[
                         "status",
@@ -536,6 +537,8 @@ def _process_item(
         _update_usage(norm.inchikey)
 
         if not remote_enabled:
+            if has_structure:
+                item.message = REMOTE_DISABLED_MESSAGE
             return (
                 BatchItemStatus.REMOTE_DELAYED
                 if has_structure
@@ -903,7 +906,8 @@ def _retry_backpressured_remote_delayed_items(
         )
         _lock_owned_job(claim)
         for item in items:
-            result = lookup_current_classification(item.inchikey)
+            inchikey = cast(str, item.inchikey)
+            result = lookup_current_classification(inchikey)
             if result is not None:
                 item.classification_snapshot = classification_lookup_snapshot(result)
                 _pin_resolved_classification(item, item.classification_snapshot)
@@ -918,7 +922,7 @@ def _retry_backpressured_remote_delayed_items(
 
             try:
                 _get_or_create_remote_task(
-                    item.inchikey,
+                    inchikey,
                     item.compound,
                     principal=remote_principal,
                 )

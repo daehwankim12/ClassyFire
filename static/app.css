@@ -67,6 +67,17 @@ tr:nth-child(even) {
   margin-bottom: 1rem;
 }
 
+.remote-delay-summary {
+  background: #fff8e1;
+  border-left: 4px solid #f9a825;
+  padding: 0.6rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.remote-delay-summary h2 {
+  margin-top: 0;
+}
+
 textarea {
   font-family: monospace;
   width: 100%;

@@ -15,10 +15,50 @@ from __future__ import annotations
 import pytest
 from django.contrib.auth.hashers import make_password
 from django.urls import reverse
+from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob
-from apps.batches.services import create_job_records
-from apps.core.enums import BatchItemStatus, BatchProcessingState
+from apps.batches.services import create_job, create_job_records
+from apps.core.enums import (
+    BatchItemStatus,
+    BatchProcessingState,
+    CircuitState,
+    ProviderControlState,
+    TaskState,
+)
+from apps.remote.models import (
+    RemoteAttempt,
+    RemoteCircuit,
+    RemoteProviderControl,
+    RemoteTask,
+)
+
+IK_A = "BSYNRYMUTXBXSQ-UHFFFAOYSA-N"
+IK_B = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+GHOST_SMILES = "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O"
+
+
+def _delayed_job_with_item(*, inchikey: str = IK_A, message: str | None = None):
+    plaintext_secret = "delayed-secret"
+    job = BatchJob.objects.create(
+        secret_hash=make_password(plaintext_secret),
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        remote_pending_count=1,
+        total_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=inchikey,
+        inchikey=inchikey,
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message=message,
+    )
+    return job, plaintext_secret, item
+
+
+def _breakdown_by_code(payload: dict) -> dict[str, dict]:
+    return {entry["code"]: entry for entry in payload["remote_delayed_breakdown"]}
 
 
 @pytest.mark.django_db(transaction=True)
@@ -52,7 +92,7 @@ def test_status_api_exposes_operational_processing_fields(client):
 
 @pytest.mark.django_db(transaction=True)
 def test_status_api_remote_delayed_next_action(client):
-    """next_action == "wait_for_remote_capacity" when there are REMOTE_DELAYED items."""
+    """Generic REMOTE_DELAYED rows surface an explicit remote-recovery action."""
     from apps.batches.ingest import parse_text_input
 
     rows = list(parse_text_input("CCO"))
@@ -66,7 +106,128 @@ def test_status_api_remote_delayed_next_action(client):
     payload = response.json()
     assert payload["remote_delayed_count"] == 1
     assert payload["normalization_pending_count"] == 0
+    assert payload["next_action"] == "wait_for_remote_recovery"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_remote_delayed_breakdown_distinguishes_wishart_outage(client):
+    job, plaintext_secret, item = _delayed_job_with_item(inchikey=IK_A)
+    task = RemoteTask.objects.create(
+        inchikey=IK_A,
+        state=TaskState.RETRY_WAIT,
+        next_run_at=timezone.now(),
+    )
+    RemoteAttempt.objects.create(
+        provider="wishart",
+        operation=RemoteAttempt.OPERATION_ENTITY,
+        task=task,
+        request_inchikey=IK_A,
+        classification="RETRYABLE",
+        http_status=503,
+        detail="HTTP 503",
+    )
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+
+    assert response.status_code == 200
+    payload = response.json()
+    breakdown = _breakdown_by_code(payload)
+    assert breakdown["wishart_retry"]["count"] == 1
+    assert breakdown["wishart_retry"]["label"] == "Wishart outage / retrying"
+    assert item.inchikey in breakdown["wishart_retry"]["inchikeys"]
+    assert payload["next_action"] == "wait_for_wishart_recovery"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_remote_delayed_breakdown_distinguishes_circuit_and_auth(client):
+    job, plaintext_secret, _item = _delayed_job_with_item(inchikey=IK_A)
+    BatchItem.objects.create(
+        job=job,
+        row_order=1,
+        original_input=IK_B,
+        inchikey=IK_B,
+        status=BatchItemStatus.REMOTE_DELAYED,
+    )
+    RemoteTask.objects.create(
+        inchikey=IK_A,
+        state=TaskState.DEFERRED,
+        next_run_at=timezone.now(),
+    )
+    RemoteTask.objects.create(
+        inchikey=IK_B,
+        state=TaskState.DEFERRED,
+        next_run_at=timezone.now(),
+    )
+    RemoteCircuit.objects.create(
+        provider="wishart",
+        state=CircuitState.OPEN,
+        consecutive_failures=5,
+        opened_at=timezone.now(),
+    )
+    RemoteProviderControl.objects.create(
+        provider="wishart",
+        state=ProviderControlState.AUTH_BLOCKED,
+        blocked_reason="HTTP 401",
+    )
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+
+    assert response.status_code == 200
+    payload = response.json()
+    breakdown = _breakdown_by_code(payload)
+    assert breakdown["wishart_auth_blocked"]["count"] == 2
+    assert breakdown["wishart_auth_blocked"]["label"] == "Wishart auth blocked"
+    assert "circuit_open" not in breakdown
+    assert payload["next_action"] == "fix_wishart_auth"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_remote_delayed_breakdown_uses_item_messages(client):
+    job, plaintext_secret, _item = _delayed_job_with_item(
+        inchikey=IK_A,
+        message="Remote queue is at capacity; retrying later.",
+    )
+    BatchItem.objects.create(
+        job=job,
+        row_order=1,
+        original_input=IK_B,
+        inchikey=IK_B,
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message="Remote budget exceeded for this principal.",
+    )
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+
+    assert response.status_code == 200
+    payload = response.json()
+    breakdown = _breakdown_by_code(payload)
+    assert breakdown["queue_capacity"]["count"] == 1
+    assert breakdown["budget_exceeded"]["count"] == 1
     assert payload["next_action"] == "wait_for_remote_capacity"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_remote_disabled_breakdown_for_structured_miss(client, monkeypatch):
+    from apps.batches.ingest import parse_text_input
+
+    monkeypatch.setattr(
+        "apps.batches.services.lookup_current_classifications",
+        lambda _inchikeys: {},
+    )
+    rows = list(parse_text_input(GHOST_SMILES))
+    job, plaintext_secret = create_job(rows, remote_enabled=False)
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+
+    assert response.status_code == 200
+    payload = response.json()
+    breakdown = _breakdown_by_code(payload)
+    assert breakdown["remote_disabled"]["count"] == 1
+    assert payload["next_action"] == "enable_remote_or_resubmit"
 
 
 @pytest.mark.django_db(transaction=True)
@@ -192,6 +353,7 @@ def test_status_api_old_keys_preserved(client):
         "processing_state",
         "normalization_pending_count",
         "remote_delayed_count",
+        "remote_delayed_breakdown",
         "next_action",
     ):
         assert key in payload, f"New operational key {key!r} missing from status response"
