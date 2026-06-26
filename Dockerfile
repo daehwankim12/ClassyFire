@@ -14,9 +14,13 @@ FROM python:3.12-slim AS base
 
 # ── System packages ──────────────────────────────────────────────────────────
 # libpq5            : PostgreSQL client runtime library
+# postgresql-client : pg_dump / pg_restore / psql — required by the in-container
+#                     backup/restore smoke (docker compose run --rm web
+#                     scripts/run_backup_restore_smoke.sh) and operator restores.
 # libxrender1, libxext6 : RDKit rendering (optional but avoids runtime warnings)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
+        postgresql-client \
         libxrender1 \
         libxext6 \
     && rm -rf /var/lib/apt/lists/*

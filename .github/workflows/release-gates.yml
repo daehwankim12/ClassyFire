@@ -90,11 +90,35 @@ jobs:
         run: docker compose down -v
 
   backup-restore-smoke:
-    # scripts/run_backup_restore_smoke.sh runs pg_restore to verify a full dump→restore round-trip
+    # scripts/run_backup_restore_smoke.sh runs pg_restore to verify a full dump→restore round-trip.
+    # It runs INSIDE the web service (Django + postgresql-client) so it has both
+    # manage.py and pg_dump/pg_restore/psql against the compose DB.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose up -d --build db migrate web worker ingest-worker
-      - run: bash scripts/run_backup_restore_smoke.sh
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked --extra dev
+      - name: Write a complete .env with a hash derived from the sentinel plaintext
+        run: |
+          HASH="$(uv run python -c '
+          from django.conf import settings
+          settings.configure(PASSWORD_HASHERS=["django.contrib.auth.hashers.PBKDF2PasswordHasher"])
+          from django.contrib.auth.hashers import make_password
+          print(make_password("sentinel-release-gate-secret"))
+          ')"
+          cat > .env <<EOF
+          POSTGRES_DB=classyfire
+          POSTGRES_USER=classyfire
+          POSTGRES_PASSWORD=classyfire
+          DJANGO_SECRET_KEY=sentinel-django-secret
+          WISHART_BASE_URL=http://mock-provider.invalid
+          REMOTE_ENABLED=false
+          SHARED_ACCESS_PASSWORD_HASH=${HASH}
+          NGROK_AUTHTOKEN=
+          NGROK_DOMAIN=localhost
+          EOF
+      - run: docker compose config >/tmp/classyfire-compose.yml
+      - run: docker compose up -d --build db migrate web worker ingest-worker backup
+      - run: docker compose run --rm web bash scripts/run_backup_restore_smoke.sh
       - if: always()
         run: docker compose down -v

@@ -37,6 +37,21 @@ def test_secret_scan_scripts_fail_on_missing_args():
     assert "CLASSYFIRE_SENTINEL_SECRET" in log_script
 
 
+def test_release_workflow_validates_compose_and_consumes_generated_secrets():
+    workflow = Path(".github/workflows/release-gates.yml").read_text()
+    # The compose configuration is rendered/validated before bringing services up.
+    assert "docker compose config" in workflow
+    # The exerciser emits the runtime-generated secrets to a file...
+    assert "CLASSYFIRE_SECRET_OUTPUT" in workflow
+    # ...which the log checker consumes literally.
+    assert "--secret-file" in workflow
+    # The backup/restore smoke runs inside an app+pg-client-capable service.
+    assert (
+        "docker compose run --rm web bash scripts/run_backup_restore_smoke.sh"
+        in workflow
+    )
+
+
 def test_secret_route_exerciser_hits_sensitive_routes():
     script = Path("scripts/exercise_secret_routes.sh").read_text()
     for needle in [
