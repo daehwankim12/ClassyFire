@@ -21,6 +21,8 @@ from django.conf import settings
 from apps.operations.backup import _sha256_file
 
 BUNDLE_INDEX_FILENAME = "bundle-manifest.json"
+DEFAULT_MAX_BUNDLE_MEMBER_SIZE = 10 * 1024 * 1024 * 1024
+DEFAULT_MAX_BUNDLE_TOTAL_SIZE = 25 * 1024 * 1024 * 1024
 
 
 class BackupBundleError(ValueError):
@@ -202,6 +204,17 @@ def create_backup_bundle(
     }
 
 
+def _bundle_size_limit(setting_name: str, default: int) -> int:
+    value = getattr(settings, setting_name, default)
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BackupBundleError(f"{setting_name} must be an integer") from exc
+    if limit <= 0:
+        raise BackupBundleError(f"{setting_name} must be positive")
+    return limit
+
+
 def _safe_tar_member(member: tarfile.TarInfo) -> str:
     name = _safe_filename(member.name, label="bundle member")
     if not member.isfile():
@@ -231,6 +244,10 @@ def import_backup_bundle(
             with tarfile.open(bundle_path, "r:gz") as bundle:
                 members = bundle.getmembers()
                 safe_names = [_safe_tar_member(member) for member in members]
+                if len(safe_names) != len(set(safe_names)):
+                    raise BackupBundleError("bundle contains duplicate member names")
+
+                member_by_name = dict(zip(safe_names, members, strict=True))
                 manifest_names = [
                     name
                     for name in safe_names
@@ -238,12 +255,56 @@ def import_backup_bundle(
                 ]
                 if len(manifest_names) != 1:
                     raise BackupBundleError("bundle must contain exactly one backup manifest")
-                for member, name in zip(members, safe_names, strict=True):
-                    if name == BUNDLE_INDEX_FILENAME:
-                        continue
+
+                manifest_name = manifest_names[0]
+                manifest_member = member_by_name[manifest_name]
+                max_member_size = _bundle_size_limit(
+                    "BACKUP_BUNDLE_MAX_MEMBER_SIZE",
+                    DEFAULT_MAX_BUNDLE_MEMBER_SIZE,
+                )
+                max_total_size = _bundle_size_limit(
+                    "BACKUP_BUNDLE_MAX_TOTAL_SIZE",
+                    DEFAULT_MAX_BUNDLE_TOTAL_SIZE,
+                )
+                if manifest_member.size > max_member_size:
+                    raise BackupBundleError(f"bundle member is too large: {manifest_name}")
+
+                manifest_source = bundle.extractfile(manifest_member)
+                if manifest_source is None:
+                    raise BackupBundleError(f"could not read bundle member: {manifest_name}")
+                with (staging / manifest_name).open("wb") as destination:
+                    copyfileobj(manifest_source, destination)
+
+                manifest = _load_manifest(staging / manifest_name)
+                expected_names = {
+                    manifest_name,
+                    *[item.name for item in _referenced_files(manifest)],
+                }
+                actual_payload_names = set(safe_names) - {BUNDLE_INDEX_FILENAME}
+                unexpected_names = actual_payload_names - expected_names
+                if unexpected_names:
+                    raise BackupBundleError(
+                        f"bundle contains unexpected member: {sorted(unexpected_names)[0]}"
+                    )
+                missing_names = expected_names - actual_payload_names
+                if missing_names:
+                    raise BackupBundleError(
+                        f"bundle is missing referenced member: {sorted(missing_names)[0]}"
+                    )
+
+                total_size = 0
+                for name in sorted(expected_names):
+                    member = member_by_name[name]
+                    if member.size > max_member_size:
+                        raise BackupBundleError(f"bundle member is too large: {name}")
+                    total_size += member.size
+                    if total_size > max_total_size:
+                        raise BackupBundleError("bundle contents exceed maximum total size")
                     target = _safe_child_path(root, name)
                     if target.exists() and not overwrite:
                         raise BackupBundleError(f"backup file already exists: {name}")
+                    if name == manifest_name:
+                        continue
                     source = bundle.extractfile(member)
                     if source is None:
                         raise BackupBundleError(f"could not read bundle member: {name}")
@@ -252,7 +313,6 @@ def import_backup_bundle(
         except tarfile.TarError as exc:
             raise BackupBundleError(f"invalid backup bundle: {bundle_path}") from exc
 
-        manifest_name = manifest_names[0]
         verified = verify_backup_manifest_files(staging, manifest_name)
         for name in verified["files"]:
             destination_path = _safe_child_path(root, name)

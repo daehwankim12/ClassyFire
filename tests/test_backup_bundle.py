@@ -138,6 +138,63 @@ def test_import_backup_bundle_rejects_unsafe_tar_member(tmp_path: Path):
         import_backup_bundle(bundle_path, backup_dir=tmp_path / "target")
 
 
+def test_import_backup_bundle_rejects_unreferenced_members(tmp_path: Path):
+    from apps.operations.backup_bundle import BackupBundleError, import_backup_bundle
+
+    dump = b"dump"
+    manifest = {
+        "timestamp": "2026-06-27T01:02:03+00:00",
+        "file": "classyfire_20260627_010203.dump",
+        "checksum": hashlib.sha256(dump).hexdigest(),
+        "artifact_archives": {},
+        "status": "ok",
+    }
+    bundle_path = tmp_path / "extra-member.tar.gz"
+    with tarfile.open(bundle_path, "w:gz") as bundle:
+        manifest_bytes = json.dumps(manifest).encode()
+        manifest_info = tarfile.TarInfo("classyfire_20260627_010203.manifest.json")
+        manifest_info.size = len(manifest_bytes)
+        bundle.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        dump_info = tarfile.TarInfo("classyfire_20260627_010203.dump")
+        dump_info.size = len(dump)
+        bundle.addfile(dump_info, io.BytesIO(dump))
+        extra_info = tarfile.TarInfo("unreferenced-extra.bin")
+        extra_info.size = len(b"extra")
+        bundle.addfile(extra_info, io.BytesIO(b"extra"))
+
+    target_dir = tmp_path / "target"
+    with pytest.raises(BackupBundleError, match="unexpected member"):
+        import_backup_bundle(bundle_path, backup_dir=target_dir)
+
+    assert not (target_dir / "unreferenced-extra.bin").exists()
+
+
+def test_import_backup_bundle_enforces_size_limit(tmp_path: Path, settings):
+    from apps.operations.backup_bundle import BackupBundleError, import_backup_bundle
+
+    settings.BACKUP_BUNDLE_MAX_MEMBER_SIZE = 3
+    dump = b"dump"
+    manifest = {
+        "timestamp": "2026-06-27T01:02:03+00:00",
+        "file": "classyfire_20260627_010203.dump",
+        "checksum": hashlib.sha256(dump).hexdigest(),
+        "artifact_archives": {},
+        "status": "ok",
+    }
+    bundle_path = tmp_path / "too-large.tar.gz"
+    with tarfile.open(bundle_path, "w:gz") as bundle:
+        manifest_bytes = json.dumps(manifest).encode()
+        manifest_info = tarfile.TarInfo("classyfire_20260627_010203.manifest.json")
+        manifest_info.size = len(manifest_bytes)
+        bundle.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        dump_info = tarfile.TarInfo("classyfire_20260627_010203.dump")
+        dump_info.size = len(dump)
+        bundle.addfile(dump_info, io.BytesIO(dump))
+
+    with pytest.raises(BackupBundleError, match="too large"):
+        import_backup_bundle(bundle_path, backup_dir=tmp_path / "target")
+
+
 def test_export_backup_bundle_command_prints_bundle_path_and_checksum(tmp_path: Path):
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
