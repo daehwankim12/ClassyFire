@@ -1,19 +1,44 @@
 """Progress + rough-ETA computation for the batch job detail page.
 
 The detail page shows a segmented progress bar (resolved vs still-processing) and
-a coarse "time remaining" estimate. The ETA is intentionally approximate: most of
-the remaining time is spent in rate-limited remote (Wishart) classification whose
-throughput depends on cross-job queue contention, so we derive it from the
-observed resolution rate since the job started and label it as an estimate. It
-self-corrects on every poll.
+a coarse "time remaining" estimate. The ETA is intentionally approximate but is
+floored at the **remote pace**: anything still pending has already missed the
+local cache/seed and must be classified by the rate-limited Wishart remote, which
+costs ~6s per item (see :func:`_remote_pace_seconds`). The observed
+resolution-rate estimate alone is misleading because it averages in the *instant*
+local cache/seed hits, so it badly under-promises the remote-bound tail. We
+therefore take whichever of {remote-pace floor, observed rate} is slower and
+label it an estimate. It self-corrects on every poll.
 """
 from __future__ import annotations
 
 from typing import Any
 
+from django.conf import settings
 from django.utils import timezone
 
 from apps.batches.models import BatchJob
+
+
+def _remote_pace_seconds() -> float:
+    """Seconds per remaining item, derived from the Wishart remote rate limit.
+
+    Every still-pending item has missed the local cache/seed, so it needs at
+    least one rate-limited remote round-trip: an entity GET, then (for a genuine
+    miss) a batched structure submit + polls. All remote calls draw from shared,
+    DB-backed token buckets that refill at ``REMOTE_ENTITY_REQUESTS_PER_MIN`` /
+    ``REMOTE_SUBMITS_PER_MIN`` per minute, so global remote throughput is capped
+    at roughly that many items per minute **no matter how many workers run**.
+
+    The binding per-item constraint is the entity bucket: there is exactly one
+    entity GET per item, whereas submits batch up to ``REMOTE_BATCH_SIZE`` and
+    are comparatively cheap. So we pace at ``60 / entity-rate`` ≈ 6s per item.
+    This is a floor — polls share the same entity bucket and cross-job
+    contention only slows it further — but it is far closer than a rate that
+    counts instant local hits.
+    """
+    rate = getattr(settings, "REMOTE_ENTITY_REQUESTS_PER_MIN", 10) or 10
+    return 60.0 / max(int(rate), 1)
 
 
 def _humanize_eta(seconds: float) -> str:
@@ -53,14 +78,23 @@ def build_job_progress(job: BatchJob, *, is_terminal: bool) -> dict[str, Any]:
     is_complete = is_terminal
     if is_terminal:
         eta = "완료"
-    else:
+    elif pending <= 0:
+        # Not terminal but nothing left to resolve (e.g. counts not computed
+        # yet): keep polling without a misleading number.
         eta = "처리 중…"
-        if pending > 0 and resolved > 0 and job.created_at is not None:
+    else:
+        # Floor at the remote pace: each pending item costs ~6s of rate-limited
+        # Wishart time. Only let the observed rate win when it is SLOWER (heavy
+        # cross-job contention) — never faster, since its speed comes from
+        # instant local cache/seed hits that the remote tail won't enjoy.
+        eta_seconds = pending * _remote_pace_seconds()
+        if resolved > 0 and job.created_at is not None:
             elapsed = (timezone.now() - job.created_at).total_seconds()
             if elapsed > 0:
                 rate = resolved / elapsed  # resolved items per second
                 if rate > 0:
-                    eta = _humanize_eta(pending / rate)
+                    eta_seconds = max(eta_seconds, pending / rate)
+        eta = _humanize_eta(eta_seconds)
 
     return {
         "total": total,
