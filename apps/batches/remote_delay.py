@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from django.db.models import OuterRef, Subquery
+
 from apps.batches.models import BatchItem, BatchJob
 from apps.core.enums import (
     BatchItemStatus,
@@ -32,6 +34,7 @@ _WISHART_RETRY_STATES = {
     TaskState.POLL_WAIT,
     TaskState.SUBMIT_WAIT,
 }
+REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -105,13 +108,18 @@ CAUSES: dict[str, RemoteDelayCause] = {
 
 
 def build_remote_delayed_breakdown(job: BatchJob) -> list[dict[str, Any]]:
-    delayed_items = list(
+    delayed_qs = (
         BatchItem.objects.filter(job=job, status=BatchItemStatus.REMOTE_DELAYED)
         .only("inchikey", "message", "row_order")
         .order_by("row_order")
     )
-    if not delayed_items:
+    delayed_count = delayed_qs.count()
+    if not delayed_count:
         return []
+
+    delayed_items = list(
+        delayed_qs[:REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT]
+    )
 
     inchikeys = [item.inchikey for item in delayed_items if item.inchikey]
     active_tasks = _active_tasks_by_inchikey(inchikeys)
@@ -152,6 +160,24 @@ def build_remote_delayed_breakdown(job: BatchJob) -> list[dict[str, Any]]:
         entry["count"] += 1
         if item.inchikey and item.inchikey not in entry["inchikeys"]:
             entry["inchikeys"].append(item.inchikey)
+
+    unclassified_count = delayed_count - len(delayed_items)
+    if unclassified_count:
+        cause = CAUSES["other_delayed"]
+        entry = grouped.setdefault(
+            cause.code,
+            {
+                "code": cause.code,
+                "label": cause.label,
+                "description": cause.description,
+                "next_action": cause.next_action,
+                "severity": cause.severity,
+                "priority": cause.priority,
+                "count": 0,
+                "inchikeys": [],
+            },
+        )
+        entry["count"] += unclassified_count
 
     return [
         _public_entry(entry)
@@ -213,9 +239,20 @@ def _active_tasks_by_inchikey(inchikeys: list[str]) -> dict[str, RemoteTask]:
 
 
 def _latest_attempts_by_inchikey(inchikeys: list[str]) -> dict[str, RemoteAttempt]:
+    if not inchikeys:
+        return {}
+
+    latest_attempt_pk = (
+        RemoteAttempt.objects.filter(task__inchikey=OuterRef("task__inchikey"))
+        .order_by("-created_at", "-pk")
+        .values("pk")[:1]
+    )
     attempts: dict[str, RemoteAttempt] = {}
     for attempt in (
-        RemoteAttempt.objects.filter(task__inchikey__in=inchikeys)
+        RemoteAttempt.objects.filter(
+            task__inchikey__in=inchikeys,
+            pk=Subquery(latest_attempt_pk),
+        )
         .select_related("task")
         .order_by("task__inchikey", "-created_at", "-pk")
     ):

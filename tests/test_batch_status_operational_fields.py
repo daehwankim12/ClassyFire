@@ -18,6 +18,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob
+from apps.batches.remote_delay import REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT
 from apps.batches.services import create_job, create_job_records
 from apps.core.enums import (
     BatchItemStatus,
@@ -207,6 +208,35 @@ def test_status_api_remote_delayed_breakdown_uses_item_messages(client):
     assert breakdown["queue_capacity"]["count"] == 1
     assert breakdown["budget_exceeded"]["count"] == 1
     assert payload["next_action"] == "wait_for_remote_capacity"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_status_api_remote_delayed_breakdown_is_bounded(client):
+    plaintext_secret = "many-delayed-secret"
+    job = BatchJob.objects.create(
+        secret_hash=make_password(plaintext_secret),
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT + 1,
+    )
+    for index in range(REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT + 1):
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=IK_A,
+            inchikey=IK_A,
+            status=BatchItemStatus.REMOTE_DELAYED,
+            message="Remote queue is at capacity; retrying later.",
+        )
+
+    url = reverse("batches:job_status", kwargs={"job_id": job.pk})
+    response = client.get(url, HTTP_X_JOB_SECRET=plaintext_secret)
+
+    assert response.status_code == 200
+    payload = response.json()
+    breakdown = _breakdown_by_code(payload)
+    assert payload["remote_delayed_count"] == REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT + 1
+    assert breakdown["queue_capacity"]["count"] == REMOTE_DELAYED_BREAKDOWN_ITEM_LIMIT
+    assert breakdown["other_delayed"]["count"] == 1
 
 
 @pytest.mark.django_db(transaction=True)
