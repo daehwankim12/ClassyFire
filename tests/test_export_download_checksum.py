@@ -53,3 +53,42 @@ def test_download_rejects_stale_rows_signature_even_when_job_state_matches(tmp_p
     )
 
     assert get_export_path(artifact.token) is None
+
+
+@pytest.mark.django_db
+def test_download_caches_rows_signature_validation_for_valid_artifact(tmp_path, monkeypatch):
+    from django.core.cache import cache
+
+    from apps.batches import exports
+
+    cache.clear()
+    job = BatchJob.objects.create(secret_hash="hash")
+    path = tmp_path / "export.csv"
+    path.write_text("good\n")
+    rows_signature = exports._compute_rows_signature(job)
+    artifact = ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token="token-valid-export-cache",
+        path=str(path),
+        checksum=exports._checksum_file(path),
+        byte_size=path.stat().st_size,
+        rows_signature=rows_signature,
+        row_count=0,
+        job_state_signature=exports._job_state_signature(job),
+        expires_at=timezone.now() + timedelta(days=1),
+    )
+
+    calls = 0
+
+    def counting_compute_rows_signature(current_job):
+        nonlocal calls
+        calls += 1
+        assert current_job.pk == job.pk
+        return rows_signature
+
+    monkeypatch.setattr(exports, "_compute_rows_signature", counting_compute_rows_signature)
+
+    assert get_export_path(artifact.token) == path
+    assert get_export_path(artifact.token) == path
+    assert calls == 1

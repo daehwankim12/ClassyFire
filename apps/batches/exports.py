@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, cast
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password
+from django.core.cache import cache
 from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob, ExportArtifact
@@ -456,6 +457,22 @@ def _job_state_signature(job: BatchJob) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _rows_signature_validation_cache_key(artifact: ExportArtifact) -> str:
+    """Return a cache key for the current cheap state of an export artifact."""
+    return (
+        "batch-export-rows-signature:"
+        f"{artifact.pk}:{artifact.token}:{artifact.job_state_signature}:"
+        f"{artifact.row_count}:{artifact.rows_signature}"
+    )
+
+
+def _rows_signature_validation_cache_timeout(artifact: ExportArtifact) -> int:
+    """Return the bounded cache TTL for an expensive rows-signature validation."""
+    max_timeout = int(getattr(settings, "EXPORT_DOWNLOAD_VALIDATION_CACHE_SECONDS", 60))
+    seconds_until_expiry = int((artifact.expires_at - timezone.now()).total_seconds())
+    return max(0, min(max_timeout, seconds_until_expiry))
+
+
 def _artifact_matches_current_job_state(artifact: ExportArtifact) -> bool:
     """Return True when an artifact still matches the job's current rows."""
     job = BatchJob.objects.filter(pk=artifact.job_id).first()
@@ -465,7 +482,17 @@ def _artifact_matches_current_job_state(artifact: ExportArtifact) -> bool:
         return False
     if artifact.job_state_signature != _job_state_signature(job):
         return False
-    return artifact.rows_signature == _compute_rows_signature(job)
+
+    cache_key = _rows_signature_validation_cache_key(artifact)
+    cached_match = cache.get(cache_key)
+    if cached_match is not None:
+        return bool(cached_match)
+
+    rows_match = artifact.rows_signature == _compute_rows_signature(job)
+    cache_timeout = _rows_signature_validation_cache_timeout(artifact)
+    if cache_timeout > 0:
+        cache.set(cache_key, rows_match, timeout=cache_timeout)
+    return rows_match
 
 def _artifact_file_checksum_matches(path: Path, artifact: ExportArtifact) -> bool:
     """Return True iff the on-disk file's SHA-256 matches the stored artifact checksum."""
