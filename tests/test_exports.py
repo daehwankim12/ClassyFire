@@ -434,6 +434,59 @@ def test_csv_export_has_no_citation_header():
 
 
 @pytest.mark.django_db(transaction=True)
+def test_no_citation_export_does_not_reuse_pre_schema_version_artifact():
+    """Old citation-bearing artifacts must not be reused after citation removal."""
+    import datetime as dt
+    import hashlib
+
+    from apps.batches import exports
+    from apps.batches.models import ExportArtifact
+
+    job, secret = _create_simple_job()
+    old_sig_hasher = hashlib.sha256()
+    old_sig_hasher.update(b"[")
+    for idx, row in enumerate(exports._rows_for_job(job)):
+        if idx:
+            old_sig_hasher.update(b",")
+        old_sig_hasher.update(
+            json.dumps(
+                {col: row.get(col) for col in exports.COLUMNS},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+    old_sig_hasher.update(b"]")
+    old_rows_signature = old_sig_hasher.hexdigest()
+
+    storage = exports._artifact_storage()
+    old_token = "oldcitationtoken"
+    old_bytes = b"# Citation: legacy inline attribution\nInChIKey,ClassyFy Status\n"
+    old_path = storage.save_bytes(f"{old_token}.csv", old_bytes)
+    old_expires_at = dt.datetime.now(tz=dt.UTC) + dt.timedelta(days=1)
+    ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token=old_token,
+        path=str(old_path),
+        checksum=hashlib.sha256(old_bytes).hexdigest(),
+        byte_size=len(old_bytes),
+        rows_signature=old_rows_signature,
+        row_count=job.total_count,
+        job_state_signature=exports._job_state_signature(job),
+        expires_at=old_expires_at,
+    )
+
+    client = Client()
+    new_token = _create_export_token(client, str(job.pk), secret, "csv")
+    new_text = _download_export_bytes(client, new_token).decode("utf-8")
+
+    assert new_token != old_token
+    assert not new_text.startswith("#")
+    assert "Citation:" not in new_text
+
+
+@pytest.mark.django_db(transaction=True)
 def test_json_export_has_no_citation_key():
     """JSON rows no longer carry the per-row ``_citation`` attribution key."""
     job, secret = _create_simple_job()

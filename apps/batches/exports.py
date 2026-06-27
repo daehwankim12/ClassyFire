@@ -75,6 +75,13 @@ logger = logging.getLogger(__name__)
 
 EXPORT_DIR: Path = Path(getattr(settings, "EXPORT_DIR", settings.BASE_DIR / "export_cache"))
 
+EXPORT_SCHEMA_VERSION = "no-inline-citation-v1"
+"""Version discriminator for export bytes that are safe to reuse.
+
+Bump this whenever a format/schema-only change should invalidate otherwise
+identical row-data artifacts.
+"""
+
 COLUMNS = [
     "InChIKey",
     "ClassyFy Status",
@@ -302,6 +309,13 @@ class _RowsSignatureHasher:
         # We need to produce the same hash as _rows_signature, which serialises
         # the full payload list.  We replicate that encoding incrementally by
         # hashing a JSON array built piece by piece.
+        self._hasher.update(
+            json.dumps(
+                {"export_schema_version": EXPORT_SCHEMA_VERSION},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
         self._hasher.update(b"[")
 
     def update(self, row: dict[str, str | int | None]) -> None:
