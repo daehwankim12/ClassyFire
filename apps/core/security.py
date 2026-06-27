@@ -962,6 +962,7 @@ class SecretRedactionFilter(logging.Filter):
     - ``/jobs/<uuid>/claim/<secret>`` capability secrets carried IN the PATH
       (Django's "Forbidden: <path>" request-log lines expose these on a 403).
     - legacy ``/jobs/<uuid>/(items|structure|result[s])/<secret>`` path secrets.
+    - legacy ``/jobs/<uuid>/<secret>/progress`` path secrets.
     - ``/api/jobs/<uuid>/...?secret=<value>`` (covered by the query rule too, but
       matched explicitly for defence in depth).
 
@@ -975,6 +976,9 @@ class SecretRedactionFilter(logging.Filter):
     LEGACY_JOB_PATH_RE = re.compile(
         r"(/jobs/[0-9a-fA-F-]{36}/(?:items|structure|results?)/)[^/?\s]+"
     )
+    LEGACY_PROGRESS_PATH_RE = re.compile(
+        r"(/jobs/[0-9a-fA-F-]{36}/)[^/?\s]+(/progress/?)(?=[?\s]|$)"
+    )
     API_JOB_SECRET_RE = re.compile(
         r"(/api/jobs/[0-9a-fA-F-]{36}/[^?\s]*[?&]secret=)[^&\s]+"
     )
@@ -985,6 +989,7 @@ class SecretRedactionFilter(logging.Filter):
         message = self.EXPORT_PATH_RE.sub(r"\1[REDACTED]", message)
         message = self.CLAIM_PATH_RE.sub(r"\1[REDACTED]", message)
         message = self.LEGACY_JOB_PATH_RE.sub(r"\1[REDACTED]", message)
+        message = self.LEGACY_PROGRESS_PATH_RE.sub(r"\1[REDACTED]\2", message)
         message = self.API_JOB_SECRET_RE.sub(r"\1[REDACTED]", message)
         record.msg = message
         record.args = ()

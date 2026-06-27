@@ -63,6 +63,7 @@ def test_secret_redaction_filter_redacts_claim_and_legacy_paths():
         logger.warning("Forbidden: /api/jobs/%s?secret=%s", job_id, secret)
         logger.warning("Forbidden: /jobs/%s/items/%s/", job_id, secret)
         logger.warning("Forbidden: /jobs/%s/structure/%s/", job_id, secret)
+        logger.warning("Forbidden: /jobs/%s/%s/progress", job_id, secret)
     finally:
         logger.removeHandler(handler)
 
@@ -741,6 +742,8 @@ class TestResultUrlSecret:
         assert "jobLegacySecret" in content
         assert "^/jobs/[^/]+/[^/]+/?$" in content
         assert "^/jobs/[^/]+/[^/]+/items/?$" in content
+        assert "jobLegacyProgressSecret" in content
+        assert "^/jobs/[^/]+/[^/]+/progress/?$" in content
 
     def test_caddy_does_not_log_raw_legacy_structure_secret_paths(self) -> None:
         caddyfile = Path(__file__).resolve().parents[1] / "deploy/caddy/Caddyfile"

@@ -69,6 +69,8 @@ http://{$NGROK_DOMAIN} {
     log_skip @jobLegacySecret
     @jobLegacyItemsSecret path_regexp job_legacy_items_secret ^/jobs/[^/]+/[^/]+/items/?$
     log_skip @jobLegacyItemsSecret
+    @jobLegacyProgressSecret path_regexp job_legacy_progress_secret ^/jobs/[^/]+/[^/]+/progress/?$
+    log_skip @jobLegacyProgressSecret
     @itemLegacyStructureSecret path_regexp item_legacy_structure_secret ^/items/[0-9]+/[^/]+/structure/?$
     log_skip @itemLegacyStructureSecret
 
