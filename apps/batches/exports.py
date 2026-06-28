@@ -472,7 +472,11 @@ def _job_state_signature(job: BatchJob) -> str:
 
 
 def _rows_signature_validation_cache_key(artifact: ExportArtifact) -> str:
-    """Return a cache key for the current cheap state of an export artifact."""
+    """Return a cache key for negative rows-signature validations.
+
+    Successful row validation cannot be safely cached because BatchItem row
+    contents can change without changing the cheap job-level state below.
+    """
     return (
         "batch-export-rows-signature:"
         f"{artifact.pk}:{artifact.token}:{artifact.job_state_signature}:"
@@ -499,13 +503,13 @@ def _artifact_matches_current_job_state(artifact: ExportArtifact) -> bool:
 
     cache_key = _rows_signature_validation_cache_key(artifact)
     cached_match = cache.get(cache_key)
-    if cached_match is not None:
-        return bool(cached_match)
+    if cached_match is False:
+        return False
 
     rows_match = artifact.rows_signature == _compute_rows_signature(job)
     cache_timeout = _rows_signature_validation_cache_timeout(artifact)
-    if cache_timeout > 0:
-        cache.set(cache_key, rows_match, timeout=cache_timeout)
+    if not rows_match and cache_timeout > 0:
+        cache.set(cache_key, False, timeout=cache_timeout)
     return rows_match
 
 def _artifact_file_checksum_matches(path: Path, artifact: ExportArtifact) -> bool:

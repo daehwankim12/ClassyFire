@@ -56,7 +56,7 @@ def test_download_rejects_stale_rows_signature_even_when_job_state_matches(tmp_p
 
 
 @pytest.mark.django_db
-def test_download_caches_rows_signature_validation_for_valid_artifact(tmp_path, monkeypatch):
+def test_download_does_not_cache_successful_rows_signature_validation(tmp_path, monkeypatch):
     from django.core.cache import cache
 
     from apps.batches import exports
@@ -91,4 +91,44 @@ def test_download_caches_rows_signature_validation_for_valid_artifact(tmp_path, 
 
     assert get_export_path(artifact.token) == path
     assert get_export_path(artifact.token) == path
-    assert calls == 1
+    assert calls == 2
+
+
+@pytest.mark.django_db
+def test_download_rejects_stale_rows_after_successful_validation_cache(tmp_path):
+    from django.core.cache import cache
+
+    from apps.batches import exports
+    from apps.batches.models import BatchItem
+
+    cache.clear()
+    job = BatchJob.objects.create(secret_hash="hash", total_count=1)
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        inchikey="ORIGINAL",
+        status="FAILED",
+    )
+    path = tmp_path / "export.csv"
+    path.write_text("good\n")
+    artifact = ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token="token-stale-after-valid-cache",
+        path=str(path),
+        checksum=exports._checksum_file(path),
+        byte_size=path.stat().st_size,
+        rows_signature=exports._compute_rows_signature(job),
+        row_count=1,
+        job_state_signature=exports._job_state_signature(job),
+        expires_at=timezone.now() + timedelta(days=1),
+    )
+
+    assert get_export_path(artifact.token) == path
+
+    item.inchikey = "CHANGED"
+    item.save(update_fields=["inchikey"])
+
+    assert exports._job_state_signature(job) == artifact.job_state_signature
+    assert exports._compute_rows_signature(job) != artifact.rows_signature
+    assert get_export_path(artifact.token) is None
