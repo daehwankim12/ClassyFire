@@ -202,9 +202,28 @@ def _run_migrations(db: str) -> None:
     )
 
 
+def _run_pg_tool(args: list[str], *, what: str) -> subprocess.CompletedProcess:
+    """Run a pg client tool, surfacing stdout+stderr when it exits non-zero.
+
+    subprocess.run(check=True) raises CalledProcessError WITHOUT the captured
+    stderr in its message, which hides the real pg_restore/pg_dump diagnostic
+    (e.g. "errors ignored on restore: N" plus the offending object). Raise our
+    own error that includes both streams instead.
+    """
+    result = subprocess.run(args, env=_env(), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{what} exited {result.returncode}\n"
+            f"--- command ---\n{' '.join(args)}\n"
+            f"--- stdout ---\n{result.stdout}\n"
+            f"--- stderr ---\n{result.stderr}"
+        )
+    return result
+
+
 def _pg_dump(src_db: str, dump_path: str) -> None:
     """Dump src_db excluding classyfire_seed* to dump_path."""
-    subprocess.run(
+    _run_pg_tool(
         [
             "pg_dump",
             "-h", CONN["host"],
@@ -215,16 +234,13 @@ def _pg_dump(src_db: str, dump_path: str) -> None:
             "--exclude-table=classyfire_seed*",
             "-f", dump_path,
         ],
-        env=_env(),
-        capture_output=True,
-        text=True,
-        check=True,
+        what="pg_dump",
     )
 
 
 def _pg_restore(dst_db: str, dump_path: str) -> None:
     """Restore dump_path into dst_db."""
-    subprocess.run(
+    _run_pg_tool(
         [
             "pg_restore",
             "-h", CONN["host"],
@@ -235,10 +251,7 @@ def _pg_restore(dst_db: str, dump_path: str) -> None:
             "--if-exists",
             dump_path,
         ],
-        env=_env(),
-        capture_output=True,
-        text=True,
-        check=True,
+        what="pg_restore",
     )
 
 
