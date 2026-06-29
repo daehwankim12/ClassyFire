@@ -202,3 +202,64 @@ def test_sweep_noop_when_disabled(settings):
     settings.STRUCTURE_RESOLVE_ENABLED = False
     stats = resolve_pending_structures()
     assert stats == {"keys": 0, "resolved_keys": 0, "items": 0}
+
+
+def test_sweep_skips_remote_disabled_need_structure_items(settings, monkeypatch):
+    _enable(settings)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("remote-disabled jobs must not trigger resolver HTTP calls")
+
+    monkeypatch.setattr(structure_providers, "_request", boom)
+
+    job = BatchJob.objects.create(secret_hash=make_password("s"), remote_enabled=False)
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=ETHANOL_IK,
+        inchikey=ETHANOL_IK,
+        status=BatchItemStatus.NEED_STRUCTURE,
+    )
+
+    stats = resolve_pending_structures()
+    assert stats == {"keys": 0, "resolved_keys": 0, "items": 0}
+
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+
+def test_sweep_does_not_apply_resolved_structure_to_remote_disabled_items(settings, monkeypatch):
+    _enable(settings)
+
+    def responder(method, url, *, json_body=None):
+        if "pubchem" in url:
+            return (200, _pubchem_inchi_body(ETHANOL_INCHI))
+        return (404, "")
+
+    monkeypatch.setattr(structure_providers, "_request", responder)
+
+    remote_job = BatchJob.objects.create(secret_hash=make_password("s1"), remote_enabled=True)
+    local_job = BatchJob.objects.create(secret_hash=make_password("s2"), remote_enabled=False)
+    remote_item = BatchItem.objects.create(
+        job=remote_job,
+        row_order=0,
+        original_input=ETHANOL_IK,
+        inchikey=ETHANOL_IK,
+        status=BatchItemStatus.NEED_STRUCTURE,
+    )
+    local_item = BatchItem.objects.create(
+        job=local_job,
+        row_order=0,
+        original_input=ETHANOL_IK,
+        inchikey=ETHANOL_IK,
+        status=BatchItemStatus.NEED_STRUCTURE,
+    )
+
+    stats = resolve_pending_structures()
+    assert stats["resolved_keys"] == 1
+    assert stats["items"] == 1
+
+    remote_item.refresh_from_db()
+    local_item.refresh_from_db()
+    assert remote_item.status != BatchItemStatus.NEED_STRUCTURE
+    assert local_item.status == BatchItemStatus.NEED_STRUCTURE

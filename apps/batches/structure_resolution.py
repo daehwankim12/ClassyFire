@@ -41,7 +41,9 @@ def resolve_pending_structures(limit: int | None = None) -> dict[str, int]:
         limit = int(getattr(settings, "STRUCTURE_RESOLVE_SWEEP_LIMIT", 25))
 
     inchikeys = list(
-        BatchItem.objects.filter(status=BatchItemStatus.NEED_STRUCTURE)
+        BatchItem.objects.filter(
+            status=BatchItemStatus.NEED_STRUCTURE, job__remote_enabled=True
+        )
         .exclude(inchikey__isnull=True)
         .exclude(inchikey="")
         .values_list("inchikey", flat=True)
@@ -54,11 +56,13 @@ def resolve_pending_structures(limit: int | None = None) -> dict[str, int]:
         resolved = resolve_structure(inchikey)
         if resolved is None:
             continue
-        # Apply to EVERY item (across jobs) still waiting on this key. Each
+        # Apply only to remote-enabled items still waiting on this key. Each
         # submit_structure_for_item is independently row-locked + re-verifies.
         item_ids = list(
             BatchItem.objects.filter(
-                status=BatchItemStatus.NEED_STRUCTURE, inchikey=inchikey
+                status=BatchItemStatus.NEED_STRUCTURE,
+                inchikey=inchikey,
+                job__remote_enabled=True,
             ).values_list("id", flat=True)
         )
         applied = False
