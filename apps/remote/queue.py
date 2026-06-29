@@ -30,9 +30,19 @@ from django.db import IntegrityError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from apps.core.enums import TaskState
+from apps.core.enums import (
+    QueryState,
+    RemoteQueryItemApplyState,
+    SubmissionState,
+    TaskState,
+)
 from apps.remote.budget import normalize_principal, reserve_remote_budget
-from apps.remote.models import RemotePrincipalState, RemoteQueueControl, RemoteTask
+from apps.remote.models import (
+    RemotePrincipalState,
+    RemoteQueryItem,
+    RemoteQueueControl,
+    RemoteTask,
+)
 
 
 class RemoteQueueBackpressure(Exception):  # noqa: N818 - domain backpressure signal
@@ -511,6 +521,51 @@ def finish_task(task: RemoteTask) -> None:
     transition(task, TaskState.DONE, lock_owner=None, locked_at=None)
 
 
+def _fail_live_remote_query_state_for_timed_out_task(
+    task: RemoteTask, message: str
+) -> None:
+    """Make live query/submission rows consistent when a task times out."""
+    now = timezone.now()
+    query_ids = list(
+        RemoteQueryItem.objects.filter(
+            task=task,
+            query__state__in=[QueryState.SUBMITTED, QueryState.POLLING],
+        ).values_list("query_id", flat=True)
+    )
+    if not query_ids:
+        return
+
+    RemoteQueryItem.objects.filter(task=task, query_id__in=query_ids).update(
+        apply_state=RemoteQueryItemApplyState.FAILED,
+        apply_detail=message,
+        applied_at=now,
+    )
+
+    from apps.remote.models import RemoteQuery, RemoteSubmission, RemoteSubmissionMember
+
+    queries = RemoteQuery.objects.select_for_update().filter(pk__in=query_ids)
+    for query in queries:
+        query.state = QueryState.FAILED
+        query.completed_at = now
+        query.save(update_fields=["state", "completed_at"])
+
+        submissions = RemoteSubmission.objects.select_for_update().filter(
+            query=query,
+            state__in=[s.value for s in SubmissionState.live_states()],
+        )
+        for submission in submissions:
+            submission.state = SubmissionState.FAILED
+            submission.detail = message
+            submission.save(update_fields=["state", "detail", "updated_at"])
+            RemoteSubmissionMember.objects.filter(
+                submission=submission, active=True
+            ).update(
+                active=False,
+                released_at=now,
+                release_reason="task_timed_out",
+            )
+
+
 def timeout_stale_tasks(
     timeout_hours: int | None = None, *, limit: int = 500
 ) -> int:
@@ -562,6 +617,7 @@ def timeout_stale_tasks(
                 # and the lock. Skip — never double-finish.
                 continue
             inchikey = task.inchikey
+            _fail_live_remote_query_state_for_timed_out_task(task, message)
             # We hold the row lock, so a plain (unfenced) transition is correct.
             transition_locked(
                 task, TaskState.DONE, lock_owner=None, locked_at=None

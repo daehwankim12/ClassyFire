@@ -117,3 +117,61 @@ def test_recompute_counts_timed_out_as_completed():
     job.refresh_from_db()
     assert job.status == BatchJobStatus.COMPLETE
     assert job.completed_count == 1
+
+
+def test_timeout_terminalizes_live_query_submission_state():
+    """Timed-out submitted tasks must not leave live rows that poison resubmit."""
+    from apps.core.enums import QueryState, RemoteQueryItemApplyState, SubmissionState
+    from apps.remote.models import (
+        RemoteQuery,
+        RemoteQueryItem,
+        RemoteSubmission,
+        RemoteSubmissionMember,
+    )
+
+    job = _job()
+    _delayed_item(job, IK_A)
+    task = RemoteTask.objects.create(inchikey=IK_A, state=TaskState.POLL_WAIT)
+    RemoteTask.objects.filter(pk=task.pk).update(
+        created_at=timezone.now() - dt.timedelta(hours=30)
+    )
+    task.refresh_from_db()
+    query = RemoteQuery.objects.create(
+        provider="wishart",
+        remote_query_id="remote-timeout-test",
+        payload_hash="payload-hash",
+        state=QueryState.SUBMITTED,
+    )
+    RemoteQueryItem.objects.create(query=query, task=task, inchikey=IK_A)
+    submission = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash="payload-hash",
+        state=SubmissionState.SUBMITTED,
+        query=query,
+        remote_query_id=query.remote_query_id,
+        request_payload={"structures": ["C"]},
+    )
+    member = RemoteSubmissionMember.objects.create(
+        submission=submission,
+        provider="wishart",
+        inchikey=IK_A,
+        structure_hash="0" * 64,
+    )
+
+    assert queue.timeout_stale_tasks(timeout_hours=24) == 1
+
+    task.refresh_from_db()
+    query.refresh_from_db()
+    submission.refresh_from_db()
+    member.refresh_from_db()
+    qitem = RemoteQueryItem.objects.get(query=query, inchikey=IK_A)
+
+    assert task.state == TaskState.DONE
+    assert qitem.apply_state == RemoteQueryItemApplyState.FAILED
+    assert "timed out" in (qitem.apply_detail or "").lower()
+    assert query.state == QueryState.FAILED
+    assert query.completed_at is not None
+    assert submission.state == SubmissionState.FAILED
+    assert "timed out" in (submission.detail or "").lower()
+    assert member.active is False
+    assert member.release_reason == "task_timed_out"
