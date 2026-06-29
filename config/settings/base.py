@@ -212,6 +212,29 @@ REMOTE_SUBMISSION_TTL_SECONDS: int = env_int(
 # (measured from creation), the reaper marks it DONE and fans its items out to
 # REMOTE_TIMED_OUT so the job can complete. Set to 0 to disable the reaper.
 REMOTE_DELAYED_TIMEOUT_HOURS: int = env_int("REMOTE_DELAYED_TIMEOUT_HOURS", 24)
+# Structure resolution: when an InChIKey-only item misses local caches AND
+# Wishart's entity endpoint (NEED_STRUCTURE), resolve its structure from public
+# key-free DBs, verify it re-hashes to the SAME InChIKey, and auto-submit it for
+# calculation. Strictly additive — an unresolved key stays NEED_STRUCTURE. The
+# ordered provider chain is key-free; per-provider polite rates (spent smoothly,
+# burst 1) are hard-coded in apps/remote/structure_providers.py.
+STRUCTURE_RESOLVE_ENABLED: bool = env_bool("STRUCTURE_RESOLVE_ENABLED", True)
+STRUCTURE_RESOLVE_PROVIDERS: tuple[str, ...] = tuple(
+    p.strip().lower()
+    for p in env_str("STRUCTURE_RESOLVE_PROVIDERS", "pubchem,cactus").split(",")
+    if p.strip()
+)
+STRUCTURE_RESOLVE_TIMEOUT_SECONDS: int = env_int("STRUCTURE_RESOLVE_TIMEOUT_SECONDS", 15)
+# Max distinct InChIKeys SCANNED per background sweep pass. Outbound call volume
+# is bounded by the per-provider rate limiter (not this); cached-miss keys are
+# skipped cheaply, so this just needs to comfortably exceed the count of
+# still-pending NEED_STRUCTURE keys so the tail is never starved.
+STRUCTURE_RESOLVE_SWEEP_LIMIT: int = env_int("STRUCTURE_RESOLVE_SWEEP_LIMIT", 200)
+# How long a DEFINITIVE all-provider miss (compound in no public DB) is cached so
+# it is not re-queried every sweep. Transient skips are never cached. 0 disables.
+STRUCTURE_RESOLVE_MISS_TTL_SECONDS: int = env_int(
+    "STRUCTURE_RESOLVE_MISS_TTL_SECONDS", 21600
+)
 REMOTE_DAILY_BUDGET_PER_PRINCIPAL: int = env_int(
     "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", 100
 )

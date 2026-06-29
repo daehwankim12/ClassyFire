@@ -12,6 +12,7 @@ HTTP upload routes defer.
 """
 from __future__ import annotations
 
+import logging
 import socket
 import time
 import uuid
@@ -25,9 +26,16 @@ from apps.batches.services import (
     process_claimed_job,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class Command(BaseCommand):
     help = "Run the durable batch-ingest processing loop (claim + process jobs)."
+
+    # How often the loop runs the NEED_STRUCTURE auto-resolution sweep. The
+    # resolver's per-provider rate limiter (not this interval) bounds outbound
+    # call volume, so a short interval just keeps the queue draining.
+    _RESOLVE_INTERVAL_SECONDS = 15.0
 
     def add_arguments(self, parser: Any) -> None:
         parser.add_argument(
@@ -49,8 +57,14 @@ class Command(BaseCommand):
         self.stdout.write(
             self.style.SUCCESS(f"process_jobs starting (worker_id={worker_id})")
         )
+        # Seed in the past so the first cycle runs a sweep immediately.
+        last_resolve = time.monotonic() - self._RESOLVE_INTERVAL_SECONDS
         try:
             while True:
+                now = time.monotonic()
+                if now - last_resolve >= self._RESOLVE_INTERVAL_SECONDS:
+                    last_resolve = now
+                    self._resolve_pending_structures()
                 job = claim_job_for_processing(worker_id)
                 if job is None:
                     if once:
@@ -71,3 +85,19 @@ class Command(BaseCommand):
                     )
         except KeyboardInterrupt:  # pragma: no cover - operator Ctrl-C
             self.stdout.write(self.style.WARNING("process_jobs stopping"))
+
+    def _resolve_pending_structures(self) -> None:
+        """Run one structure-resolution sweep; never let it crash the loop."""
+        from apps.batches.structure_resolution import resolve_pending_structures
+
+        try:
+            stats = resolve_pending_structures()
+        except Exception:  # pragma: no cover - sweep must never kill the loop
+            logger.exception("structure-resolution sweep failed")
+            return
+        if stats.get("items"):
+            logger.info(
+                "structure resolve: %s key(s) → %s item(s) re-queued",
+                stats["resolved_keys"],
+                stats["items"],
+            )
