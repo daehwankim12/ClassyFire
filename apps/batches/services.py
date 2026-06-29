@@ -81,7 +81,7 @@ from apps.classifications.services import (
     lookup_current_classification,
     lookup_current_classifications,
 )
-from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_skeleton
+from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_modulo_flag
 from apps.compounds.models import CompoundStructure, CompoundUsage
 from apps.compounds.validators import NormalizedRow, normalize_row
 from apps.core.enums import (
@@ -368,11 +368,14 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
         if item.inchikey and norm.inchikey != item.inchikey:
             # A NON-STANDARD stored key can never equal the structure's recomputed
             # STANDARD key, but the supplied structure is authoritative: adopt its
-            # standard key when the connectivity skeleton (first block) matches —
-            # a guard against pasting an unrelated structure. A standard stored
-            # key must still match exactly.
+            # standard key when the two keys match on connectivity AND the block-2
+            # stereo/isotope/charge hash (i.e. differ ONLY by the standard/
+            # non-standard flag). A bare connectivity-skeleton match is NOT enough
+            # — stereoisomers share connectivity but differ in the block-2 hash, so
+            # accepting one would adopt the wrong isomer. A standard stored key
+            # must still match exactly.
             adopt_standard = not is_standard_inchikey(item.inchikey) and (
-                same_inchikey_skeleton(item.inchikey, norm.inchikey)
+                same_inchikey_modulo_flag(item.inchikey, norm.inchikey)
             )
             if not adopt_standard:
                 raise StructureKeyMismatchError(norm.inchikey, item.inchikey)

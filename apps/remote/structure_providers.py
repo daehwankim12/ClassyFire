@@ -41,7 +41,7 @@ import httpx
 from django.conf import settings
 from django.core.cache import cache
 
-from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_skeleton
+from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_modulo_flag
 from apps.remote.circuit import DbCircuitBreaker
 from apps.remote.rate_limit import DbTokenBucket
 
@@ -155,15 +155,19 @@ def _key_matches(requested: str, computed: str | None) -> bool:
     to the requested key.
 
     Exact match for a standard requested key. A NON-STANDARD requested key can
-    never equal the structure's recomputed STANDARD key, so accept it on a
-    connectivity-skeleton (first-block) match — the structure is authoritative
-    and submit_structure_for_item then re-indexes the item under the standard key.
+    never equal the structure's recomputed STANDARD key, so accept it only when
+    the two keys match on connectivity AND the block-2 stereo/isotope/charge hash
+    (i.e. differ ONLY by the standard/non-standard flag). A bare connectivity
+    (skeleton) match is NOT enough — stereoisomers share the connectivity block
+    but differ in the block-2 hash, and accepting one would classify the wrong
+    isomer. submit_structure_for_item then re-indexes the item under the standard
+    key.
     """
     if not computed:
         return False
     if computed == requested:
         return True
-    return not is_standard_inchikey(requested) and same_inchikey_skeleton(
+    return not is_standard_inchikey(requested) and same_inchikey_modulo_flag(
         requested, computed
     )
 
