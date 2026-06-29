@@ -41,6 +41,7 @@ import httpx
 from django.conf import settings
 from django.core.cache import cache
 
+from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_skeleton
 from apps.remote.circuit import DbCircuitBreaker
 from apps.remote.rate_limit import DbTokenBucket
 
@@ -149,6 +150,24 @@ def _miss_cache_key(inchikey: str) -> str:
     return f"structresolve:miss:{inchikey}"
 
 
+def _key_matches(requested: str, computed: str | None) -> bool:
+    """True iff a resolved structure's recomputed (standard) InChIKey corresponds
+    to the requested key.
+
+    Exact match for a standard requested key. A NON-STANDARD requested key can
+    never equal the structure's recomputed STANDARD key, so accept it on a
+    connectivity-skeleton (first-block) match — the structure is authoritative
+    and submit_structure_for_item then re-indexes the item under the standard key.
+    """
+    if not computed:
+        return False
+    if computed == requested:
+        return True
+    return not is_standard_inchikey(requested) and same_inchikey_skeleton(
+        requested, computed
+    )
+
+
 def _fetch(provider: str, inchikey: str) -> tuple[str, str | None]:
     """One rate-limited, circuit-guarded fetch from a single provider.
 
@@ -218,7 +237,7 @@ def resolve_structure(inchikey: str) -> ResolvedStructure | None:
         if outcome == "miss" or structure is None:
             continue
         norm = normalize_row(structure)
-        if norm.error is None and norm.inchikey == inchikey:
+        if norm.error is None and _key_matches(inchikey, norm.inchikey):
             return ResolvedStructure(structure=structure, source=provider)
         # Provider HAD data but it re-hashes to a different key — a definitive
         # (not skipped) non-result for this provider; fall through to the next.

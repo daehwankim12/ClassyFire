@@ -78,8 +78,19 @@ from apps.classifications.services import (
     lookup_current_classification,
     lookup_current_classifications,
 )
+from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_skeleton
 from apps.compounds.models import CompoundStructure, CompoundUsage
 from apps.compounds.validators import NormalizedRow, normalize_row
+
+# Shown for a bare NON-STANDARD InChIKey input: it cannot be matched against the
+# standard-keyed caches directly (InChIKey is a one-way hash), but supplying the
+# structure lets us re-index it under its standard key (see
+# submit_structure_for_item, which adopts the structure's standard key).
+NON_STANDARD_INCHIKEY_MESSAGE = (
+    "Non-standard InChIKey: cannot match standard caches directly. Provide the "
+    "structure (SMILES/InChI) or a standard InChIKey — a supplied structure is "
+    "re-indexed under its standard key."
+)
 from apps.core.enums import (
     CLAIMABLE_PROCESSING_STATES,
     BatchItemStatus,
@@ -339,7 +350,16 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                 "Item already has a classification snapshot."
             )
         if item.inchikey and norm.inchikey != item.inchikey:
-            raise StructureKeyMismatchError(norm.inchikey, item.inchikey)
+            # A NON-STANDARD stored key can never equal the structure's recomputed
+            # STANDARD key, but the supplied structure is authoritative: adopt its
+            # standard key when the connectivity skeleton (first block) matches —
+            # a guard against pasting an unrelated structure. A standard stored
+            # key must still match exactly.
+            adopt_standard = not is_standard_inchikey(item.inchikey) and (
+                same_inchikey_skeleton(item.inchikey, norm.inchikey)
+            )
+            if not adopt_standard:
+                raise StructureKeyMismatchError(norm.inchikey, item.inchikey)
 
         resolved_inchikey = norm.inchikey
         item.inchikey = resolved_inchikey
@@ -535,6 +555,12 @@ def _process_item(
         )
         item.compound = compound
         _update_usage(norm.inchikey)
+
+        # A bare NON-STANDARD InChIKey can't match standard-keyed caches; flag it
+        # so the eventual NEED_STRUCTURE state is explained (a supplied structure
+        # is later re-indexed under its standard key).
+        if not has_structure and not is_standard_inchikey(norm.inchikey):
+            item.message = NON_STANDARD_INCHIKEY_MESSAGE
 
         if not remote_enabled:
             if has_structure:
