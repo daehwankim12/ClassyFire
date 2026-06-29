@@ -23,3 +23,13 @@ def test_from_settings_pins_burst_to_one(settings):
     # Refill cadence still tracks the per-minute settings (120/min = 2/sec).
     assert lim.entity.refill_rate_per_sec == pytest.approx(120 / 60)
     assert lim.submit.refill_rate_per_sec == pytest.approx(10 / 60)
+
+
+def test_db_entity_retry_delay_matches_refill_cadence(db):
+    lim = DbRateLimiter(entity_per_min=120, submit_per_min=0, entity_capacity=1)
+
+    assert lim.entity.allow() is True
+    assert lim.entity.allow() is False
+
+    delay = lim.entity.retry_after_seconds()
+    assert 0 < delay <= 0.55

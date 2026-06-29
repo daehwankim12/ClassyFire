@@ -77,6 +77,18 @@ from apps.remote.rate_limit import DbRateLimiter
 
 logger = logging.getLogger(__name__)
 
+
+def _bucket_retry_delay_seconds(bucket: object, fallback: float = 5.0) -> float:
+    """Return the bucket-specific retry delay after a rate-limit miss."""
+    retry_after = getattr(bucket, "retry_after_seconds", None)
+    if retry_after is None:
+        return fallback
+    delay = retry_after()
+    if delay <= 0:
+        return 0.0
+    return delay
+
+
 # Provider namespace for the outbox/circuit/rate-bucket rows. Single provider
 # today; kept explicit so the idempotency key and shared state are namespaced.
 PROVIDER = "wishart"
@@ -303,7 +315,10 @@ class RemoteWorker:
 
     def _entity_first(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
         if not self.rate_limiter.entity.allow():
-            queue.defer_task(task, delay_seconds=5)
+            queue.defer_task(
+                task,
+                delay_seconds=_bucket_retry_delay_seconds(self.rate_limiter.entity),
+            )
             fanout.mark_items_delayed(task.inchikey)
             return
         try:
@@ -1285,7 +1300,10 @@ class RemoteWorker:
             queue.transition(
                 task,
                 TaskState.POLL_WAIT,
-                next_run_at=timezone.now() + timedelta(seconds=5),
+                next_run_at=timezone.now()
+                + timedelta(
+                    seconds=_bucket_retry_delay_seconds(self.rate_limiter.entity)
+                ),
                 lock_owner=None,
                 locked_at=None,
             )

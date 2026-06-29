@@ -121,6 +121,33 @@ class DbTokenBucket:
             )
             return False
 
+    def retry_after_seconds(self) -> float:
+        """Seconds until the next token/probe should be available.
+
+        Used by queue workers after an ``allow()`` miss so a smooth capacity-1
+        bucket is retried at its refill cadence instead of an unrelated fixed
+        delay. ``Retry-After`` blocks retain absolute precedence.
+        """
+        from apps.remote.models import RemoteRateBucket
+
+        if self.capacity <= 0 and self.refill_rate_per_sec <= 0:
+            return 0.0
+        self._ensure_row()
+        now = timezone.now()
+        row = RemoteRateBucket.objects.filter(
+            provider=self.provider, bucket=self.bucket
+        ).get()
+        if row.blocked_until is not None and now < row.blocked_until:
+            return max((row.blocked_until - now).total_seconds(), 0.0)
+        elapsed = max((now - row.updated_at).total_seconds(), 0.0)
+        refilled = min(
+            float(row.capacity),
+            row.tokens + elapsed * row.refill_rate_per_sec,
+        )
+        if refilled >= 1.0 or row.refill_rate_per_sec <= 0:
+            return 0.0
+        return max((1.0 - refilled) / row.refill_rate_per_sec, 0.0)
+
     def penalize(self, retry_after: float | None) -> None:
         """Park the shared bucket until ``now + retry_after`` (server precedence)."""
         if retry_after is None or retry_after <= 0:
@@ -221,6 +248,13 @@ class _Bucket:
             return False
         self._events.append(self.clock())
         return True
+
+    def retry_after_seconds(self) -> float:
+        """Seconds until this in-process bucket should be retried."""
+        retry_at = self.retry_at()
+        if retry_at is None:
+            return 0.0
+        return max(retry_at - self.clock(), 0.0)
 
     def penalize(self, retry_after: float | None) -> None:
         """Park this bucket for ``retry_after`` seconds (server precedence)."""
