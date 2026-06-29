@@ -46,6 +46,7 @@ ETHANOL_INCHIKEY = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
 GHOST_INCHIKEY = "RDHQFKQIGNGIED-MRVPVSSYSA-N"
 GHOST_SMILES = "N[C@@H](Cc1c[nH]c2ccccc12)C(=O)O"  # L-Trp canonical form
 GHOST_INCHIKEY2 = "QNAYBMKLOCPYGJ-REOHCLBHSA-N"
+NONSTANDARD_GHOST_INCHIKEY = "SDIVYZXRQHWCKF-UHFFFAOYNA-N"
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +314,52 @@ def test_inchikey_only_miss_remote_enabled_creates_remote_task():
 
     # A RemoteTask must exist for this inchikey
     assert RemoteTask.objects.filter(inchikey=GHOST_INCHIKEY).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_nonstandard_inchikey_only_remote_enabled_waits_for_structure_resolver():
+    """A non-standard bare InChIKey enters the structure-resolution path first."""
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import NON_STANDARD_INCHIKEY_MESSAGE
+    from apps.core.enums import BatchItemStatus
+    from apps.remote.models import RemoteTask
+
+    RemoteTask.objects.filter(inchikey=NONSTANDARD_GHOST_INCHIKEY).delete()
+
+    response = _create_and_process_job(NONSTANDARD_GHOST_INCHIKEY, remote_enabled=True)
+    data = response.json()
+
+    job = BatchJob.objects.get(pk=data["job_id"])
+    item = BatchItem.objects.get(job=job)
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+    assert item.message == NON_STANDARD_INCHIKEY_MESSAGE
+    assert not RemoteTask.objects.filter(inchikey=NONSTANDARD_GHOST_INCHIKEY).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_inchikey_only_reusing_retry_wait_task_is_remote_delayed():
+    """A new row joining an already-delayed remote task must not appear pending."""
+    from django.utils import timezone
+
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.core.enums import BatchItemStatus, TaskState
+    from apps.remote.models import RemoteTask
+
+    RemoteTask.objects.filter(inchikey=GHOST_INCHIKEY).delete()
+    RemoteTask.objects.create(
+        inchikey=GHOST_INCHIKEY,
+        state=TaskState.RETRY_WAIT,
+        next_run_at=timezone.now() + dt.timedelta(minutes=5),
+    )
+
+    response = _create_and_process_job(GHOST_INCHIKEY, remote_enabled=True)
+    data = response.json()
+
+    job = BatchJob.objects.get(pk=data["job_id"])
+    item = BatchItem.objects.get(job=job)
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.message == "Wishart is retrying this InChIKey; waiting for the next retry window."
+    assert RemoteTask.objects.filter(inchikey=GHOST_INCHIKEY).count() == 1
 
 
 @pytest.mark.django_db(transaction=True)

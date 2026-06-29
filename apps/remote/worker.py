@@ -36,6 +36,7 @@ from django.conf import settings
 from django.db import DataError, IntegrityError, transaction
 from django.utils import timezone
 
+from apps.batches.remote_delay import CIRCUIT_OPEN_MESSAGE
 from apps.classifications.result_writer import (
     persistable_returned_inchikey,
     write_live_result,
@@ -246,7 +247,10 @@ class RemoteWorker:
             # Circuit open: skip remote calls, park as DEFERRED. Local lookups +
             # queue accumulation continue elsewhere (NFR-P05).
             queue.defer_task(task, delay_seconds=self.lease_seconds)
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(
+                task.inchikey,
+                message=CIRCUIT_OPEN_MESSAGE,
+            )
             return
 
         try:

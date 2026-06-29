@@ -14,6 +14,12 @@ from collections.abc import Iterable
 from django.db import transaction
 
 from apps.batches.models import BatchItem
+from apps.batches.remote_delay import (
+    AUTH_BLOCKED_MESSAGE,
+    CIRCUIT_OPEN_MESSAGE,
+    PROTOCOL_RETRY_MESSAGE,
+    RETRYABLE_REMOTE_MESSAGE,
+)
 from apps.core.enums import BatchItemStatus
 
 # BatchItem statuses considered "waiting on a remote result" for a given key.
@@ -30,7 +36,7 @@ FOUND_STATUSES = (
 )
 
 
-def mark_items_delayed(inchikey: str) -> list[uuid.UUID]:
+def mark_items_delayed(inchikey: str, *, message: str | None = None) -> list[uuid.UUID]:
     """Transition all PENDING_CLASSIFICATION items for *inchikey* to REMOTE_DELAYED.
 
     Called by the worker after parking a task for retry/defer (schedule_retry or
@@ -53,13 +59,67 @@ def mark_items_delayed(inchikey: str) -> list[uuid.UUID]:
             .distinct()
         )
         if affected_jobs:
+            update_values: dict[str, object] = {
+                "status": BatchItemStatus.REMOTE_DELAYED,
+            }
+            delayed_message = message or _delay_message_for(inchikey)
+            if delayed_message:
+                update_values["message"] = delayed_message
             BatchItem.objects.filter(
                 inchikey=inchikey,
                 status=BatchItemStatus.PENDING_CLASSIFICATION,
-            ).update(status=BatchItemStatus.REMOTE_DELAYED)
+            ).update(**update_values)
             for job_id in affected_jobs:
                 recompute_job_counters(job_id)
     return affected_jobs
+
+
+def _delay_message_for(inchikey: str) -> str | None:
+    from apps.core.enums import CircuitState, ProviderControlState, TaskState
+    from apps.remote.models import (
+        RemoteAttempt,
+        RemoteCircuit,
+        RemoteProviderControl,
+        RemoteTask,
+    )
+
+    latest_attempt = (
+        RemoteAttempt.objects.filter(task__inchikey=inchikey)
+        .order_by("-created_at", "-pk")
+        .first()
+    )
+    if RemoteProviderControl.objects.filter(
+        provider="wishart",
+        state=ProviderControlState.AUTH_BLOCKED,
+    ).exists() or (
+        latest_attempt is not None
+        and latest_attempt.classification == "AUTH_FAILURE"
+    ):
+        return AUTH_BLOCKED_MESSAGE
+    if RemoteCircuit.objects.filter(
+        provider="wishart",
+        state=CircuitState.OPEN,
+    ).exists():
+        return CIRCUIT_OPEN_MESSAGE
+    if latest_attempt is not None:
+        if latest_attempt.classification == "RETRYABLE":
+            return RETRYABLE_REMOTE_MESSAGE
+        if latest_attempt.http_status in {408, 425, 429}:
+            return RETRYABLE_REMOTE_MESSAGE
+        if latest_attempt.http_status is not None and latest_attempt.http_status >= 500:
+            return RETRYABLE_REMOTE_MESSAGE
+        if latest_attempt.classification == "PROTOCOL_ERROR":
+            return PROTOCOL_RETRY_MESSAGE
+
+    active_task = (
+        RemoteTask.objects.filter(inchikey=inchikey)
+        .exclude(state=TaskState.DONE)
+        .order_by("-updated_at", "-pk")
+        .first()
+    )
+    if active_task is not None and active_task.state == TaskState.RETRY_WAIT:
+        return RETRYABLE_REMOTE_MESSAGE
+    return None
 
 
 def fan_out_result(inchikey: str, status: BatchItemStatus) -> list[uuid.UUID]:

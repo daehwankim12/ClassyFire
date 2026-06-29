@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import uuid
 
 import pytest
 from django.test import Client
@@ -93,6 +94,25 @@ def _worker(provider, **kw) -> RemoteWorker:
         circuit=kw.pop("circuit", CircuitBreaker(failure_threshold=1000)),
         **kw,
     )
+
+
+def _claim_specific_task(task: RemoteTask, worker_id: str = "w-test") -> RemoteTask:
+    task.state = TaskState.LOCKED
+    task.lock_owner = worker_id
+    task.locked_at = timezone.now()
+    task.lease_token = uuid.uuid4()
+    task.lease_version += 1
+    task.save(
+        update_fields=[
+            "state",
+            "lock_owner",
+            "locked_at",
+            "lease_token",
+            "lease_version",
+            "updated_at",
+        ]
+    )
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -1219,20 +1239,28 @@ def test_remote_disabled_accumulates_without_calls(settings):
 # ---------------------------------------------------------------------------
 
 
-def test_retry_transitions_pending_to_remote_delayed():
+def test_retry_transitions_pending_to_remote_delayed(settings):
     """When a task is parked for retry (retryable error), waiting items must
     transition from PENDING_CLASSIFICATION to REMOTE_DELAYED so the user-facing
     status is immediately surfaced (spec §6.2)."""
+    settings.REMOTE_ENABLED = True
+    inchikey = "RETRYTESTAAAAA-UHFFFAOYSA-N"
+    RemoteTask.objects.filter(inchikey=inchikey).delete()
     job = _job()
-    item = _item(job, IK_A, 0)  # starts PENDING_CLASSIFICATION (new default)
+    item = _item(job, inchikey, 0)  # starts PENDING_CLASSIFICATION (new default)
     assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
 
-    queue.enqueue_task(IK_A)
-    provider = MockProvider(entity_retryable_for={IK_A})
+    task = RemoteTask.objects.create(
+        inchikey=inchikey,
+        priority=1_000_000,
+        attempt=0,
+    )
+    task = _claim_specific_task(task)
+    provider = MockProvider(entity_retryable_for={inchikey})
     worker = _worker(provider)
-    worker.tick()
+    worker.process(task, claim=queue.claim_from_task(task))
 
-    task = RemoteTask.objects.get(inchikey=IK_A)
+    task = RemoteTask.objects.get(inchikey=inchikey)
     assert task.state == TaskState.RETRY_WAIT, (
         "Task must be in RETRY_WAIT after a retryable error"
     )
@@ -1241,32 +1269,44 @@ def test_retry_transitions_pending_to_remote_delayed():
     assert item.status == BatchItemStatus.REMOTE_DELAYED, (
         f"Waiting item must be REMOTE_DELAYED after retry, got {item.status}"
     )
+    assert item.message == "Wishart returned a retryable error; retrying later."
 
 
-def test_circuit_open_defer_transitions_pending_to_remote_delayed():
+def test_circuit_open_defer_transitions_pending_to_remote_delayed(settings):
     """When the circuit is open, the task is deferred; waiting items must
     transition from PENDING_CLASSIFICATION to REMOTE_DELAYED."""
     from apps.remote.circuit import CircuitBreaker
 
+    settings.REMOTE_ENABLED = True
+    inchikey = "CIRCUITKEYAAAA-UHFFFAOYSA-N"
+    RemoteTask.objects.filter(inchikey=inchikey).delete()
     breaker = CircuitBreaker(failure_threshold=1, reset_timeout=999)
     breaker.record_failure()  # trip the circuit open
 
     job = _job()
-    item = _item(job, IK_A, 0)  # starts PENDING_CLASSIFICATION
+    item = _item(job, inchikey, 0)  # starts PENDING_CLASSIFICATION
     assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
 
-    queue.enqueue_task(IK_A)
-    provider = MockProvider(entities={IK_A: build_raw(IK_A)})
+    task = RemoteTask.objects.create(
+        inchikey=inchikey,
+        priority=1_000_000,
+        attempt=0,
+    )
+    task = _claim_specific_task(task)
+    provider = MockProvider(entities={inchikey: build_raw(inchikey)})
     worker = _worker(provider, circuit=breaker)
-    worker.tick()
+    worker.process(task, claim=queue.claim_from_task(task))
 
-    task = RemoteTask.objects.get(inchikey=IK_A)
+    task = RemoteTask.objects.get(inchikey=inchikey)
     assert task.state == TaskState.DEFERRED, (
         "Task must be DEFERRED when circuit is open"
     )
     item.refresh_from_db()
     assert item.status == BatchItemStatus.REMOTE_DELAYED, (
         f"Waiting item must be REMOTE_DELAYED after circuit-open defer, got {item.status}"
+    )
+    assert item.message == (
+        "Wishart calls are paused by the circuit breaker; retrying after cooldown."
     )
 
 

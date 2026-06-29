@@ -27,6 +27,16 @@ REMOTE_DELAYED_DEFAULT_MESSAGE = (
 QUEUE_CAPACITY_MESSAGE = "Remote queue is at capacity; retrying later."
 BUDGET_EXCEEDED_MESSAGE = "Remote budget exceeded for this principal."
 REMOTE_DISABLED_MESSAGE = "Structure provided; remote classification disabled."
+RETRYABLE_REMOTE_MESSAGE = "Wishart returned a retryable error; retrying later."
+CIRCUIT_OPEN_MESSAGE = (
+    "Wishart calls are paused by the circuit breaker; retrying after cooldown."
+)
+AUTH_BLOCKED_MESSAGE = (
+    "Wishart authentication is blocked; operator action is required."
+)
+PROTOCOL_RETRY_MESSAGE = (
+    "Wishart returned an unexpected response; retrying later."
+)
 
 _RETRYABLE_HTTP_STATUSES = {408, 425, 429}
 _WISHART_RETRY_STATES = {

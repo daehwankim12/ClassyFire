@@ -62,9 +62,10 @@ def resolve_pending_structures(limit: int | None = None) -> dict[str, int]:
             ).values_list("id", flat=True)
         )
         applied = False
+        resolved_inchikeys: set[str] = set()
         for item_id in item_ids:
             try:
-                submit_structure_for_item(item_id, resolved.structure)
+                updated_item = submit_structure_for_item(item_id, resolved.structure)
             except StructureSubmissionConflictError:
                 continue  # raced to another state — leave it
             except (StructureKeyMismatchError, StructureSubmissionError):
@@ -77,10 +78,13 @@ def resolve_pending_structures(limit: int | None = None) -> dict[str, int]:
                 )
                 continue
             applied = True
+            if updated_item.inchikey:
+                resolved_inchikeys.add(updated_item.inchikey)
             resolved_items += 1
         if applied:
             resolved_keys += 1
-            _stamp_provenance(inchikey, resolved.source)
+            for resolved_inchikey in resolved_inchikeys or {inchikey}:
+                _stamp_provenance(resolved_inchikey, resolved.source)
 
     return {"keys": len(inchikeys), "resolved_keys": resolved_keys, "items": resolved_items}
 

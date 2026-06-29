@@ -70,7 +70,10 @@ from apps.batches.ingest import (
     validate_upload_root,
 )
 from apps.batches.models import BatchItem, BatchJob
-from apps.batches.remote_delay import REMOTE_DISABLED_MESSAGE
+from apps.batches.remote_delay import (
+    REMOTE_DELAYED_DEFAULT_MESSAGE,
+    REMOTE_DISABLED_MESSAGE,
+)
 from apps.classifications.services import (
     ClassificationLookupResult,
     LookupTier,
@@ -81,28 +84,29 @@ from apps.classifications.services import (
 from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_skeleton
 from apps.compounds.models import CompoundStructure, CompoundUsage
 from apps.compounds.validators import NormalizedRow, normalize_row
-
-# Shown for a bare NON-STANDARD InChIKey input: it cannot be matched against the
-# standard-keyed caches directly (InChIKey is a one-way hash), but supplying the
-# structure lets us re-index it under its standard key (see
-# submit_structure_for_item, which adopts the structure's standard key).
-NON_STANDARD_INCHIKEY_MESSAGE = (
-    "Non-standard InChIKey: cannot match standard caches directly. Provide the "
-    "structure (SMILES/InChI) or a standard InChIKey — a supplied structure is "
-    "re-indexed under its standard key."
-)
 from apps.core.enums import (
     CLAIMABLE_PROCESSING_STATES,
     BatchItemStatus,
     BatchJobStatus,
     BatchProcessingState,
     DetectedInputType,
+    TaskState,
 )
 from apps.core.security import MAX_STRUCTURE_LEN, RowTooLongError, check_structure_length
 from apps.remote import queue as remote_queue
 from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
 from apps.remote.models import RemoteTask
 from apps.remote.queue import RemoteQueueBackpressure
+
+# Shown for a bare NON-STANDARD InChIKey input: it cannot be matched against the
+# standard-keyed caches directly (InChIKey is a one-way hash), but supplying the
+# structure lets us re-index it under its standard key (see
+# submit_structure_for_item, which adopts the structure's standard key).
+NON_STANDARD_INCHIKEY_MESSAGE = (
+    "Non-standard InChIKey: cannot match standard caches directly. The system "
+    "will try public structure lookups; if it remains here, provide the "
+    "structure (SMILES/InChI) or a standard InChIKey."
+)
 
 # Number of characters preserved in the bounded preview for an over-limit row.
 _OVERLONG_PREVIEW_CHARS = 200
@@ -312,6 +316,18 @@ def _get_or_create_remote_task(
         return existing
 
 
+def _initial_status_for_remote_task(task: RemoteTask) -> tuple[BatchItemStatus, str | None]:
+    """User-facing item state when joining an already-active remote task."""
+    if task.state == TaskState.RETRY_WAIT:
+        return (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Wishart is retrying this InChIKey; waiting for the next retry window.",
+        )
+    if task.state == TaskState.DEFERRED:
+        return BatchItemStatus.REMOTE_DELAYED, REMOTE_DELAYED_DEFAULT_MESSAGE
+    return BatchItemStatus.PENDING_CLASSIFICATION, None
+
+
 def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
     """Submit a missing structure for a NEED_STRUCTURE item.
 
@@ -405,11 +421,16 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                     ]
                 )
                 try:
-                    _get_or_create_remote_task(
+                    task = _get_or_create_remote_task(
                         resolved_inchikey,
                         compound,
                         principal=job.remote_principal,
                     )
+                    status, message = _initial_status_for_remote_task(task)
+                    if status != BatchItemStatus.PENDING_CLASSIFICATION:
+                        item.status = status
+                        item.message = message
+                        item.save(update_fields=["status", "message"])
                 except RemoteBudgetExceededError:
                     item.status = BatchItemStatus.REMOTE_DELAYED
                     item.message = "Remote budget exceeded for this principal."
@@ -556,11 +577,12 @@ def _process_item(
         item.compound = compound
         _update_usage(norm.inchikey)
 
-        # A bare NON-STANDARD InChIKey can't match standard-keyed caches; flag it
-        # so the eventual NEED_STRUCTURE state is explained (a supplied structure
-        # is later re-indexed under its standard key).
+        # A bare NON-STANDARD InChIKey can't match standard-keyed caches. Put it
+        # directly on the NEED_STRUCTURE path so the structure-resolution sweep
+        # tries public providers before asking the user for SMILES/InChI.
         if not has_structure and not is_standard_inchikey(norm.inchikey):
             item.message = NON_STANDARD_INCHIKEY_MESSAGE
+            return BatchItemStatus.NEED_STRUCTURE
 
         if not remote_enabled:
             if has_structure:
@@ -574,18 +596,20 @@ def _process_item(
         # Create/reuse a RemoteTask. Key-only tasks are entity lookups; structure
         # tasks can proceed to calculation if entity lookup misses.
         try:
-            _get_or_create_remote_task(
+            task = _get_or_create_remote_task(
                 norm.inchikey,
                 compound,
                 principal=remote_principal,
             )
+            status, message = _initial_status_for_remote_task(task)
+            item.message = message
+            return status
         except RemoteBudgetExceededError:
             item.message = "Remote budget exceeded for this principal."
             return BatchItemStatus.REMOTE_DELAYED
         except RemoteQueueBackpressure:
             item.message = _REMOTE_QUEUE_BACKPRESSURE_MESSAGE
             return BatchItemStatus.REMOTE_DELAYED
-        return BatchItemStatus.PENDING_CLASSIFICATION
 
     # inchikey is None after normalization → the input could not be parsed at all
     # (this shouldn't normally happen — normalize_row returns an error — but be safe)

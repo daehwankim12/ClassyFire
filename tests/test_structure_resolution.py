@@ -19,6 +19,7 @@ from apps.remote.structure_providers import resolve_structure
 pytestmark = pytest.mark.django_db(transaction=True)
 
 ETHANOL_IK = "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+ETHANOL_NONSTD_IK = "LFQSCWFLJHTTHZ-UHFFFAOYNA-N"
 ETHANOL_INCHI = "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3"
 ETHANOL_SMILES = "CCO"
 METHANOL_INCHI = "InChI=1S/CH4O/c1-2/h2H,1H3"
@@ -138,6 +139,43 @@ def test_sweep_resolves_need_structure_item_and_records_provenance(settings, mon
     comp = CompoundStructure.objects.get(inchikey=ETHANOL_IK)
     assert comp.parse_metadata.get("structure_source") == "pubchem"
     assert comp.parse_metadata.get("structure_auto_resolved") is True
+
+
+def test_sweep_resolves_nonstandard_key_under_standard_key(settings, monkeypatch):
+    _enable(settings)
+
+    def responder(method, url, *, json_body=None):
+        if "cactus" in url:
+            return (200, ETHANOL_SMILES + "\n")
+        return (404, "")
+
+    monkeypatch.setattr(structure_providers, "_request", responder)
+
+    job = BatchJob.objects.create(secret_hash=make_password("s"), remote_enabled=True)
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=ETHANOL_NONSTD_IK,
+        inchikey=ETHANOL_NONSTD_IK,
+        status=BatchItemStatus.NEED_STRUCTURE,
+    )
+
+    stats = resolve_pending_structures()
+    assert stats["resolved_keys"] == 1
+    assert stats["items"] == 1
+
+    item.refresh_from_db()
+    assert item.inchikey == ETHANOL_IK
+    assert item.status != BatchItemStatus.NEED_STRUCTURE
+
+    from apps.compounds.models import CompoundStructure
+
+    comp = CompoundStructure.objects.get(inchikey=ETHANOL_IK)
+    assert comp.parse_metadata.get("structure_source") == "cactus"
+    assert comp.parse_metadata.get("structure_auto_resolved") is True
+    from apps.remote.models import RemoteTask
+
+    assert not RemoteTask.objects.filter(inchikey=ETHANOL_NONSTD_IK).exists()
 
 
 def test_definitive_miss_is_negative_cached(settings, monkeypatch):
