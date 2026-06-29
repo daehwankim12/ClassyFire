@@ -23,7 +23,9 @@ from apps.core.enums import (
     BatchItemStatus,
     BatchJobStatus,
     QueryState,
+    RemoteQueryItemApplyState,
     SourceType,
+    SubmissionState,
     TaskState,
 )
 from apps.remote import queue
@@ -40,6 +42,7 @@ from apps.remote.models import (
     RemoteQueryItem,
     RemoteRateBucket,
     RemoteSubmission,
+    RemoteSubmissionMember,
     RemoteTask,
 )
 from apps.remote.queue import LeaseLost
@@ -1483,6 +1486,73 @@ def test_in_doubt_pending_parks_as_unknown_and_never_reposts(settings):
     assert provider.submit_calls == [], "UNKNOWN must never auto-re-POST"
     assert RemoteSubmission.objects.filter(state="UNKNOWN").count() == 1
     assert RemoteSubmission.objects.filter(state="SUBMITTED").count() == 0
+
+
+def test_poll_protocol_error_fails_query_and_releases_reservations():
+    # Regression: a completed multipage /queries response is surfaced as a poll
+    # PROTOCOL_ERROR. The old SUBMITTED query must release its per-member
+    # reservations before the task retries, or the new capped batch is filtered
+    # out by the live reservation gate.
+    members: list[RemoteTask] = []
+    structures: list[tuple[str, str]] = []
+    for idx in range(11):
+        # First block must be 14 uppercase letters (no digits) to satisfy the
+        # compound_structure_inchikey_format CHECK; vary the last letter per idx.
+        inchikey = f"PROTOERRAAAAA{chr(ord('A') + idx)}-BBBBCCCCCC-N"
+        smiles = f"CCO{idx}"
+        compound = _compound(inchikey, smiles)
+        task = queue.enqueue_task(inchikey, compound_id=compound.id)
+        task.state = TaskState.POLL_WAIT
+        task.next_run_at = timezone.now()
+        task.save(update_fields=["state", "next_run_at", "updated_at"])
+        members.append(task)
+        structures.append((inchikey, smiles))
+
+    worker = _worker(MockProvider(poll_protocol_error_for={"q-multipage"}))
+    payload = worker._canonical_payload(structures)
+    payload_hash = worker._payload_hash(payload)
+    query = RemoteQuery.objects.create(
+        remote_query_id="q-multipage",
+        payload_hash=payload_hash,
+        state=QueryState.SUBMITTED,
+    )
+    submission = RemoteSubmission.objects.create(
+        provider="wishart",
+        payload_hash=payload_hash,
+        state=SubmissionState.SUBMITTED,
+        query=query,
+        remote_query_id="q-multipage",
+        request_payload=payload,
+    )
+    RemoteSubmissionMember.objects.bulk_create(
+        [
+            RemoteSubmissionMember(
+                submission=submission,
+                provider="wishart",
+                inchikey=inchikey,
+                structure_hash=worker._structure_hash(smiles),
+            )
+            for inchikey, smiles in structures
+        ]
+    )
+    for task in members:
+        RemoteQueryItem.objects.create(query=query, task=task)
+
+    claimed = _claim_specific_task(members[0], worker.worker_id)
+    worker.process(claimed)
+
+    query.refresh_from_db()
+    submission.refresh_from_db()
+    members[0].refresh_from_db()
+    assert query.state == QueryState.FAILED
+    assert submission.state == SubmissionState.FAILED
+    assert members[0].state == TaskState.RETRY_WAIT
+    assert RemoteSubmissionMember.objects.filter(
+        submission=submission, active=True
+    ).count() == 0
+    assert RemoteQueryItem.objects.filter(
+        query=query, apply_state=RemoteQueryItemApplyState.FAILED
+    ).count() == len(members)
 
 
 def test_in_doubt_pending_parks_unknown_by_ttl(settings):

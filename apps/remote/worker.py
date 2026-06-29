@@ -1377,6 +1377,13 @@ class RemoteWorker:
         if poll.status in (PollStatus.NOT_FOUND, PollStatus.PROTOCOL_ERROR):
             # NOT_FOUND (query absent) or unmapped status: never treat as
             # COMPLETE. Surface + retry rather than silently resolving (F-10).
+            #
+            # A provider PROTOCOL_ERROR for an already-submitted query means this
+            # specific provider query cannot be safely reconciled. Terminally fail
+            # the local query/submission and release its per-member reservations
+            # before retrying the task; otherwise legacy oversized submissions
+            # (or unexpected multipage responses) keep holding R-01 reservations
+            # and the capped retry batch is filtered out forever.
             self.circuit.record_failure()
             try:
                 with transaction.atomic():
@@ -1395,6 +1402,10 @@ class RemoteWorker:
                         raw_body_text=poll.raw_text,
                         safe_headers=poll.safe_headers,
                     )
+                    if poll.status == PollStatus.PROTOCOL_ERROR:
+                        self._fail_query_for_poll_protocol_error(
+                            query, detail=poll.detail
+                        )
                     queue.schedule_retry(locked)
             except LeaseLost:
                 self._log_poll_lease_lost(task, str(poll.status))
@@ -1657,6 +1668,47 @@ class RemoteWorker:
             # marks the query complete, avoiding stranded active reservations.
             for submission in locked_query.submissions.all():
                 self._release_submission_members(submission, reason="query_complete")
+
+    def _fail_query_for_poll_protocol_error(
+        self, query: RemoteQuery, *, detail: str | None
+    ) -> None:
+        """Fail an unreconcilable provider query and free its member slots.
+
+        Poll protocol errors are different from RUNNING/RETRYABLE: the provider
+        response for this already-created query cannot be trusted or completely
+        consumed. Keep the audit attempt, then mark all still-pending query items
+        terminal so the old query no longer owns future retries, fail the linked
+        submissions, and release their active per-member reservations.
+        """
+        terminal_states = [
+            RemoteQueryItemApplyState.APPLIED,
+            RemoteQueryItemApplyState.MISMATCH,
+            RemoteQueryItemApplyState.FAILED,
+        ]
+        now = timezone.now()
+        locked_query = RemoteQuery.objects.select_for_update().get(pk=query.pk)
+        RemoteQueryItem.objects.filter(query=locked_query).exclude(
+            apply_state__in=terminal_states
+        ).update(
+            apply_state=RemoteQueryItemApplyState.FAILED,
+            apply_detail=(
+                "poll protocol error; old provider query failed and retry scheduled"
+            ),
+            applied_at=now,
+        )
+        locked_query.state = QueryState.FAILED
+        locked_query.completed_at = now
+        locked_query.save(update_fields=["state", "completed_at"])
+        query.state = locked_query.state
+        query.completed_at = locked_query.completed_at
+        fail_detail = f"poll protocol error: {detail or 'unreconcilable response'}"
+        for submission in locked_query.submissions.select_for_update():
+            submission.state = SubmissionState.FAILED
+            submission.detail = fail_detail
+            submission.save(update_fields=["state", "detail", "updated_at"])
+            self._release_submission_members(
+                submission, reason="poll_protocol_error"
+            )
 
     def _member_claim(
         self, member: RemoteTask, claim: queue.TaskClaim
