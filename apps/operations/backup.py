@@ -5,11 +5,16 @@ tests can monkeypatch it without touching real binaries.
 
 Dump strategy
 ─────────────
-We dump the FULL database and EXCLUDE only the rebuildable seed tables.
-The ``classyfire_seed*`` pattern covers:
-  - classyfire_seed          — base seed table (re-importable from Zenodo)
+We dump the FULL database and EXCLUDE only the rebuildable seed *data*, via
+``--exclude-table-data=classyfire_seed*``. This drops the bulky seed ROWS while
+KEEPING the table/view definitions — which matters because the
+``classyfire_current`` view (live-over-seed, migration 0005) depends on the
+``classyfire_seed_current`` view. The old ``--exclude-table`` dropped those seed
+*definitions* too, leaving ``classyfire_current``'s dependency dangling so
+``pg_restore`` failed to create it. The ``classyfire_seed*`` pattern covers:
+  - classyfire_seed          — base seed table (rows re-importable from Zenodo)
   - classyfire_seed_v<N>     — versioned physical tables (same source)
-  - classyfire_seed_current  — view (pg_dump skips views with --exclude-table)
+  - classyfire_seed_current  — view (definition kept; a view carries no data)
 
 Everything else — compounds, batch jobs/items with their submitted structures,
 remote tasks + provenance, classification live/history, operations — IS dumped.
@@ -78,7 +83,7 @@ def _db_params() -> dict[str, str]:
 
 
 def _seed_exclude_pattern() -> str:
-    """Return the pg_dump --exclude-table glob pattern for seed tables."""
+    """Return the pg_dump --exclude-table-data glob pattern for seed tables."""
     return "classyfire_seed*"
 
 
@@ -292,7 +297,7 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
         "-U", db["user"],
         "-d", db["name"],
         "-Fc",
-        f"--exclude-table={_seed_exclude_pattern()}",
+        f"--exclude-table-data={_seed_exclude_pattern()}",
         "-f", str(dump_path),
     ]
 
@@ -384,7 +389,7 @@ def run_backup_injectable(
         "-U", db["user"],
         "-d", db["name"],
         "-Fc",
-        f"--exclude-table={_seed_exclude_pattern()}",
+        f"--exclude-table-data={_seed_exclude_pattern()}",
         "-f", str(dump_path),
     ]
 

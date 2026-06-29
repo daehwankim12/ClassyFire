@@ -9,7 +9,8 @@ Postgres (127.0.0.1:55432) using two temporary databases:
 
 The tests validate:
   A. Checksum: sha256 of the dump matches the manifest value.
-  B. Exclude policy: ``classyfire_seed*`` tables are absent from the dump.
+  B. Exclude policy: ``classyfire_seed*`` row DATA is absent from the dump
+     (definitions kept so the dependent classyfire_current view can restore).
   C. Row counts: all key non-seed tables survive the round-trip intact.
   D. FK integrity: FK-bearing tables are probed with JOIN queries that
      exercise the foreign key relationships.
@@ -231,7 +232,7 @@ def _pg_dump(src_db: str, dump_path: str) -> None:
             "-U", CONN["user"],
             "-d", src_db,
             "-Fc",
-            "--exclude-table=classyfire_seed*",
+            "--exclude-table-data=classyfire_seed*",
             "-f", dump_path,
         ],
         what="pg_dump",
@@ -570,11 +571,12 @@ def test_manifest_records_exclude_pattern(restore_round_trip):
 
 
 def test_seed_table_excluded_from_dump(restore_round_trip):
-    """classyfire_seed must be absent from the restored destination DB.
+    """classyfire_seed must carry no seed ROWS in the restored destination DB.
 
-    pg_dump --exclude-table=classyfire_seed* excludes BOTH schema and data,
-    so the table should not exist at all in DST (or be empty if present).
-    Either outcome confirms the seed exclusion policy is enforced.
+    pg_dump --exclude-table-data=classyfire_seed* keeps the table/view
+    DEFINITIONS but drops the seed ROWS, so classyfire_seed is present-but-empty
+    in DST (and would also pass if absent). Either outcome confirms the seed
+    DATA is excluded while the definitions that dependent views need survive.
     """
     dst_db = restore_round_trip["dst_db"]
 
@@ -790,8 +792,13 @@ def test_retention_prunes_excess_daily_backups(tmp_path):
 
 
 @pytest.mark.django_db
-def test_backup_command_uses_exclude_table_flag(tmp_path):
-    """run_backup_injectable must pass --exclude-table=classyfire_seed* to pg_dump."""
+def test_backup_command_uses_exclude_table_data_flag(tmp_path):
+    """run_backup_injectable must pass --exclude-table-data=classyfire_seed* to pg_dump.
+
+    --exclude-table-data drops the seed ROWS but KEEPS the seed table/view
+    definitions, so the dependent classyfire_current view can still be restored
+    (the old --exclude-table dropped the definitions and broke pg_restore).
+    """
     from apps.operations.backup import run_backup_injectable
 
     captured_cmd: list[list[str]] = []
@@ -805,15 +812,15 @@ def test_backup_command_uses_exclude_table_flag(tmp_path):
     assert captured_cmd, "pg_dump was never called"
     cmd = captured_cmd[0]
 
-    # Must use --exclude-table, NOT -t (explicit include).
-    assert any("--exclude-table=classyfire_seed*" in arg for arg in cmd), (
-        f"--exclude-table flag missing from pg_dump command: {cmd}"
+    # Must exclude seed DATA only (definitions kept), NOT -t (explicit include).
+    assert any("--exclude-table-data=classyfire_seed*" in arg for arg in cmd), (
+        f"--exclude-table-data flag missing from pg_dump command: {cmd}"
     )
     # Must NOT use standalone -t (table include) flag.
     # Note: other single-char flags like -h, -p, -U, -d, -f are expected.
     assert "-t" not in cmd, (
         f"Standalone -t include flag found in pg_dump command "
-        f"(should use --exclude-table instead): {cmd}"
+        f"(should use --exclude-table-data instead): {cmd}"
     )
 
 
