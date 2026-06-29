@@ -316,6 +316,11 @@ docker compose exec web python manage.py admin_pause_remote
 docker compose exec web python manage.py admin_resume_remote
 ```
 
+`cleanup_expired`는 완료/실패한 웹 작업 페이지와 연결된 업로드 artifact를
+기본 7일 후 정리하고, 만료된 export 파일도 기본 7일 후 정리합니다. InChIKey
+분류 캐시(`classyfire_seed*`, `classyfire_live`, `classification_history`)는
+삭제하지 않습니다.
+
 ### 7-1. 코드 업데이트
 ```bash
 git pull

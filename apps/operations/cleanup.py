@@ -5,8 +5,8 @@ classification_history). Only removes expired operational/transient data.
 
 Retention days are read from settings:
   UPLOAD_RETENTION_DAYS        (default 30)   — BatchJobs older than N days get secret_hash wiped
-  JOB_RETENTION_DAYS           (default 90)   — BatchJobs completed more than N days ago get deleted
-  EXPORT_RETENTION_DAYS        (default 14)   — expired export cache files are deleted
+  JOB_RETENTION_DAYS           (default 7)    — BatchJobs completed more than N days ago get deleted
+  EXPORT_RETENTION_DAYS        (default 7)    — expired export cache files are deleted
   EXPORT_ORPHAN_GRACE_SECONDS  (default 3600) — grace window before an orphan/temp file is removed
 """
 from __future__ import annotations
@@ -291,8 +291,8 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
     now = timezone.now()
 
     upload_days = _retention_days("UPLOAD_RETENTION_DAYS", 30)
-    job_days = _retention_days("JOB_RETENTION_DAYS", 90)
-    export_days = _retention_days("EXPORT_RETENTION_DAYS", 14)
+    job_days = _retention_days("JOB_RETENTION_DAYS", 7)
+    export_days = _retention_days("EXPORT_RETENTION_DAYS", 7)
 
     upload_cutoff = now - timedelta(days=upload_days)
     job_cutoff = now - timedelta(days=job_days)

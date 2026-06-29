@@ -60,6 +60,31 @@ def test_cleanup_expired_deletes_final_upload_artifact_after_job_delete(
 
 
 @pytest.mark.django_db
+def test_cleanup_expired_deletes_final_upload_artifact_after_default_seven_days(
+    settings, tmp_path
+):
+    """Completed job pages and linked upload artifacts expire after 7 days by default."""
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
+    artifact_dir = Path(settings.UPLOAD_ARTIFACT_DIR)
+    artifact_dir.mkdir()
+    artifact = artifact_dir / "raw.csv"
+    artifact.write_text("C\n")
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        completed_at=timezone.now() - timedelta(days=8),
+        upload_artifact_path=artifact.name,
+    )
+
+    result = cleanup_expired(actor="test")
+
+    assert result.jobs_deleted == 1
+    assert result.upload_artifacts_deleted == 1
+    assert not artifact.exists()
+    assert not BatchJob.objects.filter(pk=job.pk).exists()
+
+
+@pytest.mark.django_db
 def test_api_upload_spools_artifact_without_creating_items(client, settings, monkeypatch, tmp_path):
     settings.INGEST_DEFER_HEAVY_PROCESSING = True
     settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")

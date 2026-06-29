@@ -724,7 +724,7 @@ def test_cleanup_wipes_old_job_secrets():
     from apps.operations.cleanup import cleanup_expired
 
     old_time = dj_timezone.now() - timedelta(days=35)
-    job = _batch_job(status="COMPLETE", created_at_override=old_time)
+    job = _batch_job(status="PENDING", created_at_override=old_time)
     assert job.secret_hash == "abc123"
 
     cleanup_expired(actor="test")
@@ -742,6 +742,19 @@ def test_cleanup_deletes_old_completed_jobs():
 
     cleanup_expired(actor="test")
     assert not BatchJob.objects.filter(pk=pk).exists()
+
+
+def test_cleanup_deletes_completed_jobs_after_default_seven_days():
+    from apps.batches.models import BatchJob
+    from apps.operations.cleanup import cleanup_expired
+
+    job = _batch_job(status="COMPLETE")
+    old_completed_at = dj_timezone.now() - timedelta(days=8)
+    BatchJob.objects.filter(pk=job.pk).update(completed_at=old_completed_at)
+
+    cleanup_expired(actor="test")
+
+    assert not BatchJob.objects.filter(pk=job.pk).exists()
 
 
 def test_cleanup_keeps_recent_jobs():

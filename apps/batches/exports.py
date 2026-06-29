@@ -622,7 +622,7 @@ def _create_or_reuse_export(job: BatchJob, fmt: str) -> tuple[str, str]:
         _discard_temp(tmp_path)
         return existing.token, existing.expires_at.isoformat()
 
-    retention_days = getattr(settings, "EXPORT_RETENTION_DAYS", 14)
+    retention_days = getattr(settings, "EXPORT_RETENTION_DAYS", 7)
     expires_at = datetime.now(tz=dt.UTC) + timedelta(days=retention_days)
     expires_at_iso = expires_at.isoformat()
 

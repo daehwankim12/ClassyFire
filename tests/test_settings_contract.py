@@ -199,10 +199,12 @@ class TestBaseSettingsContract:
     def test_job_retention_days(self, settings: object) -> None:
         assert hasattr(settings, "JOB_RETENTION_DAYS")
         assert isinstance(settings.JOB_RETENTION_DAYS, int)
+        assert settings.JOB_RETENTION_DAYS == 7
 
     def test_export_retention_days(self, settings: object) -> None:
         assert hasattr(settings, "EXPORT_RETENTION_DAYS")
         assert isinstance(settings.EXPORT_RETENTION_DAYS, int)
+        assert settings.EXPORT_RETENTION_DAYS == 7
 
     def test_disk_upload_pause_percent(self, settings: object) -> None:
         assert hasattr(settings, "DISK_UPLOAD_PAUSE_PERCENT")

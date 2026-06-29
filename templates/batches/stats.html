@@ -17,14 +17,6 @@
   </tr>
 </table>
 
-<h2>Batch Items</h2>
-<table>
-  <tr><th>Status</th><th>Count</th></tr>
-  {% for status, count in item_counts.items %}
-  <tr><td>{{ status }}</td><td>{{ count }}</td></tr>
-  {% endfor %}
-</table>
-
 <h2>Compound Structures</h2>
 <p>Total: {{ compound_total }}</p>
 {% endblock %}

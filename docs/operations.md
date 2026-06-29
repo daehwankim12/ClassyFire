@@ -410,6 +410,12 @@ when **Retry deferred** is triggered manually.
 3. Remove expired uploads and exports: `docker compose run --rm cleanup`
 4. Consider moving the backup directory to a larger volume
 
+`cleanup_expired` removes transient web-job data only: completed/failed batch
+job pages and their linked upload artifacts after `JOB_RETENTION_DAYS`
+(default 7), plus expired export files after `EXPORT_RETENTION_DAYS`
+(default 7). It does not delete the ClassyFire classification cache tables
+(`classyfire_seed*`, `classyfire_live`, or `classification_history`).
+
 ---
 
 ## Gate 3 Load Probe

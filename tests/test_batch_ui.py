@@ -374,6 +374,18 @@ def test_stats_page_returns_200():
     assert response.status_code == 200
 
 
+@pytest.mark.django_db(transaction=True)
+def test_stats_page_omits_batch_items_section():
+    client = Client()
+    response = client.get("/stats/")
+    assert response.status_code == 200
+    content = response.content.decode()
+
+    assert "Batch Jobs" in content
+    assert "Compound Structures" in content
+    assert "Batch Items" not in content
+
+
 # ---------------------------------------------------------------------------
 # 12. API pagination: bad page_size → 400; page_size=0 doesn't crash
 # ---------------------------------------------------------------------------

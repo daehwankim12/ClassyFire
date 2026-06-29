@@ -462,12 +462,6 @@ def stats_view(request: HttpRequest) -> HttpResponse:
         failed=Count("pk", filter=Q(status=BatchJobStatus.FAILED)),
     )
 
-    item_counts: dict[str, int] = {}
-    for status_value, _label in BatchItemStatus.choices:
-        count = BatchItem.objects.filter(status=status_value).count()
-        if count:
-            item_counts[status_value] = count
-
     compound_total = CompoundStructure.objects.count()
 
     return render(
@@ -479,7 +473,6 @@ def stats_view(request: HttpRequest) -> HttpResponse:
             "jobs_in_progress": jobs_qs["in_progress"],
             "jobs_pending": jobs_qs["pending"],
             "jobs_failed": jobs_qs["failed"],
-            "item_counts": item_counts,
             "compound_total": compound_total,
         },
     )
