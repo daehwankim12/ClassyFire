@@ -757,6 +757,53 @@ def test_cleanup_deletes_completed_jobs_after_default_seven_days():
     assert not BatchJob.objects.filter(pk=job.pk).exists()
 
 
+def test_cleanup_deletes_exports_for_pruned_jobs(tmp_path, monkeypatch, settings):
+    from django.test import Client
+
+    from apps.batches.ingest import parse_text_input
+    from apps.batches.models import BatchJob, ExportArtifact
+    from apps.batches.services import create_job
+    from apps.core.enums import BatchJobStatus
+    from apps.operations.cleanup import cleanup_expired
+
+    export_dir = tmp_path / "export_cache"
+    export_dir.mkdir()
+    monkeypatch.setattr("apps.batches.exports.EXPORT_DIR", export_dir)
+    settings.EXPORT_RETENTION_DAYS = 7
+    settings.JOB_RETENTION_DAYS = 7
+
+    rows = list(parse_text_input("CC(=O)Oc1ccccc1C(=O)O"))
+    job, secret = create_job(rows, remote_enabled=False)
+    # cleanup_expired prunes a job only when it is in a terminal status AND past
+    # the retention cutoff; set both so the cascade-delete of its export runs.
+    BatchJob.objects.filter(pk=job.pk).update(
+        status=BatchJobStatus.COMPLETE,
+        completed_at=dj_timezone.now() - timedelta(days=8),
+    )
+
+    client = Client()
+    response = client.post(
+        f"/api/jobs/{job.pk}/exports",
+        data=json.dumps({"format": "csv", "secret": secret}),
+        content_type="application/json",
+    )
+    assert response.status_code == 201
+    token = response.json()["token"]
+    payload = export_dir / f"{token}.csv"
+    sidecar = export_dir / f"{token}.meta.json"
+    assert payload.exists()
+    assert sidecar.exists()
+
+    result = cleanup_expired(actor="test")
+
+    assert result.export_files_deleted >= 2
+    assert not BatchJob.objects.filter(pk=job.pk).exists()
+    assert not ExportArtifact.objects.filter(token=token).exists()
+    assert not payload.exists()
+    assert not sidecar.exists()
+    assert client.get(f"/api/exports/{token}").status_code == 404
+
+
 def test_cleanup_keeps_recent_jobs():
     from apps.batches.models import BatchJob
     from apps.operations.cleanup import cleanup_expired

@@ -323,6 +323,25 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
         .exclude(upload_artifact_path="")
         .values_list("upload_artifact_path", flat=True)
     )
+
+    # ExportArtifact rows cascade when their owning BatchJob is deleted.  Collect
+    # and unlink their payloads/sidecars before deleting the jobs so fresh
+    # exports created near the job-retention cutoff cannot survive as
+    # sidecar-only downloads after their result page has been pruned.
+    from apps.batches import exports
+    from apps.batches.models import ExportArtifact
+
+    expiring_artifacts = list(
+        ExportArtifact.objects.filter(job__in=delete_qs).only("path", "token")
+    )
+    cascaded_export_files_deleted = 0
+    for artifact in expiring_artifacts:
+        cascaded_export_files_deleted += _delete_if_exists(Path(artifact.path))
+        if exports.EXPORT_DIR.exists():
+            cascaded_export_files_deleted += _delete_if_exists(
+                exports.EXPORT_DIR / f"{artifact.token}.meta.json"
+            )
+
     jobs_deleted, _ = delete_qs.delete()
     upload_artifacts_deleted = 0
     for relative_path in upload_paths:
@@ -330,6 +349,8 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             upload_artifacts_deleted += 1
 
     exports_deleted, export_files_deleted = _cleanup_expired_exports(now, export_days)
+    exports_deleted += len(expiring_artifacts)
+    export_files_deleted += cascaded_export_files_deleted
 
     orphan_grace = _retention_days("EXPORT_ORPHAN_GRACE_SECONDS", 3600)
     export_orphans_deleted = _cleanup_orphan_exports(now, orphan_grace)
