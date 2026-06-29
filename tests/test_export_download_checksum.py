@@ -103,10 +103,13 @@ def test_download_rejects_stale_rows_after_successful_validation_cache(tmp_path)
 
     cache.clear()
     job = BatchJob.objects.create(secret_hash="hash", total_count=1)
+    # InChIKeys must satisfy the batch_item_inchikey_format CHECK constraint
+    # (^[A-Z]{14}-[A-Z]{10}-[A-Z]$); use two real, distinct keys so changing the
+    # row's content below shifts the rows_signature.
     item = BatchItem.objects.create(
         job=job,
         row_order=0,
-        inchikey="ORIGINAL",
+        inchikey="LFQSCWFLJHTTHZ-UHFFFAOYSA-N",
         status="FAILED",
     )
     path = tmp_path / "export.csv"
@@ -126,7 +129,7 @@ def test_download_rejects_stale_rows_after_successful_validation_cache(tmp_path)
 
     assert get_export_path(artifact.token) == path
 
-    item.inchikey = "CHANGED"
+    item.inchikey = "OKKJLVBELUTLKV-UHFFFAOYSA-N"
     item.save(update_fields=["inchikey"])
 
     assert exports._job_state_signature(job) == artifact.job_state_signature
