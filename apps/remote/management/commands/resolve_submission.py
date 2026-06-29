@@ -29,7 +29,8 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.core.enums import QueryState, SubmissionState
-from apps.remote.models import RemoteQuery, RemoteSubmission, RemoteSubmissionMember
+from apps.remote.models import RemoteQuery, RemoteSubmission
+from apps.remote.services import fail_unknown_submission
 
 
 class Command(BaseCommand):
@@ -79,7 +80,13 @@ class Command(BaseCommand):
             )
 
         if options["mark_failed"]:
-            self._mark_failed(submission)
+            fail_unknown_submission(submission, actor="resolve_submission")
+            self.stdout.write(
+                self.style.SUCCESS(
+                    f"Submission {submission.pk} -> FAILED "
+                    "(idempotency key freed)."
+                )
+            )
         else:
             self._confirm_accepted(submission, options["remote_query_id"])
 
@@ -127,32 +134,5 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"Submission {submission.pk} -> SUBMITTED "
                 f"(linked RemoteQuery {query.pk}, remote_query_id={remote_query_id})."
-            )
-        )
-
-    def _mark_failed(self, submission: RemoteSubmission) -> None:
-        """Operator verified non-acceptance: move to FAILED, freeing the key.
-
-        The submission no longer holds the idempotency slot, so its per-member
-        reservations (R-01) are released in the SAME transaction — a genuine
-        re-POST of those members may now occur.
-        """
-        with transaction.atomic():
-            submission.state = SubmissionState.FAILED
-            submission.detail = (
-                "operator verified provider did NOT accept via resolve_submission "
-                "--mark-failed (idempotency key freed)"
-            )
-            submission.save(update_fields=["state", "detail", "updated_at"])
-            RemoteSubmissionMember.objects.filter(
-                submission=submission, active=True
-            ).update(
-                active=False,
-                released_at=timezone.now(),
-                release_reason="operator_mark_failed",
-            )
-        self.stdout.write(
-            self.style.SUCCESS(
-                f"Submission {submission.pk} -> FAILED (idempotency key freed)."
             )
         )

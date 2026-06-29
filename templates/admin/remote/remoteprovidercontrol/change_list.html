@@ -1,0 +1,27 @@
+{% extends "admin/change_list.html" %}
+{% load i18n %}
+
+{% block object-tools-items %}
+  <li>
+    {% if is_remote_paused %}
+      <span style="color:#b91c1c;font-weight:600;">● Remote PAUSED</span>
+    {% else %}
+      <span style="color:#15803d;font-weight:600;">● Remote running</span>
+    {% endif %}
+  </li>
+  {% if can_operate %}
+  <li>
+    <form method="post" action="{% url 'admin:remote_remoteprovidercontrol_pause' %}" style="display:inline;">
+      {% csrf_token %}
+      <button type="submit" class="button">{% trans "Pause remote" %}</button>
+    </form>
+  </li>
+  <li>
+    <form method="post" action="{% url 'admin:remote_remoteprovidercontrol_resume' %}" style="display:inline;">
+      {% csrf_token %}
+      <button type="submit" class="button">{% trans "Resume remote" %}</button>
+    </form>
+  </li>
+  {% endif %}
+  {{ block.super }}
+{% endblock %}

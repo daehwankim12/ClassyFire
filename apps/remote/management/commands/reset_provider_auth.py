@@ -4,8 +4,7 @@ from typing import Any
 
 from django.core.management.base import BaseCommand
 
-from apps.core.enums import ProviderControlState
-from apps.remote.models import RemoteProviderControl
+from apps.remote.services import reset_provider_auth
 
 
 class Command(BaseCommand):
@@ -13,14 +12,13 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser: Any) -> None:
         parser.add_argument("--provider", default="wishart")
+        parser.add_argument(
+            "--actor",
+            default="reset_provider_auth",
+            help="Actor recorded in the SystemEvent audit row.",
+        )
 
     def handle(self, *args: Any, **options: Any) -> None:
         provider = options["provider"]
-        RemoteProviderControl.objects.update_or_create(
-            provider=provider,
-            defaults={
-                "state": ProviderControlState.ENABLED,
-                "blocked_reason": "",
-            },
-        )
+        reset_provider_auth(provider=provider, actor=str(options["actor"]))
         self.stdout.write(self.style.SUCCESS(f"{provider} provider auth reset."))
