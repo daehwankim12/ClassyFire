@@ -191,6 +191,14 @@ REMOTE_SUBMISSION_RECONCILE_MAX: int = env_int("REMOTE_SUBMISSION_RECONCILE_MAX"
 REMOTE_SUBMISSION_TTL_SECONDS: int = env_int(
     "REMOTE_SUBMISSION_TTL_SECONDS", 3600
 )
+# Give-up horizon for a stuck remote task. The queue NEVER discards a task on
+# its own: once the retry schedule (1m→5m→30m→2h→6h→24h) is exhausted it parks
+# as DEFERRED and retries ~daily forever, so a single permanently-unresolvable
+# InChIKey keeps its BatchItem in REMOTE_DELAYED and pins the owning job to
+# IN_PROGRESS indefinitely. After a task has been outstanding this many hours
+# (measured from creation), the reaper marks it DONE and fans its items out to
+# REMOTE_TIMED_OUT so the job can complete. Set to 0 to disable the reaper.
+REMOTE_DELAYED_TIMEOUT_HOURS: int = env_int("REMOTE_DELAYED_TIMEOUT_HOURS", 24)
 REMOTE_DAILY_BUDGET_PER_PRINCIPAL: int = env_int(
     "REMOTE_DAILY_BUDGET_PER_PRINCIPAL", 100
 )

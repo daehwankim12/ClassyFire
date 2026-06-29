@@ -177,6 +177,11 @@ class BatchItemStatus(models.TextChoices):
     COMPLETE_AFTER_WISHART = "COMPLETE_AFTER_WISHART", "Complete after Wishart"
     NEED_STRUCTURE = "NEED_STRUCTURE", "Needs structure"
     REMOTE_DELAYED = "REMOTE_DELAYED", "Remote delayed"
+    # Terminal give-up state: a remote task that stayed outstanding past
+    # REMOTE_DELAYED_TIMEOUT_HOURS (the queue otherwise parks an exhausted task
+    # as DEFERRED and retries it ~daily forever). Counted as a resolved/terminal
+    # outcome by recompute_job_counters so the owning job can finally complete.
+    REMOTE_TIMED_OUT = "REMOTE_TIMED_OUT", "Remote timed out"
     INVALID_INPUT = "INVALID_INPUT", "Invalid input"
     RESULT_KEY_MISMATCH = "RESULT_KEY_MISMATCH", "Result key mismatch"
 

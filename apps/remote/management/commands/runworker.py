@@ -52,8 +52,16 @@ class Command(BaseCommand):
         )
         once = options["once"]
         idle_sleep = options["idle_sleep"]
+        # Run the stale-task timeout reaper at most once per minute (it is a
+        # cheap indexed scan but need not run on every tight tick). Seed it in
+        # the past so the first cycle reaps immediately.
+        last_reap = time.monotonic() - self._REAP_INTERVAL_SECONDS
         try:
             while True:
+                now = time.monotonic()
+                if now - last_reap >= self._REAP_INTERVAL_SECONDS:
+                    last_reap = now
+                    self._reap_stale_tasks()
                 # Tick EVERY worker each cycle — do NOT short-circuit. The old
                 # ``any(worker.tick() for ...)`` stopped at the first truthy tick,
                 # so only one worker ever ran per cycle. Materialise all results
@@ -66,6 +74,20 @@ class Command(BaseCommand):
                     time.sleep(idle_sleep)
         except KeyboardInterrupt:  # pragma: no cover - operator Ctrl-C
             self.stdout.write(self.style.WARNING("runworker stopping"))
+
+    # How often the worker loop runs the stale-task timeout reaper.
+    _REAP_INTERVAL_SECONDS = 60.0
+
+    def _reap_stale_tasks(self) -> None:
+        from apps.remote import queue
+
+        try:
+            timed_out = queue.timeout_stale_tasks()
+        except Exception:  # pragma: no cover - reaper must never kill the loop
+            logger.exception("stale remote-task timeout reaper failed")
+            return
+        if timed_out:
+            logger.warning("timed out %d stale remote task(s)", timed_out)
 
     def _build_provider(self, *, mock: bool) -> Any:
         if mock:

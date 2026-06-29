@@ -509,3 +509,72 @@ def reactivate_due_tasks() -> int:
 def finish_task(task: RemoteTask) -> None:
     """Mark a task DONE (success or permanent failure), freeing the dedup slot."""
     transition(task, TaskState.DONE, lock_owner=None, locked_at=None)
+
+
+def timeout_stale_tasks(
+    timeout_hours: int | None = None, *, limit: int = 500
+) -> int:
+    """Terminally time out remote tasks stuck far past every backoff window.
+
+    The queue NEVER discards a task on its own: once the retry schedule
+    (:data:`BACKOFF_SCHEDULE_SECONDS`) is exhausted a task parks as ``DEFERRED``
+    and retries ~daily *forever*. A single permanently-unresolvable InChIKey
+    therefore keeps its ``BatchItem`` rows in ``REMOTE_DELAYED`` and pins every
+    owning job to ``IN_PROGRESS`` indefinitely. This reaper gives up on tasks
+    outstanding longer than ``REMOTE_DELAYED_TIMEOUT_HOURS``, measured from
+    ``created_at`` — NOT ``updated_at``, which the daily retries keep bumping —
+    by marking them ``DONE`` (freeing the dedup slot) and fanning their waiting
+    items out to ``REMOTE_TIMED_OUT`` so the job reaches a terminal state.
+
+    Idempotent and concurrency-safe: each candidate is re-locked + re-checked
+    under ``SELECT ... FOR UPDATE`` so two worker processes never double-finish
+    the same task. ``timeout_hours <= 0`` disables the reaper. Returns the number
+    of tasks timed out.
+    """
+    from apps.core.enums import BatchItemStatus
+    from apps.remote import fanout
+
+    if timeout_hours is None:
+        timeout_hours = getattr(settings, "REMOTE_DELAYED_TIMEOUT_HOURS", 24)
+    if timeout_hours <= 0:
+        return 0
+
+    cutoff = timezone.now() - timedelta(hours=timeout_hours)
+    stale_ids = list(
+        RemoteTask.objects.filter(created_at__lt=cutoff)
+        .exclude(state=TaskState.DONE)
+        .order_by("created_at")
+        .values_list("pk", flat=True)[:limit]
+    )
+
+    message = f"Remote classification timed out after {timeout_hours}h."
+    timed_out = 0
+    for task_id in stale_ids:
+        with transaction.atomic():
+            task = (
+                RemoteTask.objects.select_for_update()
+                .filter(pk=task_id, created_at__lt=cutoff)
+                .exclude(state=TaskState.DONE)
+                .first()
+            )
+            if task is None:
+                # Another worker timed it out, or it resolved, between the scan
+                # and the lock. Skip — never double-finish.
+                continue
+            inchikey = task.inchikey
+            # We hold the row lock, so a plain (unfenced) transition is correct.
+            transition_locked(
+                task, TaskState.DONE, lock_owner=None, locked_at=None
+            )
+        # Fan out OUTSIDE the task-row lock: fan_out_result opens its own
+        # transaction and locks the affected BatchJob rows.
+        fanout.fan_out_result(inchikey, BatchItemStatus.REMOTE_TIMED_OUT)
+        # Stamp a human-readable reason on the just-timed-out items (fan-out only
+        # sets status). Scoped to this key so the item table explains the state.
+        from apps.batches.models import BatchItem
+
+        BatchItem.objects.filter(
+            inchikey=inchikey, status=BatchItemStatus.REMOTE_TIMED_OUT
+        ).exclude(message=message).update(message=message)
+        timed_out += 1
+    return timed_out

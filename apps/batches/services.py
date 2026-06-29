@@ -599,6 +599,10 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
         BatchItemStatus.COMPLETE_AFTER_WISHART,
         BatchItemStatus.INVALID_INPUT,
         BatchItemStatus.RESULT_KEY_MISMATCH,
+        # Remote give-up: a timed-out item requires no further work, so it counts
+        # toward "completed" and lets the job leave IN_PROGRESS (it renders as a
+        # non-FOUND row, i.e. "Failed", in exports — see exports._build_row_dict).
+        BatchItemStatus.REMOTE_TIMED_OUT,
     )
 
     blocking_statuses = (
