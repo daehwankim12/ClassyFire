@@ -118,6 +118,21 @@ DEFAULT_LEASE_SECONDS = 300.0
 MAX_REMOTE_ATTEMPT_RAW_BODY_CHARS = 65536
 TRUNCATED_REMOTE_ATTEMPT_SUFFIX = "\n...[truncated remote response body]"
 
+# Wishart paginates a completed /queries JSON response at 10 compounds/page, and
+# our poll (WishartDirectProvider.poll_query) fetches a SINGLE page — so a
+# /queries submission must carry no more structures than fit on one page.
+# Submitting more silently strands every entity beyond page 1: those tasks see no
+# matching entity in the response, look like misses, and loop until they time
+# out — never classified. Cap the effective submit batch at the documented page
+# size regardless of REMOTE_BATCH_SIZE. (Ref: classyfire.wishartlab.com API docs
+# — "JSON files are paginated (10 compounds/page)"; POST limited to 12/min.)
+WISHART_QUERY_JSON_PAGE_SIZE = 10
+
+
+def _effective_batch_size() -> int:
+    """Submit batch size clamped to the Wishart JSON page size (see above)."""
+    return max(1, min(int(settings.REMOTE_BATCH_SIZE), WISHART_QUERY_JSON_PAGE_SIZE))
+
 
 def _raw_body_text(raw_payload: object | None, raw_body_text: str | None) -> str:
     """Return the literal response BODY text for hashing/auditing.
@@ -633,10 +648,11 @@ class RemoteWorker:
                 task.inchikey,
             )
             return
-        # Batch this task with other READY tasks that have a structure, up to
-        # REMOTE_BATCH_SIZE. The dedup index guarantees one task per inchikey.
+        # Batch this task with other READY tasks that have a structure, up to the
+        # effective batch size (clamped to the Wishart JSON page size). The dedup
+        # index guarantees one task per inchikey.
         batch = [task]
-        if settings.REMOTE_BATCH_SIZE > 1:
+        if _effective_batch_size() > 1:
             batch.extend(self._claim_batch_extras(task))
 
         structures: list[tuple[str, str]] = []
@@ -1199,7 +1215,7 @@ class RemoteWorker:
         """
         extras: list[RemoteTask] = []
         exclude_ids = {task.id}
-        while len(extras) < settings.REMOTE_BATCH_SIZE - 1:
+        while len(extras) < _effective_batch_size() - 1:
             extra = queue.claim_task(
                 self.worker_id,
                 exclude_ids=exclude_ids,
@@ -1487,7 +1503,7 @@ class RemoteWorker:
         if task.id not in seen_task_ids:
             members.append(task)
 
-        max_entities = min(len(members), settings.REMOTE_BATCH_SIZE)
+        max_entities = min(len(members), _effective_batch_size())
         try:
             results = self.provider.parse_results(raw, max_entities=max_entities)
         except ProtocolProviderError as exc:

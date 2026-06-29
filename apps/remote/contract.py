@@ -142,6 +142,19 @@ def validate_query_poll_payload(
             f"unknown classification_status {raw.get('classification_status')!r}"
         )
 
+    # Wishart paginates completed-query JSON at 10 compounds/page and the poll
+    # fetches only one page. A response that declares more than one page means
+    # some submitted entities live on pages we never fetched: fail LOUDLY rather
+    # than silently treating the page-1 subset as the complete result (the submit
+    # batch is capped at the page size to keep this from ever happening — see
+    # worker._effective_batch_size).
+    number_of_pages = raw.get("number_of_pages")
+    if isinstance(number_of_pages, int) and number_of_pages > 1:
+        raise ProviderContractError(
+            f"query result spans {number_of_pages} JSON pages but only page 1 was "
+            "fetched; the submit batch exceeded the 10-compound page size"
+        )
+
     entities = raw.get("entities")
     if not isinstance(entities, list):
         raise ProviderContractError("complete query poll response requires entities list")

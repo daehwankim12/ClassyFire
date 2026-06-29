@@ -150,6 +150,39 @@ def test_query_poll_complete_rejects_malformed_entity_payload():
     assert "inchikey" in result.detail
 
 
+def test_query_poll_complete_rejects_multipage_response():
+    """A completed result spanning >1 JSON page (10 compounds/page) must fail
+    loudly: page-2+ entities were never fetched, so treating page 1 as complete
+    would silently drop classifications."""
+    raw = {
+        "classification_status": "Done",
+        "number_of_pages": 3,
+        "number_of_elements": 25,
+        "entities": [build_raw(IK_A)],
+    }
+
+    result = _wishart_with_json(200, raw).poll_query("q-multipage")
+
+    assert result.status == PollStatus.PROTOCOL_ERROR
+    assert result.status != PollStatus.COMPLETE
+    assert result.detail is not None
+    assert "page" in result.detail.lower()
+
+
+def test_query_poll_complete_accepts_single_page_response():
+    """A single-page completed result (number_of_pages == 1) is still COMPLETE."""
+    raw = {
+        "classification_status": "Done",
+        "number_of_pages": 1,
+        "number_of_elements": 1,
+        "entities": [build_raw(IK_A)],
+    }
+
+    result = _wishart_with_json(200, raw).poll_query("q-singlepage")
+
+    assert result.status == PollStatus.COMPLETE
+
+
 def test_valid_success_payloads_still_parse_and_preserve_raw_payloads():
     entity_raw = build_raw(IK_A)
     entity_result = _wishart_with_json(200, entity_raw).lookup_entity(IK_A)

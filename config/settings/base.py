@@ -178,7 +178,12 @@ REMOTE_ENTITY_REQUESTS_PER_MIN: int = env_int("REMOTE_ENTITY_REQUESTS_PER_MIN", 
 # The submit token-bucket burst is pinned to 1 in DbRateLimiter.from_settings so
 # a fresh worker cannot fire a whole minute's budget at once and trip the cap.
 REMOTE_SUBMITS_PER_MIN: int = 10
-REMOTE_BATCH_SIZE: int = env_int("REMOTE_BATCH_SIZE", 25)
+# Structures per /queries POST. Wishart paginates completed-query JSON at 10
+# compounds/page and our poll fetches a single page, so the effective batch is
+# CLAMPED to that page size in worker._effective_batch_size — values above 10
+# are silently capped (anything beyond page 1 would never be retrieved). 10 is
+# the documented page size; 12 POST/min still bounds the submit rate.
+REMOTE_BATCH_SIZE: int = env_int("REMOTE_BATCH_SIZE", 10)
 REMOTE_POLL_MIN_SECONDS: int = env_int("REMOTE_POLL_MIN_SECONDS", 60)
 REMOTE_MAX_CONCURRENCY: int = env_int("REMOTE_MAX_CONCURRENCY", 2)
 REMOTE_TIMEOUT_SECONDS: int = env_int("REMOTE_TIMEOUT_SECONDS", 45)
