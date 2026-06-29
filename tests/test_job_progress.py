@@ -46,10 +46,12 @@ def test_progress_nothing_resolved_yet_still_estimates_from_remote_pace():
 
 
 @pytest.mark.django_db
-def test_progress_eta_floored_at_remote_pace_not_cache_speed():
+def test_progress_eta_floored_at_remote_pace_not_cache_speed(settings):
     """The observed resolution rate is fast (instant cache/seed hits) but the 10
-    pending items are remote-bound: the ETA must reflect ~6s/item (≈1분), not the
-    near-instant cache speed."""
+    pending items are remote-bound: the ETA must reflect the remote pace, not the
+    near-instant cache speed. Pin the entity rate so the assertion is independent
+    of the (tunable) default."""
+    settings.REMOTE_ENTITY_REQUESTS_PER_MIN = 10
     job = BatchJob.objects.create(
         secret_hash="x", total_count=20, completed_count=10
     )

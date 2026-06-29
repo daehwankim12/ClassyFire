@@ -4,7 +4,8 @@ The detail page shows a segmented progress bar (resolved vs still-processing) an
 a coarse "time remaining" estimate. The ETA is intentionally approximate but is
 floored at the **remote pace**: anything still pending has already missed the
 local cache/seed and must be classified by the rate-limited Wishart remote, which
-costs ~6s per item (see :func:`_remote_pace_seconds`). The observed
+costs ``60 / REMOTE_ENTITY_REQUESTS_PER_MIN`` seconds per item (see
+:func:`_remote_pace_seconds`). The observed
 resolution-rate estimate alone is misleading because it averages in the *instant*
 local cache/seed hits, so it badly under-promises the remote-bound tail. We
 therefore take whichever of {remote-pace floor, observed rate} is slower and
@@ -31,13 +32,13 @@ def _remote_pace_seconds() -> float:
     at roughly that many items per minute **no matter how many workers run**.
 
     The binding per-item constraint is the entity bucket: there is exactly one
-    entity GET per item, whereas submits batch up to ``REMOTE_BATCH_SIZE`` and
-    are comparatively cheap. So we pace at ``60 / entity-rate`` ≈ 6s per item.
-    This is a floor — polls share the same entity bucket and cross-job
-    contention only slows it further — but it is far closer than a rate that
-    counts instant local hits.
+    entity GET per item, whereas submits batch up to the page size and are
+    comparatively cheap. So we pace at ``60 / entity-rate`` seconds per item
+    (e.g. 0.5s at 120/min). This is a floor — polls share the same entity bucket
+    and cross-job contention only slows it further — but it is far closer than a
+    rate that counts instant local hits.
     """
-    rate = getattr(settings, "REMOTE_ENTITY_REQUESTS_PER_MIN", 10) or 10
+    rate = getattr(settings, "REMOTE_ENTITY_REQUESTS_PER_MIN", 120) or 120
     return 60.0 / max(int(rate), 1)
 
 

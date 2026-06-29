@@ -172,8 +172,12 @@ class DbRateLimiter:
         return cls(
             entity_per_min=settings.REMOTE_ENTITY_REQUESTS_PER_MIN,
             submit_per_min=settings.REMOTE_SUBMITS_PER_MIN,
-            # Pace submits at one per ~6s with NO catch-up burst so the shared
-            # bucket never exceeds Wishart's fixed 12 POST/min limit.
+            # Pin BOTH burst sizes to 1 so each shared bucket is spent SMOOTHLY at
+            # its refill rate with no catch-up spike: submits at one per ~6s (never
+            # exceeding Wishart's fixed 12 POST/min), entity/poll GETs evenly at the
+            # refill cadence (e.g. one per ~0.5s at 120/min) instead of bursting a
+            # whole minute's budget at once after an idle period.
+            entity_capacity=1,
             submit_capacity=1,
             provider=provider,
         )

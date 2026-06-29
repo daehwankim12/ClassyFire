@@ -172,7 +172,15 @@ WISHART_BASE_URL: str = env_str(
     "WISHART_BASE_URL", "http://classyfire.wishartlab.com"
 )
 REMOTE_ENABLED: bool = env_bool("REMOTE_ENABLED", True)
-REMOTE_ENTITY_REQUESTS_PER_MIN: int = env_int("REMOTE_ENTITY_REQUESTS_PER_MIN", 10)
+# Entity/poll GETs are cheap cached reads (Wishart only caps the expensive POST
+# submits at 12/min — confirmed: the official classyfire_api client applies NO
+# hard GET limit, only a 0.2s/req pace ≈ 300/min). This is our SELF-IMPOSED,
+# env-tunable politeness rate. 120/min keeps the entity-GET stage from being the
+# throughput floor (the submit path tops out at 12 POST/min × 10 = 120/min) while
+# staying well under the official client's ~300/min. The burst is pinned to 1 in
+# DbRateLimiter.from_settings so this 2/sec budget is spent SMOOTHLY (no spike
+# after an idle period) rather than as a 120-request thundering herd.
+REMOTE_ENTITY_REQUESTS_PER_MIN: int = env_int("REMOTE_ENTITY_REQUESTS_PER_MIN", 120)
 # Wishart caps POST (query submit) requests at 12/min — a fixed external limit,
 # so this is hard-coded (NOT env-overridable) at a paced 10/min (one per ~6s).
 # The submit token-bucket burst is pinned to 1 in DbRateLimiter.from_settings so
