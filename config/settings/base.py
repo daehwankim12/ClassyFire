@@ -164,26 +164,23 @@ WISHART_BASE_URL: str = env_str(
     "WISHART_BASE_URL", "http://classyfire.wishartlab.com"
 )
 REMOTE_ENABLED: bool = env_bool("REMOTE_ENABLED", True)
-# Entity/poll GETs are cheap cached reads (Wishart only caps the expensive POST
-# submits at 12/min — confirmed: the official classyfire_api client applies NO
-# hard GET limit, only a 0.2s/req pace ≈ 300/min). This is our SELF-IMPOSED,
-# env-tunable politeness rate. 120/min keeps the entity-GET stage from being the
-# throughput floor (the submit path tops out at 12 POST/min x 10 = 120/min) while
-# staying well under the official client's ~300/min. The burst is pinned to 1 in
-# DbRateLimiter.from_settings so this 2/sec budget is spent SMOOTHLY (no spike
-# after an idle period) rather than as a 120-request thundering herd.
-REMOTE_ENTITY_REQUESTS_PER_MIN: int = env_int("REMOTE_ENTITY_REQUESTS_PER_MIN", 120)
-# Wishart caps POST (query submit) requests at 12/min — a fixed external limit,
-# so this is hard-coded (NOT env-overridable) at a paced 10/min (one per ~6s).
-# The submit token-bucket burst is pinned to 1 in DbRateLimiter.from_settings so
-# a fresh worker cannot fire a whole minute's budget at once and trip the cap.
-REMOTE_SUBMITS_PER_MIN: int = 10
-# Structures per /queries POST. Wishart paginates completed-query JSON at 10
-# compounds/page and our poll fetches a single page, so the effective batch is
-# CLAMPED to that page size in worker._effective_batch_size — values above 10
-# are silently capped (anything beyond page 1 would never be retrieved). 10 is
-# the documented page size; 12 POST/min still bounds the submit rate.
-REMOTE_BATCH_SIZE: int = env_int("REMOTE_BATCH_SIZE", 10)
+# Wishart rate-limits BOTH entity/poll GETs and POST submits at ~12/min per IP
+# (measured 2026-07-01: a burst of ~10 GETs is allowed, then it throttles to one
+# per ~5s, returning 429 with a long Retry-After above that — the earlier
+# assumption that GET was uncapped was wrong). Both are PINNED to 12/min (one per
+# ~5s), hard-coded (NOT env-overridable), and the token-bucket burst is pinned to
+# 1 in DbRateLimiter.from_settings so a fresh worker spends the budget smoothly
+# (one request per ~5s) instead of bursting a whole minute at once and tripping
+# the cap into 429 parks.
+REMOTE_ENTITY_REQUESTS_PER_MIN: int = 12
+REMOTE_SUBMITS_PER_MIN: int = 12
+# Structures per /queries POST. Default 1 — each entity MISS is POSTed on its
+# own, never bundling un-checked extra tasks. This keeps known compounds resolving
+# via the cheap entity GET instead of being dragged into the slower POST path by
+# an interspersed new compound. (When >1, the effective batch is still clamped to
+# Wishart's 10-compounds/page JSON limit in worker._effective_batch_size — values
+# above 10 would strand entities past page 1.)
+REMOTE_BATCH_SIZE: int = env_int("REMOTE_BATCH_SIZE", 1)
 REMOTE_POLL_MIN_SECONDS: int = env_int("REMOTE_POLL_MIN_SECONDS", 60)
 REMOTE_MAX_CONCURRENCY: int = env_int("REMOTE_MAX_CONCURRENCY", 2)
 REMOTE_TIMEOUT_SECONDS: int = env_int("REMOTE_TIMEOUT_SECONDS", 45)
