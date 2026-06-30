@@ -27,7 +27,7 @@ from __future__ import annotations
 import csv
 import io
 from collections.abc import Iterator
-from typing import IO
+from typing import IO, cast
 
 from rdkit import Chem
 
@@ -221,7 +221,7 @@ def _prepend(prefix: str, stream: IO[str]) -> IO[str]:
     auto-detection laziness instead of reading the rest of the upload into a
     StringIO before the csv module can yield the first row.
     """
-    return _PrefixedTextIO(prefix, stream)
+    return cast("IO[str]", _PrefixedTextIO(prefix, stream))
 
 
 class _PrefixedTextIO(io.TextIOBase):
@@ -235,18 +235,18 @@ class _PrefixedTextIO(io.TextIOBase):
     def readable(self) -> bool:
         return True
 
-    def read(self, size: int = -1) -> str:
+    def read(self, size: int | None = -1) -> str:
         prefix = self._read_prefix(size)
         if size is not None and size >= 0:
             remaining_size = size - len(prefix)
             if remaining_size <= 0:
                 return prefix
             return prefix + self._stream.read(remaining_size)
-        return prefix + self._stream.read(size)
+        return prefix + self._stream.read(size if size is not None else -1)
 
-    def readline(self, size: int = -1) -> str:
+    def readline(self, size: int | None = -1) -> str:  # type: ignore[override]
         if self._prefix_pos >= len(self._prefix):
-            return self._stream.readline(size)
+            return self._stream.readline(size if size is not None else -1)
 
         newline_pos = self._prefix.find("\n", self._prefix_pos)
         if newline_pos == -1:
@@ -266,7 +266,7 @@ class _PrefixedTextIO(io.TextIOBase):
         suffix_size = -1 if size is None or size < 0 else size - len(chunk)
         return chunk + self._stream.readline(suffix_size)
 
-    def _read_prefix(self, size: int = -1) -> str:
+    def _read_prefix(self, size: int | None = -1) -> str:
         if self._prefix_pos >= len(self._prefix):
             return ""
         if size is None or size < 0:

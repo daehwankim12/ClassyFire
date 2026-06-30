@@ -53,6 +53,8 @@ def resolve_pending_structures(limit: int | None = None) -> dict[str, int]:
     resolved_keys = 0
     resolved_items = 0
     for inchikey in inchikeys:
+        if not inchikey:
+            continue
         resolved = resolve_structure(inchikey)
         if resolved is None:
             continue

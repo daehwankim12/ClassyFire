@@ -86,7 +86,7 @@ def _bucket_retry_delay_seconds(bucket: object, fallback: float = 5.0) -> float:
     delay = retry_after()
     if delay <= 0:
         return 0.0
-    return delay
+    return float(delay)
 
 
 # Provider namespace for the outbox/circuit/rate-bucket rows. Single provider

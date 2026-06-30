@@ -57,7 +57,7 @@ def test_progress_eta_floored_at_remote_pace_not_cache_speed(settings):
     )
     p = build_job_progress(job, is_terminal=False)
     assert p["pending"] == 10
-    # 10 items × 60/REMOTE_ENTITY_REQUESTS_PER_MIN(=10) s = 60s → "약 1분 남음".
+    # 10 items x 60/REMOTE_ENTITY_REQUESTS_PER_MIN(=10) s = 60s -> "약 1분 남음".
     assert p["eta"] == "약 1분 남음 (예상)"
 
 
