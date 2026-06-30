@@ -1,6 +1,6 @@
 """Cleanup expired uploads, exports, and old job secrets.
 
-NEVER deletes classification cache (classyfire_live, classyfire_seed,
+NEVER deletes classification cache (classyfire_live,
 classification_history). Only removes expired operational/transient data.
 
 Retention days are read from settings:

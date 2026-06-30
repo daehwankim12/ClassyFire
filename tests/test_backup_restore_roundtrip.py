@@ -145,7 +145,6 @@ def _build_backup_dir(
             "exports": {{"file": "{exports_archive_name}", "checksum": "{exports_checksum}"}},
             "source_artifacts": {{"file": "{source_archive_name}", "checksum": "{source_checksum}"}}
           }},
-          "excludes": "classyfire_seed*",
           "status": "ok"
         }}
     """)

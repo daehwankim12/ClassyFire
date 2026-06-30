@@ -106,7 +106,6 @@ def _job_secret(request: HttpRequest, body: dict[str, object] | None = None) -> 
 # Status groups for items filter
 FOUND_STATUSES = [
     BatchItemStatus.FOUND_LIVE_CACHE,
-    BatchItemStatus.FOUND_SEED_CACHE,
     BatchItemStatus.FOUND_WISHART_ENTITY,
     BatchItemStatus.COMPLETE_AFTER_WISHART,
 ]
@@ -279,7 +278,6 @@ def job_status_view(request: HttpRequest, job_id: str) -> JsonResponse:
             "total_count": job.total_count,
             "completed_count": job.completed_count,
             "local_hit_count": job.local_hit_count,
-            "seed_hit_count": job.seed_hit_count,
             "remote_pending_count": job.remote_pending_count,
             "need_structure_count": need_structure,
             "normalization_pending_count": pending_normalization,

@@ -1,6 +1,6 @@
 """Tests for the Classification Lookup Service (Task 5).
 
-FR-010/FR-011, P-02: exact 27-char InChIKey lookup, live-over-seed precedence,
+FR-010/FR-011, P-02: exact 27-char InChIKey lookup, live cache resolution,
 newest-wins within equal priority, no auto-apply for 14-char connectivity keys.
 All tests run against the real DB — no mocks.
 """
@@ -36,18 +36,6 @@ def _make_chemont(numeric_id: int, name: str, version: str = "2.1") -> object:
     )[0]
 
 
-def _make_seed(inchikey: str, version: str = "v1", kingdom_id: int | None = None) -> object:
-    from apps.classifications.models import ClassyfireSeed
-
-    return ClassyfireSeed.objects.create(
-        inchikey=inchikey,
-        inchikey14=inchikey[:14],
-        seed_source_id=1,
-        seed_version=version,
-        kingdom_id=kingdom_id,
-    )
-
-
 def _make_live(
     inchikey: str,
     source_type: str = "WISHART_LIVE_QUERY",
@@ -74,43 +62,23 @@ def _make_live(
 
 
 # ---------------------------------------------------------------------------
-# TEST: exact seed lookup
+# TEST: exact live lookup (with ChemOnt slot resolution)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.django_db(transaction=True)
-def test_exact_seed_lookup_hit():
+def test_exact_live_lookup_hit():
     node = _make_chemont(0, "Chemical entities")
-    _make_seed(IK_A, version="v1", kingdom_id=node.numeric_id)
+    _make_live(IK_A, classification_version="v1", kingdom_id=node.numeric_id)
 
-    from apps.classifications.services import LookupTier, lookup_current_classification
+    from apps.classifications.services import lookup_current_classification
 
     result = lookup_current_classification(IK_A)
     assert result is not None
     assert result.inchikey == IK_A
-    assert result.tier == LookupTier.SEED
     assert result.classification_version == "v1"
     assert result.kingdom is not None
     assert result.kingdom.name == "Chemical entities"
-
-
-# ---------------------------------------------------------------------------
-# TEST: live-over-seed precedence
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.django_db(transaction=True)
-def test_live_over_seed_precedence():
-    node = _make_chemont(1, "Organic compounds")
-    _make_seed(IK_A, version="v1", kingdom_id=node.numeric_id)
-    _make_live(IK_A, kingdom_id=node.numeric_id)
-
-    from apps.classifications.services import LookupTier, lookup_current_classification
-
-    result = lookup_current_classification(IK_A)
-    assert result is not None
-    assert result.tier == LookupTier.LIVE
-    assert result.source_type == "WISHART_LIVE_QUERY"
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +114,8 @@ def test_newest_retrieved_at_returned():
 
 @pytest.mark.django_db(transaction=True)
 def test_no_auto_apply_14char_key():
-    # Even if a seed row exists, a 14-char key must return None.
-    _make_seed(IK_A)
+    # Even if a full-key live row exists, a 14-char key must return None.
+    _make_live(IK_A)
 
     from apps.classifications.services import lookup_current_classification
 
@@ -212,21 +180,26 @@ def test_provenance_fields_populated():
 
 @pytest.mark.django_db(transaction=True)
 def test_p95_latency_under_200ms():
-    """p95 of exact-key lookups on 300 seed rows must be < 200 ms."""
-    # Insert 300 seed rows via raw SQL for speed.
+    """p95 of exact-key lookups on 300 live rows must be < 200 ms."""
+    # Insert 300 live rows via raw SQL for speed.
     rows = []
     for i in range(300):
-        # Generate valid 27-char InChIKeys: 14-char block + 10-char block + 1-char
-        block1 = f"AAAAAAAAAA{i:04d}"[:14]
-        block2 = f"BBBBBB{i:04d}"[:10]
-        suffix = "N"
-        ik = f"{block1}-{block2}-{suffix}"
-        rows.append((ik, ik[:14], i + 100, "perf-v1"))
+        # Generate valid 27-char InChIKeys (uppercase letters only — classyfire_live
+        # enforces the [A-Z] format): encode i as 3 base-26 letters for uniqueness.
+        enc = ""
+        n = i
+        for _ in range(3):
+            enc = chr(ord("A") + n % 26) + enc
+            n //= 26
+        block1 = ("AAAAAAAAAAA" + enc)[:14]
+        block2 = ("BBBBBBB" + enc)[:10]
+        ik = f"{block1}-{block2}-N"
+        rows.append((ik, "WISHART_LIVE_QUERY", 100))
 
     with connection.cursor() as cur:
         cur.executemany(
-            "INSERT INTO classyfire_seed (inchikey, inchikey14, seed_source_id, seed_version)"
-            " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            "INSERT INTO classyfire_live (inchikey, source_type, source_priority, retrieved_at)"
+            " VALUES (%s, %s, %s, NOW()) ON CONFLICT DO NOTHING",
             rows,
         )
 

@@ -15,13 +15,11 @@
 #   BACKUP_WEEKLY_COUNT  — Weekly backups to keep (default 4)
 #   BACKUP_MONTHLY_COUNT — Monthly backups to keep (default 6)
 #
-# Exclusion policy
-# ────────────────
-# The seed tables (classyfire_seed, classyfire_seed_v*, classyfire_seed_current
-# view) are RE-IMPORTABLE from Zenodo source artifacts, so they are excluded
-# to keep backups small.  ALL other tables — compounds, batch jobs/items,
-# remote tasks + provenance, classification live/history, operations — are
-# included in the dump.
+# Dump policy
+# ───────────
+# The FULL database is dumped with no table exclusions — compounds, batch
+# jobs/items, remote tasks + provenance, classification live/history, and
+# operations are all included.
 #
 # Alpine compatibility
 # ────────────────────
@@ -126,11 +124,7 @@ echo "[backup] Starting backup at ${TIMESTAMP}"
 mkdir -p "${BACKUP_DIR}"
 
 # ---------------------------------------------------------------------------
-# 1. Database dump — full DB EXCLUDING only the rebuildable seed tables.
-#    classyfire_seed*  covers: classyfire_seed (base table),
-#                              classyfire_seed_v<N> (versioned tables),
-#                              classyfire_seed_current (view — pg_dump skips
-#                              views when using --exclude-table anyway).
+# 1. Database dump — full DB, no table exclusions.
 # ---------------------------------------------------------------------------
 pg_dump \
   -h "${POSTGRES_HOST}" \
@@ -138,7 +132,6 @@ pg_dump \
   -U "${POSTGRES_USER}" \
   -d "${POSTGRES_DB}" \
   -Fc \
-  --exclude-table="classyfire_seed*" \
   -f "${DUMP_FILE}"
 
 echo "[backup] DB dump written: ${DUMP_FILE}"
@@ -254,7 +247,6 @@ ${ARTIFACT_EXPORTS_JSON},
 ${ARTIFACT_SOURCE_JSON},
 ${ARTIFACT_UPLOADS_JSON}
   },
-  "excludes": "classyfire_seed*",
   "status": "ok"
 }
 EOF

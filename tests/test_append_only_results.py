@@ -105,7 +105,7 @@ def test_lower_priority_write_is_stored_as_rejected_event_without_touching_live(
     )
     rejected = write_live_result(
         ASPIRIN_INCHIKEY, _norm(ASPIRIN_INCHIKEY, kingdom_name="Low"),
-        source_type=SourceType.HISTORICAL_AGGREGATE,  # priority 70
+        source_type=SourceType.LAB_OFFICIAL_IMPORT,  # priority 85 (lower than 100)
     )
     assert rejected.applied is False
     assert rejected.result_id is not None

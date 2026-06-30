@@ -24,63 +24,6 @@ def _chemont_slot(slot_name: str) -> models.ForeignKey:
     )
 
 
-class ClassyfireSeed(models.Model):
-    """Immutable seed shape (requirements section 5.2).
-
-    One row per InChIKey. This is the base physical table; Task 4 builds the
-    versioned-table swap and the ``classyfire_seed_current`` view on top of it.
-    The CHAR(27)/CHAR(14) check constraints are defined here.
-    """
-
-    inchikey = models.CharField(
-        max_length=27,
-        primary_key=True,
-        help_text="Full 27-char InChIKey (exact length enforced by DB).",
-    )
-    inchikey14 = models.CharField(
-        max_length=14,
-        help_text="14-char skeleton (first block) of the InChIKey.",
-    )
-    pubchem_cid = models.BigIntegerField(null=True, blank=True)
-    zinc_id = models.TextField(null=True, blank=True)
-    representative_smiles = models.TextField(null=True, blank=True)
-
-    kingdom = _chemont_slot("kingdom")
-    superclass = _chemont_slot("superclass")
-    class_node = _chemont_slot("class")
-    subclass = _chemont_slot("subclass")
-    direct_parent = _chemont_slot("direct_parent")
-
-    other_labels = models.JSONField(
-        null=True,
-        blank=True,
-        help_text="Additional ChemOnt labels / alternative parents as JSONB.",
-    )
-    seed_source_id = models.BigIntegerField(
-        help_text="FK-by-value to the operations.SeedImport that produced this row."
-    )
-    seed_version = models.TextField(help_text="Seed dataset version string.")
-
-    class Meta:
-        db_table = "classyfire_seed"
-        constraints = [
-            models.CheckConstraint(
-                name="classyfire_seed_inchikey_len27",
-                condition=Q(inchikey__length=27),
-            ),
-            models.CheckConstraint(
-                name="classyfire_seed_inchikey14_len14",
-                condition=Q(inchikey14__length=14),
-            ),
-        ]
-        indexes = [
-            models.Index(fields=["inchikey14"], name="seed_inchikey14_idx"),
-        ]
-
-    def __str__(self) -> str:
-        return f"seed:{self.inchikey}@{self.seed_version}"
-
-
 class SourceArtifact(models.Model):
     """Immutable record of a bulk source input (official/seed import file/payload).
 

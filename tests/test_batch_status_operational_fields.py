@@ -368,7 +368,6 @@ def test_status_api_old_keys_preserved(client):
         "total_count",
         "completed_count",
         "local_hit_count",
-        "seed_hit_count",
         "remote_pending_count",
         "need_structure_count",
         "invalid_count",

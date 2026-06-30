@@ -1,8 +1,8 @@
 """Admin registration for classification tables (all read-only).
 
 These tables are append-only / immutable by contract — the live pointer, the
-immutable result events, archived history, and the seed snapshot. Read-only
-admin enforces that no operator edit can break those invariants.
+immutable result events, and archived history. Read-only admin enforces that no
+operator edit can break those invariants.
 """
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from apps.classifications.models import (
     ClassificationHistory,
     ClassificationResult,
     ClassyfireLive,
-    ClassyfireSeed,
     SourceArtifact,
 )
 from apps.core.admin_base import ReadOnlyModelAdmin
@@ -44,12 +43,6 @@ class ClassyfireLiveAdmin(ReadOnlyModelAdmin):
     )
     list_filter = ("source_type",)
     search_fields = ("inchikey",)
-
-
-@admin.register(ClassyfireSeed)
-class ClassyfireSeedAdmin(ReadOnlyModelAdmin):
-    list_display = ("inchikey", "inchikey14", "seed_version", "seed_source_id")
-    search_fields = ("inchikey", "inchikey14")
 
 
 @admin.register(ClassificationHistory)

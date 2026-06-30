@@ -71,59 +71,20 @@ should load.
 
 ---
 
-## Seed Dataset (Local Classification Cache)
+## Classification Cache (Seedless, On-Demand)
 
-A pre-loaded seed dataset significantly reduces the number of remote calls.
-Three profiles are available:
+There is no pre-loaded seed dataset. The classification cache (`classyfire_live`)
+starts empty and fills on demand:
 
-| Profile | Description | Size (approx.) |
-|---|---|---|
-| `FULL` | Complete InChIKey-deduplicated ClassyFire collection | ~4 GB |
-| `LITE` | Most-common compounds only | ~400 MB |
-| `CUSTOM` | User-supplied subset | varies |
+1. A lookup for an InChIKey checks `classyfire_live`.
+2. On a miss, the remote worker queries the Wishart ClassyFire service — an
+   entity `GET` first, then a structure-submit `POST` for compounds Wishart has
+   not seen — and writes the result back into `classyfire_live`.
+3. Subsequent lookups for the same key are served instantly from the cache.
 
-### Download
-
-```bash
-make seed-download
-```
-
-Downloads the selected seed profile from Zenodo (record 20472700).
-
-### Verify integrity
-
-```bash
-make seed-verify
-```
-
-Checks SHA-256 checksums.
-
-### Import (resumable)
-
-```bash
-make seed-import
-```
-
-Streams rows into the seed staging table.  Import can be safely interrupted and
-resumed — the checkpoint mechanism prevents duplicate rows.
-
-### Audit
-
-```bash
-make seed-audit
-```
-
-Validates InChIKey format and ChemOnt hierarchy consistency.  A seed that fails
-audit cannot be activated.
-
-### Activate
-
-```bash
-make seed-activate
-```
-
-Promotes the audited seed to the active classification cache.  This operation
-is idempotent and does not overwrite live (Wishart) results.
+No download/import/activate steps are required. Run the worker
+(`make` targets / `manage.py runworker`) and the cache populates as jobs are
+processed.
 
 ---
 
@@ -202,8 +163,8 @@ See [docs/operations.md](docs/operations.md) for the full runbook.
 
 When the Wishart ClassyFire API is unreachable:
 
-- **Local cache lookups continue normally.** Compounds already in the local or
-  seed cache are served instantly.
+- **Local cache lookups continue normally.** Compounds already in the live cache
+  are served instantly.
 - **The circuit breaker opens** after repeated consecutive failures, preventing
   further outbound calls until the API recovers.
 - **Pending remote tasks are deferred** — they are not lost.  When the circuit
@@ -275,7 +236,7 @@ make typecheck
 ## Documentation
 
 - [docs/user-guide.md](docs/user-guide.md) — How to submit compounds, read results, handle NEED_STRUCTURE, export
-- [docs/operations.md](docs/operations.md) — Worker management, backup/restore, seed swap, admin actions
+- [docs/operations.md](docs/operations.md) — Worker management, backup/restore, admin actions
 - [docs/api/openapi.yaml](docs/api/openapi.yaml) — Full OpenAPI 3 spec
 - [docs/acceptance-test-results.md](docs/acceptance-test-results.md) — Acceptance evidence for all T-xx / NFR-Pxx IDs
 - [docs/state-machines.md](docs/state-machines.md) — BatchItem and RemoteTask state diagrams
@@ -296,11 +257,5 @@ When using ClassyFire classifications, please cite:
 > computable taxonomy.
 > *J Cheminformatics.* 2016;8:61.
 > DOI: [10.1186/s13321-016-0174-y](https://doi.org/10.1186/s13321-016-0174-y)
-
-The pre-loaded seed dataset is derived from:
-
-> InChIKey-Deduplicated ClassyFire/ChemOnt Label Collection v3  
-> Zenodo record 20472700  
-> License: CC BY 4.0
 
 See [NOTICE.md](NOTICE.md) for full attribution details.

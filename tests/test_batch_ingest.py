@@ -5,7 +5,6 @@ Covers:
 - Invalid row isolated → INVALID_INPUT, others still processed (FR-007).
 - Duplicate rows preserved (same input twice → two items, same compound).
 - Local LIVE hit → FOUND_LIVE_CACHE.
-- Local SEED hit → FOUND_SEED_CACHE.
 - InChIKey-only miss with remote DISABLED → NEED_STRUCTURE.
 - InChIKey-only miss with remote ENABLED → RemoteTask (entity-lookup), PENDING_CLASSIFICATION.
 - Structure (SMILES) miss with remote ENABLED → RemoteTask created, PENDING_CLASSIFICATION.
@@ -76,18 +75,6 @@ def _make_live(inchikey: str, kingdom_id: int | None = None) -> Any:
         source_type="WISHART_LIVE_QUERY",
         source_priority=100,
         retrieved_at=datetime(2024, 6, 1, 12, 0, 0, tzinfo=dt.UTC),
-        kingdom_id=kingdom_id,
-    )
-
-
-def _make_seed(inchikey: str, kingdom_id: int | None = None) -> Any:
-    from apps.classifications.models import ClassyfireSeed
-
-    return ClassyfireSeed.objects.create(
-        inchikey=inchikey,
-        inchikey14=inchikey[:14],
-        seed_source_id=1,
-        seed_version="v1",
         kingdom_id=kingdom_id,
     )
 
@@ -262,24 +249,6 @@ def test_live_hit_sets_found_live_cache():
     assert len(items) == 1
     assert items[0].status == BatchItemStatus.FOUND_LIVE_CACHE
     assert items[0].inchikey == ASPIRIN_INCHIKEY
-
-
-@pytest.mark.django_db(transaction=True)
-def test_seed_hit_sets_found_seed_cache():
-    """When a SEED classification exists (no live), item gets FOUND_SEED_CACHE."""
-    from apps.batches.models import BatchItem, BatchJob
-    from apps.core.enums import BatchItemStatus
-
-    node = _make_chemont(11, "Organic compounds")
-    _make_seed(ASPIRIN_INCHIKEY, kingdom_id=node.numeric_id)
-
-    response = _create_and_process_job(ASPIRIN_SMILES)
-    data = response.json()
-
-    job = BatchJob.objects.get(pk=data["job_id"])
-    items = list(BatchItem.objects.filter(job=job))
-    assert len(items) == 1
-    assert items[0].status == BatchItemStatus.FOUND_SEED_CACHE
 
 
 @pytest.mark.django_db(transaction=True)
@@ -798,22 +767,6 @@ def test_inchikey_input_links_item_inchikey():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_seed_hit_counter():
-    """seed_hit_count is incremented for SEED hits."""
-    from apps.batches.models import BatchJob
-
-    _make_seed(ASPIRIN_INCHIKEY)
-
-    response = _create_and_process_job(ASPIRIN_SMILES)
-    data = response.json()
-
-    job = BatchJob.objects.get(pk=data["job_id"])
-    assert job.seed_hit_count == 1
-    assert job.local_hit_count == 0  # seed hits are NOT counted in local_hit_count
-    assert job.completed_count == 1
-
-
-@pytest.mark.django_db(transaction=True)
 def test_job_complete_when_all_resolved():
     """Job status is COMPLETE when every item is resolved (no pending items)."""
     from apps.batches.models import BatchJob
@@ -972,9 +925,9 @@ LTRP_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"
 def test_api_structure_resubmit_cache_hit_updates_counters():
     """Structure resubmit that resolves to a cache hit must update job counters.
 
-    When the submitted structure is in the seed/live cache, the item flips to
-    FOUND_SEED_CACHE/FOUND_LIVE_CACHE with no remote fan-out, so counters must
-    be recomputed immediately in the resubmit path.
+    When the submitted structure is in the live cache, the item flips to
+    FOUND_LIVE_CACHE with no remote fan-out, so counters must be recomputed
+    immediately in the resubmit path.
     """
     import json as _json
 
@@ -999,9 +952,9 @@ def test_api_structure_resubmit_cache_hit_updates_counters():
     assert job.need_structure_count == 1
     assert job.completed_count == 0
 
-    # Now add a seed entry for this InChIKey so the structure resubmit resolves as
-    # a seed hit.
-    _make_seed(LTRP_INCHIKEY)
+    # Now add a live entry for this InChIKey so the structure resubmit resolves as
+    # a live cache hit.
+    _make_live(LTRP_INCHIKEY)
 
     # Submit the matching structure via the API.
     response = client.post(
@@ -1012,10 +965,9 @@ def test_api_structure_resubmit_cache_hit_updates_counters():
     assert response.status_code == 200, response.content
     resp_data = response.json()
     # Item must now be a cache hit.
-    assert resp_data["status"] in (
-        BatchItemStatus.FOUND_SEED_CACHE,
-        BatchItemStatus.FOUND_LIVE_CACHE,
-    ), f"Expected cache-hit status, got {resp_data['status']}"
+    assert resp_data["status"] == BatchItemStatus.FOUND_LIVE_CACHE, (
+        f"Expected cache-hit status, got {resp_data['status']}"
+    )
 
     # Job counters MUST have been updated immediately (no fan-out required).
     job.refresh_from_db()

@@ -227,18 +227,6 @@ class TestBaseSettingsContract:
             assert hasattr(settings, setting_name)
             assert isinstance(getattr(settings, setting_name), int)
 
-    def test_seed_profile(self, settings: object) -> None:
-        assert hasattr(settings, "SEED_PROFILE")
-        assert settings.SEED_PROFILE in ("FULL", "LITE", "CUSTOM")
-
-    def test_seed_record_id(self, settings: object) -> None:
-        assert hasattr(settings, "SEED_RECORD_ID")
-        assert isinstance(settings.SEED_RECORD_ID, int)
-
-    def test_seed_auto_update(self, settings: object) -> None:
-        assert hasattr(settings, "SEED_AUTO_UPDATE")
-        assert isinstance(settings.SEED_AUTO_UPDATE, bool)
-
     def test_shared_access_password_hash_has_default(self, settings: object) -> None:
         # dev: empty string or any value is fine; just verify attribute exists
         assert hasattr(settings, "SHARED_ACCESS_PASSWORD_HASH")

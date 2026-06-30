@@ -42,12 +42,9 @@
 #   is aborted if the checksum does not match.
 #
 # After restore:
-#   The seed tables (classyfire_seed*) are NOT in the dump — they were
-#   excluded at backup time because they are re-importable from the Zenodo
-#   source artifact.  Re-seed after restore with:
-#     python manage.py seed_import --profile FULL   (or LITE for testing)
-#   Then activate with:
-#     python manage.py seed_activate
+#   The dump is the full database (no table exclusions), so the restored DB is
+#   complete. The classification cache (classyfire_live) is rebuilt on demand by
+#   the Wishart remote worker as cache misses come in — no manual re-seed step.
 # =============================================================================
 set -eu
 
@@ -274,8 +271,3 @@ else
 fi
 
 echo "[restore] Done."
-echo "[restore]"
-echo "[restore] NOTE: The seed tables (classyfire_seed*) were excluded from"
-echo "[restore]       this backup.  Re-seed with:"
-echo "[restore]         python manage.py seed_import --profile FULL"
-echo "[restore]         python manage.py seed_activate"

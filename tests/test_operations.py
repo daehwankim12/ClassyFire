@@ -2,8 +2,8 @@
 
 All tests run against the real Postgres DB. Subprocess calls (pg_dump /
 pg_restore) are monkeypatched so no binary is required. Classification cache
-tables (classyfire_live, classyfire_seed, classification_history) must never
-be deleted by cleanup.
+tables (classyfire_live, classification_history) must never be deleted by
+cleanup.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import pytest
 from django.core.management import call_command
 from django.utils import timezone as dj_timezone
 
-from apps.operations.models import SeedImport, SystemEvent
+from apps.operations.models import SystemEvent
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -42,17 +42,6 @@ def _live(inchikey: str):
     )
 
 
-def _seed(inchikey: str, seed_source_id: int = 1):
-    from apps.classifications.models import ClassyfireSeed
-
-    return ClassyfireSeed.objects.create(
-        inchikey=inchikey,
-        inchikey14=inchikey[:14],
-        seed_source_id=seed_source_id,
-        seed_version="test-v1",
-    )
-
-
 def _remote_task(inchikey: str, state: str = "READY"):
     from apps.remote.models import RemoteTask
 
@@ -67,19 +56,6 @@ def _batch_job(status: str = "PENDING", created_at_override=None):
         BatchJob.objects.filter(pk=job.pk).update(created_at=created_at_override)
         job.refresh_from_db()
     return job
-
-
-def _seed_import(**kwargs):
-    defaults = {
-        "doi": "10.5281/zenodo.test",
-        "filename": "seed_test.tsv.zst",
-        "checksum": "abcdef123456",
-        "import_status": "COMPLETE",
-        "actual_row_count": 100,
-        "who": "tester",
-    }
-    defaults.update(kwargs)
-    return SeedImport.objects.create(**defaults)
 
 
 def _system_event(category: str, event_type: str, payload: dict | None = None):
@@ -124,20 +100,6 @@ def test_stats_live_result_count():
     before = collect_stats("/").live_result_count
     _live(VALID_IK_A)
     after = collect_stats("/").live_result_count
-    assert after == before + 1
-
-
-# ---------------------------------------------------------------------------
-# Stats: seed count
-# ---------------------------------------------------------------------------
-
-
-def test_stats_seed_count():
-    from apps.operations.stats import collect_stats
-
-    before = collect_stats("/").seed_count
-    _seed(VALID_IK_A)
-    after = collect_stats("/").seed_count
     assert after == before + 1
 
 
@@ -265,32 +227,6 @@ def test_stats_wishart_last_success_at_populated():
     _system_event("REMOTE", "wishart_success")
     stats = collect_stats("/")
     assert stats.wishart.last_success_at is not None
-
-
-# ---------------------------------------------------------------------------
-# Stats: seed import history
-# ---------------------------------------------------------------------------
-
-
-def test_stats_seed_import_history_empty():
-    from apps.operations.stats import collect_stats
-
-    SeedImport.objects.all().delete()
-    stats = collect_stats("/")
-    assert stats.seed_import_history == []
-
-
-def test_stats_seed_import_history_populated():
-    from apps.operations.stats import collect_stats
-
-    SeedImport.objects.all().delete()
-    _seed_import(import_status="COMPLETE")
-    _seed_import(import_status="PENDING")
-    stats = collect_stats("/")
-    assert len(stats.seed_import_history) == 2
-    statuses = {r["import_status"] for r in stats.seed_import_history}
-    assert "COMPLETE" in statuses
-    assert "PENDING" in statuses
 
 
 # ---------------------------------------------------------------------------
@@ -505,20 +441,6 @@ def test_admin_retry_logs_event():
 
 
 # ---------------------------------------------------------------------------
-# Admin: seed activation trigger
-# ---------------------------------------------------------------------------
-
-
-def test_admin_trigger_seed_activation():
-    from apps.operations.admin_views import trigger_seed_activation
-
-    ev = trigger_seed_activation(seed_import_id=42, actor="test")
-    assert ev.category == "SEED"
-    assert ev.event_type == "seed_activation_triggered"
-    assert ev.payload["seed_import_id"] == 42
-
-
-# ---------------------------------------------------------------------------
 # Admin: backup status review
 # ---------------------------------------------------------------------------
 
@@ -584,19 +506,11 @@ def test_backup_checksum_matches_file(tmp_path):
     assert manifest["checksum"] == checksum
 
 
-def test_backup_excludes_seed_in_manifest(tmp_path):
-    """Manifest must record the exclude pattern, not an explicit table list.
-
-    The backup now dumps the FULL database excluding classyfire_seed* rather
-    than listing tables to include.  The manifest records the exclude glob.
-    """
+def test_backup_manifest_has_no_table_list(tmp_path):
+    """The backup dumps the FULL database; the manifest carries no table list."""
     from apps.operations.backup import run_backup_injectable
 
     manifest = run_backup_injectable(tmp_path, _fake_dump_fn)
-    # New: manifest records the exclude pattern, not an include list.
-    assert "excludes" in manifest
-    assert "classyfire_seed" in manifest["excludes"]
-    # No explicit table list — we dump the full DB minus seed.
     assert "tables" not in manifest
 
 
@@ -816,20 +730,17 @@ def test_cleanup_keeps_recent_jobs():
 
 
 def test_cleanup_never_deletes_classification_cache():
-    from apps.classifications.models import ClassificationHistory, ClassyfireLive, ClassyfireSeed
+    from apps.classifications.models import ClassificationHistory, ClassyfireLive
     from apps.operations.cleanup import cleanup_expired
 
     _live(VALID_IK_A)
-    _seed(VALID_IK_B)
 
     live_count_before = ClassyfireLive.objects.count()
-    seed_count_before = ClassyfireSeed.objects.count()
     history_count_before = ClassificationHistory.objects.count()
 
     cleanup_expired(actor="test")
 
     assert ClassyfireLive.objects.count() == live_count_before
-    assert ClassyfireSeed.objects.count() == seed_count_before
     assert ClassificationHistory.objects.count() == history_count_before
 
 

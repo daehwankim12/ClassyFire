@@ -157,14 +157,6 @@ SHARED_ACCESS_LOGIN_WINDOW_SECONDS: int = env_int(
 )
 
 # ---------------------------------------------------------------------------
-# Seeding
-# ---------------------------------------------------------------------------
-
-SEED_PROFILE: str = env_str("SEED_PROFILE", "FULL")
-SEED_RECORD_ID: int = env_int("SEED_RECORD_ID", 20472700)
-SEED_AUTO_UPDATE: bool = env_bool("SEED_AUTO_UPDATE", False)
-
-# ---------------------------------------------------------------------------
 # ClassyFire remote API
 # ---------------------------------------------------------------------------
 

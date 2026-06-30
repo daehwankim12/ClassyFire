@@ -81,7 +81,7 @@ INSERT INTO gate3_probe_items (row_order, inchikey, status, priority)
 SELECT
     gs,
     'RDHQFKQIGNGIED-UHFFFAOYSA-N',
-    CASE WHEN gs % 10 = 0 THEN 'PENDING_CLASSIFICATION' ELSE 'FOUND_SEED_CACHE' END,
+    CASE WHEN gs % 10 = 0 THEN 'PENDING_CLASSIFICATION' ELSE 'FOUND_LIVE_CACHE' END,
     gs % 5
 FROM generate_series(1, {rows}) AS gs;
 

@@ -34,7 +34,6 @@ result lifecycle. Duplicates and input order are preserved via
 | --- | --- | --- |
 | `PENDING_NORMALIZATION` | Raw input not yet parsed/normalized. | no |
 | `FOUND_LIVE_CACHE` | Resolved from the current live cache (`classyfire_live`). | yes |
-| `FOUND_SEED_CACHE` | Resolved from the immutable seed (`classyfire_seed`). | yes |
 | `FOUND_WISHART_ENTITY` | Resolved via a Wishart entity lookup. | yes |
 | `PENDING_CLASSIFICATION` | Normalized; awaiting (local or remote) classification. | no |
 | `COMPLETE_AFTER_WISHART` | Completed after a remote Wishart classification. | yes |
@@ -53,7 +52,6 @@ PENDING_NORMALIZATION
     ├─▶ INVALID_INPUT                 (parse failure)
     ├─▶ NEED_STRUCTURE               (InChIKey-only, no known structure, remote needs structure)
     ├─▶ FOUND_LIVE_CACHE             (hit in classyfire_live)
-    ├─▶ FOUND_SEED_CACHE             (hit in classyfire_seed)
     ├─▶ FOUND_WISHART_ENTITY         (hit via Wishart entity lookup)
     └─▶ PENDING_CLASSIFICATION       (no cache hit; must classify)
 
@@ -418,11 +416,10 @@ byte-stable even after live is later superseded.
   row. Priority is stored as the integer column `classyfire_live.source_priority`
   so overwrite arbitration (`new.priority >= current.priority`) is portable.
   Exact map: `WISHART_LIVE_QUERY=100`, `WISHART_LIVE_ENTITY=100`,
-  `ARCHIVED_WISHART_JSON=90`, `LAB_OFFICIAL_IMPORT=85`, `HISTORICAL_AGGREGATE=70`.
+  `ARCHIVED_WISHART_JSON=90`, `LAB_OFFICIAL_IMPORT=85`.
 - `DetectedInputType` — detected shape of a raw input row
   (`INCHIKEY/INCHI/SMILES/SDF/UNKNOWN`).
-- `SeedProfile` — `FULL/LITE/CUSTOM` seed shape selector.
-- `EventCategory` — `WORKER/REMOTE/BACKUP/SEED/SECURITY` for `system_events`.
+- `EventCategory` — `WORKER/REMOTE/BACKUP/SECURITY` for `system_events`.
 
 ---
 

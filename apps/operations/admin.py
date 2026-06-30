@@ -9,22 +9,7 @@ from __future__ import annotations
 from django.contrib import admin
 
 from apps.core.admin_base import ReadOnlyModelAdmin
-from apps.operations.models import AuditSignature, SeedImport, SystemEvent
-
-
-@admin.register(SeedImport)
-class SeedImportAdmin(ReadOnlyModelAdmin):
-    list_display = (
-        "id",
-        "import_status",
-        "filename",
-        "actual_row_count",
-        "duplicate_count",
-        "created_at",
-        "who",
-    )
-    list_filter = ("import_status",)
-    search_fields = ("filename", "doi", "record_id")
+from apps.operations.models import AuditSignature, SystemEvent
 
 
 @admin.register(SystemEvent)

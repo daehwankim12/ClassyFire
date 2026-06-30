@@ -763,18 +763,11 @@ def test_fan_out_updates_all_waiting_items_across_jobs():
 
 def test_every_resolution_path_pins_classification_snapshot():
     from apps.chemont.models import ChemOntNode
-    from apps.classifications.models import ClassyfireSeed
 
     live_node = ChemOntNode.objects.create(
         numeric_id=9100,
         chemont_id="CHEMONT:0009100",
         name="Live pinned kingdom",
-        ontology_version="2.1",
-    )
-    seed_node = ChemOntNode.objects.create(
-        numeric_id=9101,
-        chemont_id="CHEMONT:0009101",
-        name="Seed pinned kingdom",
         ontology_version="2.1",
     )
     ClassyfireLive.objects.create(
@@ -784,39 +777,22 @@ def test_every_resolution_path_pins_classification_snapshot():
         retrieved_at=dt.datetime(2026, 1, 1, 12, 0, tzinfo=dt.UTC),
         kingdom_id=live_node.numeric_id,
     )
-    ClassyfireSeed.objects.create(
-        inchikey=IK_B,
-        inchikey14=IK_B[:14],
-        seed_source_id=1,
-        seed_version="fixture",
-        kingdom_id=seed_node.numeric_id,
-    )
 
     local_job, _secret = create_job(
         [
             {"raw": IK_A, "row_index": 0},
-            {"raw": IK_B, "row_index": 1},
         ],
         remote_enabled=True,
     )
     live_item = local_job.items.get(row_order=0)
-    seed_item = local_job.items.get(row_order=1)
     assert live_item.status == BatchItemStatus.FOUND_LIVE_CACHE
     assert live_item.classification_snapshot is not None
     assert live_item.classification_snapshot["inchikey"] == IK_A
-    assert live_item.classification_snapshot["tier"] == "LIVE"
     assert live_item.classification_snapshot["source_type"] == (
         SourceType.WISHART_LIVE_QUERY
     )
     assert live_item.classification_snapshot["kingdom"]["name"] == (
         "Live pinned kingdom"
-    )
-    assert seed_item.status == BatchItemStatus.FOUND_SEED_CACHE
-    assert seed_item.classification_snapshot is not None
-    assert seed_item.classification_snapshot["inchikey"] == IK_B
-    assert seed_item.classification_snapshot["tier"] == "SEED"
-    assert seed_item.classification_snapshot["kingdom"]["name"] == (
-        "Seed pinned kingdom"
     )
 
     entity_job = _job()
@@ -828,7 +804,6 @@ def test_every_resolution_path_pins_classification_snapshot():
     assert entity_item.status == BatchItemStatus.FOUND_WISHART_ENTITY
     assert entity_item.classification_snapshot is not None
     assert entity_item.classification_snapshot["inchikey"] == IK_C
-    assert entity_item.classification_snapshot["tier"] == "LIVE"
     assert entity_item.classification_snapshot["source_type"] == (
         SourceType.WISHART_LIVE_ENTITY
     )
@@ -854,7 +829,6 @@ def test_every_resolution_path_pins_classification_snapshot():
     assert query_item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
     assert query_item.classification_snapshot is not None
     assert query_item.classification_snapshot["inchikey"] == query_key
-    assert query_item.classification_snapshot["tier"] == "LIVE"
     assert query_item.classification_snapshot["source_type"] == (
         SourceType.WISHART_LIVE_QUERY
     )
@@ -892,7 +866,6 @@ def test_every_resolution_path_pins_classification_snapshot():
     assert structure_item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
     assert structure_item.classification_snapshot is not None
     assert structure_item.classification_snapshot["inchikey"] == ETHANOL_INCHIKEY
-    assert structure_item.classification_snapshot["tier"] == "LIVE"
     assert structure_item.classification_snapshot["source_type"] == (
         SourceType.WISHART_LIVE_QUERY
     )

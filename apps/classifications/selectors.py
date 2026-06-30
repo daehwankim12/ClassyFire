@@ -10,19 +10,16 @@ def _row_to_dict(cursor: Any, row: tuple[Any, ...]) -> dict[str, Any]:
     return dict(zip(cols, row, strict=True))
 
 
-# --- Unified surface: classyfire_current view (live-over-seed) ----------------
-# The view (migration 0005) applies the live-precedence rule in SQL and emits one
-# row per inchikey with a ``tier`` discriminator, so a single query resolves the
-# effective classification. The per-tier converters in ``services`` consume the
-# ``tier`` column to produce the same ``ClassificationLookupResult`` objects the
-# former live-then-seed two-step did.
+# --- Unified surface: classyfire_current view (live-only) ---------------------
+# The view emits one row per inchikey from the live cache, so a single query
+# resolves the effective classification into a ``ClassificationLookupResult``.
 
 _CURRENT_QUERY = "SELECT * FROM classyfire_current WHERE inchikey = %s LIMIT 1"
 _CURRENT_BULK_QUERY = "SELECT * FROM classyfire_current WHERE inchikey = ANY(%s)"
 
 
 def get_current_classification(inchikey: str) -> dict[str, Any] | None:
-    """Resolved current classification (live-over-seed) for one InChIKey."""
+    """Resolved current classification (live-only) for one InChIKey."""
     with connection.cursor() as cur:
         cur.execute(_CURRENT_QUERY, [inchikey])
         row = cur.fetchone()
@@ -33,7 +30,7 @@ def get_current_classification(inchikey: str) -> dict[str, Any] | None:
 
 def get_current_classifications(inchikeys: list[str]) -> dict[str, dict[str, Any]]:
     """Bulk resolved lookup. Returns ``{inchikey: row}``; the view guarantees
-    at most one row per inchikey (live wins, seed only when no live exists)."""
+    at most one row per inchikey (live-only)."""
     if not inchikeys:
         return {}
     out: dict[str, dict[str, Any]] = {}

@@ -99,11 +99,9 @@ automatically runs the recovery pass and resets stale tasks to `READY`.
 The stats page at `/stats/` provides a live overview of:
 
 - Unique InChIKey count in the live cache
-- Seed cache size
 - Remote task queue depth (pending, running, deferred)
 - Circuit breaker state (CLOSED / OPEN / HALF_OPEN)
 - Last successful remote call timestamp
-- Recent seed import history
 - Database size
 - Backup status
 
@@ -117,7 +115,6 @@ The `/admin/` actions panel exposes:
 | **Resume remote** | Clears the `REMOTE_PAUSED` flag. |
 | **Retry deferred** | Resets `DEFERRED` tasks to `READY` for immediate retry. |
 | **Retry retry-wait** | Resets `RETRY_WAIT` tasks to `READY`. |
-| **Trigger seed activation** | Activates the latest audited seed dataset. |
 
 ### Remote-pause flag
 
@@ -222,61 +219,6 @@ is recommended:
 
 ---
 
-## Seed Swap (Seed Dataset Update)
-
-The seed dataset is the pre-loaded local classification cache.  A new version
-can be imported and activated without downtime.
-
-### Step 1: Download the new seed
-
-```bash
-make seed-download
-```
-
-Downloads the latest seed from Zenodo (record 20472700) or a configured
-mirror.
-
-### Step 2: Verify integrity
-
-```bash
-make seed-verify
-```
-
-Checks the SHA-256 checksum of the downloaded files.
-
-### Step 3: Import (resumable)
-
-```bash
-make seed-import
-```
-
-Streams rows into the seed staging table.  If interrupted, re-run the same
-command — the checkpoint mechanism prevents duplicates (T-12).
-
-### Step 4: Audit
-
-```bash
-make seed-audit
-```
-
-Verifies that all imported InChIKeys are valid 27-character strings and that
-the ChemOnt hierarchy is consistent.  A seed that fails audit cannot be
-activated.
-
-### Step 5: Activate
-
-```bash
-make seed-activate
-```
-
-Promotes the audited seed to the active cache.  Existing live (Wishart) results
-are not overwritten — live results always take precedence (T-04).
-
-The operation is idempotent (T-13): running activate more than once does not
-create duplicates.
-
----
-
 ## Stats Page (`/stats/`)
 
 The stats page provides real-time operational metrics:
@@ -284,13 +226,11 @@ The stats page provides real-time operational metrics:
 | Metric | Description |
 |---|---|
 | Unique InChIKeys (live) | Compounds with a live Wishart classification. |
-| Seed rows | Active seed cache row count. |
-| Cache hit rate | Fraction of job items resolved locally (live + seed). |
+| Cache hit rate | Fraction of job items resolved from the live cache. |
 | Remote queue | Pending / running / deferred task counts. |
 | Circuit state | CLOSED (healthy), OPEN (outage), HALF_OPEN (recovering). |
 | DB size | PostgreSQL database size in MB. |
 | Backup status | Timestamp of the last successful backup. |
-| Seed import history | Last N seed import runs with row counts and status. |
 
 For automation, emit a machine-readable Gate 3 metrics snapshot:
 
@@ -345,7 +285,6 @@ The Django admin is available at `/admin/` for staff users.  Key admin actions:
 - **BatchJob** — view job details, inspect item counts, manually cancel jobs.
 - **RemoteTask** — inspect queue, reset stuck tasks.
 - **SystemEvent** — audit log of all administrative actions.
-- **SeedImport** — view import history and activation status.
 
 ### Pausing and resuming remote classification
 
@@ -414,7 +353,7 @@ when **Retry deferred** is triggered manually.
 job pages and their linked upload artifacts after `JOB_RETENTION_DAYS`
 (default 7), plus expired export files after `EXPORT_RETENTION_DAYS`
 (default 7). It does not delete the ClassyFire classification cache tables
-(`classyfire_seed*`, `classyfire_live`, or `classification_history`).
+(`classyfire_live` or `classification_history`).
 
 ---
 

@@ -74,23 +74,13 @@ EVIDENCE: dict[str, Evidence] = {
         ],
     },
     # ------------------------------------------------------------------
-    # T-03: Seed lookup (local cache hit)
+    # T-03: Live cache lookup (local cache hit)
     # ------------------------------------------------------------------
     "T-03": {
         "kind": "automated",
         "file": "test_classification_lookup.py",
         "tests": [
-            "test_exact_seed_lookup_hit",
-        ],
-    },
-    # ------------------------------------------------------------------
-    # T-04: Live precedence (live over seed)
-    # ------------------------------------------------------------------
-    "T-04": {
-        "kind": "automated",
-        "file": "test_classification_lookup.py",
-        "tests": [
-            "test_live_over_seed_precedence",
+            "test_exact_live_lookup_hit",
         ],
     },
     # ------------------------------------------------------------------
@@ -168,27 +158,6 @@ EVIDENCE: dict[str, Evidence] = {
             "test_csv_export_requested_classyfy_row_shape",
             "test_batch_item_and_export_keep_original_classification_after_live_supersede",
             "test_injection_escaping",
-        ],
-    },
-    # ------------------------------------------------------------------
-    # T-12: Seed resume (checkpoint resume no duplicates)
-    # ------------------------------------------------------------------
-    "T-12": {
-        "kind": "automated",
-        "file": "test_seed_import.py",
-        "tests": [
-            "test_checkpoint_resume_no_duplicates",
-        ],
-    },
-    # ------------------------------------------------------------------
-    # T-13: Seed swap (seed activation/new version)
-    # ------------------------------------------------------------------
-    "T-13": {
-        "kind": "automated",
-        "file": "test_seed_import.py",
-        "tests": [
-            "test_seed_activate_view_serves_rows",
-            "test_seed_activate_view_survives_multiple_calls",
         ],
     },
     # ------------------------------------------------------------------
@@ -283,9 +252,9 @@ EVIDENCE: dict[str, Evidence] = {
 # ---------------------------------------------------------------------------
 
 REQUIRED_IDS = [
-    "T-01", "T-02", "T-03", "T-04", "T-05",
+    "T-01", "T-02", "T-03", "T-05",
     "T-06", "T-07", "T-08", "T-09", "T-10",
-    "T-11", "T-12", "T-13", "T-14", "T-15",
+    "T-11", "T-14", "T-15",
     "NFR-P01", "NFR-P02", "NFR-P03", "NFR-P04", "NFR-P05",
 ]
 

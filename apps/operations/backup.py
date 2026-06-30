@@ -5,19 +5,9 @@ tests can monkeypatch it without touching real binaries.
 
 Dump strategy
 ─────────────
-We dump the FULL database and EXCLUDE only the rebuildable seed *data*, via
-``--exclude-table-data=classyfire_seed*``. This drops the bulky seed ROWS while
-KEEPING the table/view definitions — which matters because the
-``classyfire_current`` view (live-over-seed, migration 0005) depends on the
-``classyfire_seed_current`` view. The old ``--exclude-table`` dropped those seed
-*definitions* too, leaving ``classyfire_current``'s dependency dangling so
-``pg_restore`` failed to create it. The ``classyfire_seed*`` pattern covers:
-  - classyfire_seed          — base seed table (rows re-importable from Zenodo)
-  - classyfire_seed_v<N>     — versioned physical tables (same source)
-  - classyfire_seed_current  — view (definition kept; a view carries no data)
-
-Everything else — compounds, batch jobs/items with their submitted structures,
-remote tasks + provenance, classification live/history, operations — IS dumped.
+We dump the FULL database with no table-data exclusions: compounds, batch
+jobs/items with their submitted structures, remote tasks + provenance,
+classification live/history, and operations are all dumped.
 
 Retention policy (configurable via settings):
   - BACKUP_DAILY_COUNT   (default 7)
@@ -80,11 +70,6 @@ def _db_params() -> dict[str, str]:
         "user": db.get("USER", ""),
         "password": db.get("PASSWORD", ""),
     }
-
-
-def _seed_exclude_pattern() -> str:
-    """Return the pg_dump --exclude-table-data glob pattern for seed tables."""
-    return "classyfire_seed*"
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +256,7 @@ def _build_artifact_archives(
 
 
 def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
-    """Run a backup: dump (excluding seed tables), archive media, checksum,
+    """Run a backup: dump the full database, archive media, checksum,
     manifest, retention, log event.
 
     Returns the manifest dict.
@@ -297,7 +282,6 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
         "-U", db["user"],
         "-d", db["name"],
         "-Fc",
-        f"--exclude-table-data={_seed_exclude_pattern()}",
         "-f", str(dump_path),
     ]
 
@@ -343,7 +327,6 @@ def run_backup(backup_dir: Path | None = None) -> dict[str, Any]:
         "media_file": media_file,
         "media_checksum": media_checksum,
         "artifact_archives": artifact_archives,
-        "excludes": _seed_exclude_pattern(),
         "status": "ok",
         "stderr": result.stderr or "",
     }
@@ -389,7 +372,6 @@ def run_backup_injectable(
         "-U", db["user"],
         "-d", db["name"],
         "-Fc",
-        f"--exclude-table-data={_seed_exclude_pattern()}",
         "-f", str(dump_path),
     ]
 
@@ -435,7 +417,6 @@ def run_backup_injectable(
         "media_file": media_file,
         "media_checksum": media_checksum,
         "artifact_archives": artifact_archives,
-        "excludes": _seed_exclude_pattern(),
         "status": "ok",
         "stderr": "",
     }

@@ -74,7 +74,6 @@ The results page shows a table with one row per input compound:
 | Status | Meaning |
 |---|---|
 | FOUND_LIVE_CACHE | Classified from a recent Wishart result stored locally. |
-| FOUND_SEED_CACHE | Classified from the pre-loaded seed dataset. |
 | COMPLETE_AFTER_WISHART | Classified after a successful remote call in this job. |
 | FOUND_WISHART_ENTITY | Classified from a Wishart entity lookup. |
 | PENDING_CLASSIFICATION | Queued for remote classification (check back later). |
@@ -166,7 +165,7 @@ curl -O /api/exports/<token>
 - Row order matches the original input order (T-11).
 - Duplicate input rows appear as separate export rows (T-11).
 - Special characters are escaped to prevent CSV/formula injection (T-11).
-- Source/provenance fields (seed vs. live) are included in the export (T-11).
+- Source/provenance fields (live cache vs. remote Wishart) are included in the export (T-11).
 
 ---
 

@@ -64,9 +64,6 @@ components:
         local_hit_count:
           type: integer
           description: Rows resolved from the live classification cache.
-        seed_hit_count:
-          type: integer
-          description: Rows resolved from the seed cache.
         remote_pending_count:
           type: integer
           description: Rows awaiting remote classification.
@@ -93,7 +90,6 @@ components:
         - total_count
         - completed_count
         - local_hit_count
-        - seed_hit_count
         - remote_pending_count
         - need_structure_count
         - invalid_count
@@ -126,7 +122,7 @@ components:
           type: string
           description: >
             Item status.  One of:
-            PENDING_CLASSIFICATION, FOUND_LIVE_CACHE, FOUND_SEED_CACHE,
+            PENDING_CLASSIFICATION, FOUND_LIVE_CACHE,
             FOUND_WISHART_ENTITY, COMPLETE_AFTER_WISHART, NEED_STRUCTURE,
             INVALID_INPUT, REMOTE_DELAYED.
         message:

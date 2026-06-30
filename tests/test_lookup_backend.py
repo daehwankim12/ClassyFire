@@ -23,7 +23,6 @@ class RecordingLookupBackend:
         from apps.classifications.services import (
             ChemOntLabel,
             ClassificationLookupResult,
-            LookupTier,
         )
 
         self.__class__.one_calls.append(inchikey)
@@ -40,7 +39,6 @@ class RecordingLookupBackend:
             classification_version="backend-v1",
             retrieved_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
             query_id="backend-query",
-            tier=LookupTier.LIVE,
             result_id=123,
         )
 
@@ -86,19 +84,21 @@ def test_bulk_lookup_delegates_to_configured_backend_once():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_default_lookup_backend_preserves_postgres_seed_lookup():
-    from apps.classifications.models import ClassyfireSeed
-    from apps.classifications.services import LookupTier, lookup_current_classification
+def test_default_lookup_backend_resolves_live_row():
+    from django.utils import timezone
 
-    ClassyfireSeed.objects.create(
+    from apps.classifications.models import ClassyfireLive
+    from apps.classifications.services import lookup_current_classification
+    from apps.core.enums import SOURCE_PRIORITY, SourceType
+
+    ClassyfireLive.objects.create(
         inchikey=IK_A,
-        inchikey14=IK_A[:14],
-        seed_source_id=42,
-        seed_version="seed-backend-v1",
+        source_type=SourceType.WISHART_LIVE_QUERY.value,
+        source_priority=SOURCE_PRIORITY[SourceType.WISHART_LIVE_QUERY],
+        retrieved_at=timezone.now(),
     )
 
     result = lookup_current_classification(IK_A)
 
     assert result is not None
-    assert result.tier == LookupTier.SEED
-    assert result.classification_version == "seed-backend-v1"
+    assert result.source_type == SourceType.WISHART_LIVE_QUERY.value

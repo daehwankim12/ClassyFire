@@ -9,7 +9,7 @@ POSTGRES_TEST_USER ?= classyfire
 POSTGRES_TEST_PASSWORD ?= classyfire
 PYTEST_ARGS ?= tests
 
-.PHONY: test lint format typecheck seed-download seed-verify seed-import seed-audit seed-activate postgres-test-up postgres-test-down test-postgres
+.PHONY: test lint format typecheck postgres-test-up postgres-test-down test-postgres
 
 test:
 	$(UV_DEV_RUN) python -m pytest
@@ -22,21 +22,6 @@ format:
 
 typecheck:
 	$(UV_DEV_RUN) python -m mypy apps config
-
-seed-download:
-	$(UV_RUN) python manage.py seed_download
-
-seed-verify:
-	$(UV_RUN) python manage.py seed_verify
-
-seed-import:
-	$(UV_RUN) python manage.py seed_import --resume
-
-seed-audit:
-	$(UV_RUN) python manage.py seed_audit
-
-seed-activate:
-	$(UV_RUN) python manage.py seed_activate
 
 postgres-test-up:
 	POSTGRES_TEST_PORT=$(POSTGRES_TEST_PORT) POSTGRES_TEST_DB=$(POSTGRES_TEST_DB) POSTGRES_TEST_USER=$(POSTGRES_TEST_USER) POSTGRES_TEST_PASSWORD=$(POSTGRES_TEST_PASSWORD) docker compose -f docker-compose.test.yml up -d postgres-test

@@ -17,14 +17,13 @@ from apps.classifications.models import (
     ClassificationHistory,
     ClassificationResult,
     ClassyfireLive,
-    ClassyfireSeed,
     SourceArtifact,
 )
 from apps.compounds.models import CompoundStructure, CompoundUsage
 from apps.core.enums import ProviderControlState, SubmissionState, TaskState
 from apps.core.models import LoginThrottle
 from apps.operations.admin_views import is_remote_paused
-from apps.operations.models import AuditSignature, SeedImport, SystemEvent
+from apps.operations.models import AuditSignature, SystemEvent
 from apps.remote.models import (
     RemoteAttempt,
     RemoteBudgetLedger,
@@ -50,9 +49,9 @@ REGISTERED_MODELS = [
     RemoteSubmissionMember, RemoteAttempt, RemoteCircuit, RemoteRateBucket,
     RemoteProviderControl, RemoteBudgetLedger, RemotePrincipalState,
     RemoteQueueControl,
-    ClassificationResult, ClassyfireLive, ClassyfireSeed, ClassificationHistory,
+    ClassificationResult, ClassyfireLive, ClassificationHistory,
     SourceArtifact,
-    SeedImport, SystemEvent, AuditSignature,
+    SystemEvent, AuditSignature,
     CompoundStructure, CompoundUsage,
     ChemOntNode,
     LoginThrottle,

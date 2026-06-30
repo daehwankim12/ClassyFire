@@ -47,7 +47,6 @@ PAGE_SIZE = 100
 
 FOUND_STATUSES = [
     BatchItemStatus.FOUND_LIVE_CACHE,
-    BatchItemStatus.FOUND_SEED_CACHE,
     BatchItemStatus.FOUND_WISHART_ENTITY,
     BatchItemStatus.COMPLETE_AFTER_WISHART,
 ]

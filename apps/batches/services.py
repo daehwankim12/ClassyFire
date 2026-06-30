@@ -29,7 +29,6 @@ Local processing flow per row
 2. If error → INVALID_INPUT (message = error)
 3. If inchikey (27-char) → lookup_current_classification(inchikey)
    - LIVE hit → FOUND_LIVE_CACHE
-   - SEED hit → FOUND_SEED_CACHE
    - miss → see step 4
 4. Local miss:
    - Create/reuse CompoundStructure; update CompoundUsage.
@@ -76,7 +75,6 @@ from apps.batches.remote_delay import (
 )
 from apps.classifications.services import (
     ClassificationLookupResult,
-    LookupTier,
     classification_lookup_snapshot,
     lookup_current_classification,
     lookup_current_classifications,
@@ -137,7 +135,6 @@ def _reconcile_resolved_classification(job: BatchJob) -> None:
     """
     resolved_statuses = (
         BatchItemStatus.FOUND_LIVE_CACHE,
-        BatchItemStatus.FOUND_SEED_CACHE,
         BatchItemStatus.FOUND_WISHART_ENTITY,
         BatchItemStatus.COMPLETE_AFTER_WISHART,
     )
@@ -389,11 +386,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
         if result is not None:
             item.classification_snapshot = classification_lookup_snapshot(result)
             _pin_resolved_classification(item, item.classification_snapshot)
-            item.status = (
-                BatchItemStatus.FOUND_LIVE_CACHE
-                if result.tier == LookupTier.LIVE
-                else BatchItemStatus.FOUND_SEED_CACHE
-            )
+            item.status = BatchItemStatus.FOUND_LIVE_CACHE
             item.save(
                 update_fields=[
                     "status",
@@ -560,10 +553,7 @@ def _process_item(
         if result is not None:
             item.classification_snapshot = classification_lookup_snapshot(result)
             _pin_resolved_classification(item, item.classification_snapshot)
-            if result.tier == LookupTier.LIVE:
-                return BatchItemStatus.FOUND_LIVE_CACHE
-            else:
-                return BatchItemStatus.FOUND_SEED_CACHE
+            return BatchItemStatus.FOUND_LIVE_CACHE
 
         # Step 4: Local miss — create/reuse structure only if one was supplied.
         has_structure = norm.detected_type != DetectedInputType.INCHIKEY
@@ -629,7 +619,7 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
 
     Canonical definitions
     ---------------------
-    completed  = FOUND_LIVE_CACHE + FOUND_SEED_CACHE + FOUND_WISHART_ENTITY
+    completed  = FOUND_LIVE_CACHE + FOUND_WISHART_ENTITY
                  + COMPLETE_AFTER_WISHART + INVALID_INPUT + RESULT_KEY_MISMATCH
                  (every item in a terminal state that requires no further action)
     blocking = PENDING_NORMALIZATION + PENDING_CLASSIFICATION + REMOTE_DELAYED
@@ -647,7 +637,6 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
 
     terminal_complete = (
         BatchItemStatus.FOUND_LIVE_CACHE,
-        BatchItemStatus.FOUND_SEED_CACHE,
         BatchItemStatus.FOUND_WISHART_ENTITY,
         BatchItemStatus.COMPLETE_AFTER_WISHART,
         BatchItemStatus.INVALID_INPUT,
@@ -674,7 +663,6 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
         counts = BatchItem.objects.filter(job=job).aggregate(
             total=Count("pk"),
             local_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_LIVE_CACHE)),
-            seed_hit=Count("pk", filter=Q(status=BatchItemStatus.FOUND_SEED_CACHE)),
             remote_pending=Count(
                 "pk",
                 filter=Q(
@@ -692,7 +680,6 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
 
         total = counts["total"]
         local_hit = counts["local_hit"]
-        seed_hit = counts["seed_hit"]
         remote_pending = counts["remote_pending"]
         blocking = counts["blocking"]
         need_structure = counts["need_structure"]
@@ -717,7 +704,6 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
             "total_count": total,
             "completed_count": completed,
             "local_hit_count": local_hit,
-            "seed_hit_count": seed_hit,
             "remote_pending_count": remote_pending,
             "need_structure_count": need_structure,
             "invalid_count": invalid,
@@ -968,11 +954,7 @@ def _retry_backpressured_remote_delayed_items(
             if result is not None:
                 item.classification_snapshot = classification_lookup_snapshot(result)
                 _pin_resolved_classification(item, item.classification_snapshot)
-                item.status = (
-                    BatchItemStatus.FOUND_LIVE_CACHE
-                    if result.tier == LookupTier.LIVE
-                    else BatchItemStatus.FOUND_SEED_CACHE
-                )
+                item.status = BatchItemStatus.FOUND_LIVE_CACHE
                 item.message = None
                 item.save(update_fields=_ITEM_UPDATE_FIELDS)
                 continue

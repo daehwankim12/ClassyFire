@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import dataclass
-from typing import Any
 
 from django.conf import settings
 from django.db import connection
@@ -41,11 +40,9 @@ class BackupStatus:
 class SystemStats:
     unique_inchikey_count: int
     live_result_count: int
-    seed_count: int
     cache_hit_rate: float
     pending_unique_structure_count: int
     wishart: WishartStats
-    seed_import_history: list[dict[str, Any]]
     db_size_bytes: int
     backup: BackupStatus
     disk: DiskGuard
@@ -154,29 +151,12 @@ def _backup_status() -> BackupStatus:
     )
 
 
-def _seed_import_history() -> list[dict[str, Any]]:
-    from apps.operations.models import SeedImport
-
-    rows = SeedImport.objects.order_by("-created_at").values(
-        "id",
-        "doi",
-        "filename",
-        "checksum",
-        "import_status",
-        "actual_row_count",
-        "created_at",
-        "who",
-    )
-    return [dict(r) for r in rows]
-
-
 def collect_stats(data_path: str | None = None) -> SystemStats:
-    from apps.classifications.models import ClassyfireLive, ClassyfireSeed
+    from apps.classifications.models import ClassyfireLive
     from apps.remote.models import RemoteTask
 
     unique_inchikeys = ClassyfireLive.objects.values("inchikey").distinct().count()
     live_count = ClassyfireLive.objects.count()
-    seed_count = ClassyfireSeed.objects.count()
 
     total_unique = unique_inchikeys
     cache_hit_rate = (live_count / total_unique) if total_unique > 0 else 0.0
@@ -191,11 +171,9 @@ def collect_stats(data_path: str | None = None) -> SystemStats:
     return SystemStats(
         unique_inchikey_count=unique_inchikeys,
         live_result_count=live_count,
-        seed_count=seed_count,
         cache_hit_rate=round(cache_hit_rate, 4),
         pending_unique_structure_count=pending_unique,
         wishart=_wishart_stats(),
-        seed_import_history=_seed_import_history(),
         db_size_bytes=_get_db_size_bytes(),
         backup=_backup_status(),
         disk=_disk_guard(data_path),

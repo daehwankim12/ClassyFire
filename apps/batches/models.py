@@ -44,7 +44,6 @@ class BatchJob(models.Model):
     total_count = models.IntegerField(default=0)
     completed_count = models.IntegerField(default=0)
     local_hit_count = models.IntegerField(default=0)
-    seed_hit_count = models.IntegerField(default=0)
     remote_pending_count = models.IntegerField(default=0)
     need_structure_count = models.IntegerField(default=0)
     invalid_count = models.IntegerField(default=0)

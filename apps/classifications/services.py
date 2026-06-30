@@ -4,14 +4,12 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
 from django.conf import settings
 from django.utils.module_loading import import_string
 
 from apps.classifications.backends import ClassificationLookupBackend
-from apps.core.enums import SOURCE_PRIORITY, SourceType
 
 INCHIKEY_RE = re.compile(r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$")
 DEFAULT_LOOKUP_BACKEND = (
@@ -19,11 +17,6 @@ DEFAULT_LOOKUP_BACKEND = (
 )
 _lookup_backend: ClassificationLookupBackend | None = None
 _lookup_backend_path: str | None = None
-
-
-class LookupTier(StrEnum):
-    LIVE = "LIVE"
-    SEED = "SEED"
 
 
 @dataclass(frozen=True)
@@ -46,7 +39,6 @@ class ClassificationLookupResult:
     classification_version: str | None
     retrieved_at: datetime | None
     query_id: str | None
-    tier: LookupTier
     result_id: int | None = None
 
 
@@ -104,7 +96,6 @@ def classification_lookup_snapshot(
         "classification_version": result.classification_version,
         "retrieved_at": retrieved_at,
         "query_id": result.query_id,
-        "tier": result.tier.value,
         "result_id": result.result_id,
     }
 
@@ -160,53 +151,25 @@ def _live_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
         classification_version=row.get("classification_version"),
         retrieved_at=row.get("retrieved_at"),
         query_id=row.get("remote_query_id"),
-        tier=LookupTier.LIVE,
         result_id=row.get("result_id"),
-    )
-
-
-def _seed_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
-    return ClassificationLookupResult(
-        inchikey=row["inchikey"],
-        kingdom=_label(row, "kingdom"),
-        superclass=_label(row, "superclass"),
-        class_=_label(row, "class"),
-        subclass=_label(row, "subclass"),
-        direct_parent=_label(row, "direct_parent"),
-        # Seed rows are served as the historical-aggregate tier; surface its
-        # canonical priority and the seed source id as provenance so callers
-        # (and a future Go/Rust reader) can audit where the result came from.
-        source_type=SourceType.HISTORICAL_AGGREGATE.value,
-        source_priority=SOURCE_PRIORITY[SourceType.HISTORICAL_AGGREGATE],
-        source_ref=(
-            str(row["seed_source_id"]) if row.get("seed_source_id") is not None else None
-        ),
-        classification_version=row.get("seed_version"),
-        retrieved_at=None,
-        query_id=None,
-        tier=LookupTier.SEED,
     )
 
 
 def _current_row_to_result(row: dict[str, Any]) -> ClassificationLookupResult:
     """Map one ``classyfire_current`` view row to a result.
 
-    The view emits a ``tier`` discriminator ('live' | 'seed'); we dispatch to the
-    existing per-tier converters so the public result is identical to the former
-    two-query (live-then-seed) path.
+    The view is live-only, so every row maps via the live converter.
     """
-    if row.get("tier") == "live":
-        return _live_row_to_result(row)
-    return _seed_row_to_result(row)
+    return _live_row_to_result(row)
 
 
 def lookup_current_classification(inchikey: str) -> ClassificationLookupResult | None:
     """Look up classification for an exact 27-char InChIKey.
 
     Returns None if the key is not a valid full InChIKey (P-02: connectivity-only
-    14-char prefix matches are never auto-applied) or if no record exists.
-    Live results take precedence; within live, highest source_priority wins,
-    ties broken by newest retrieved_at.
+    14-char prefix matches are never auto-applied) or if no record exists in the
+    live cache. The live cache holds one row per key (highest source_priority wins
+    at write time, ties broken by newest retrieved_at).
     """
     if not INCHIKEY_RE.match(inchikey):
         return None
@@ -219,9 +182,8 @@ def lookup_current_classifications(
 ) -> dict[str, ClassificationLookupResult]:
     """Bulk equivalent of :func:`lookup_current_classification`.
 
-    Runs ONE ``WHERE inchikey IN (...)`` live query and ONE seed query (instead
-    of the per-item N+1), then applies the SAME live-precedence rule per key:
-    a live hit wins; otherwise the seed hit (if any) is used. Invalid / non-27
+    Runs ONE ``WHERE inchikey = ANY(...)`` query against the live-only
+    ``classyfire_current`` view (instead of the per-item N+1). Invalid / non-27
     keys are skipped. The returned dict has identical ``ClassificationLookupResult``
     values to calling the single-key function per inchikey.
     """

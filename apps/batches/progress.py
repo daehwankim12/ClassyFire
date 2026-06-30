@@ -3,11 +3,11 @@
 The detail page shows a segmented progress bar (resolved vs still-processing) and
 a coarse "time remaining" estimate. The ETA is intentionally approximate but is
 floored at the **remote pace**: anything still pending has already missed the
-local cache/seed and must be classified by the rate-limited Wishart remote, which
+local cache and must be classified by the rate-limited Wishart remote, which
 costs ``60 / REMOTE_ENTITY_REQUESTS_PER_MIN`` seconds per item (see
 :func:`_remote_pace_seconds`). The observed
 resolution-rate estimate alone is misleading because it averages in the *instant*
-local cache/seed hits, so it badly under-promises the remote-bound tail. We
+local cache hits, so it badly under-promises the remote-bound tail. We
 therefore take whichever of {remote-pace floor, observed rate} is slower and
 label it an estimate. It self-corrects on every poll.
 """
@@ -24,7 +24,7 @@ from apps.batches.models import BatchJob
 def _remote_pace_seconds() -> float:
     """Seconds per remaining item, derived from the Wishart remote rate limit.
 
-    Every still-pending item has missed the local cache/seed, so it needs at
+    Every still-pending item has missed the local cache, so it needs at
     least one rate-limited remote round-trip: an entity GET, then (for a genuine
     miss) a batched structure submit + polls. All remote calls draw from shared,
     DB-backed token buckets that refill at ``REMOTE_ENTITY_REQUESTS_PER_MIN`` /
@@ -87,7 +87,7 @@ def build_job_progress(job: BatchJob, *, is_terminal: bool) -> dict[str, Any]:
         # Floor at the remote pace: each pending item costs ~6s of rate-limited
         # Wishart time. Only let the observed rate win when it is SLOWER (heavy
         # cross-job contention) — never faster, since its speed comes from
-        # instant local cache/seed hits that the remote tail won't enjoy.
+        # instant local cache hits that the remote tail won't enjoy.
         eta_seconds = pending * _remote_pace_seconds()
         if resolved > 0 and job.created_at is not None:
             elapsed = (timezone.now() - job.created_at).total_seconds()

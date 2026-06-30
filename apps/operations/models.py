@@ -1,4 +1,4 @@
-"""Operational tables: seed imports and the system event log."""
+"""Operational tables: the system event log and audit signatures."""
 from __future__ import annotations
 
 from typing import Any
@@ -6,36 +6,6 @@ from typing import Any
 from django.db import models
 
 from apps.core.enums import EventCategory
-
-
-class SeedImport(models.Model):
-    """An audited import of a seed dataset (DOI-cited, checksummed, licensed)."""
-
-    doi = models.TextField(null=True, blank=True)
-    record_id = models.TextField(null=True, blank=True, help_text="Source record id.")
-    filename = models.TextField(null=True, blank=True)
-    checksum = models.TextField(null=True, blank=True, help_text="File checksum.")
-    license = models.TextField(null=True, blank=True)
-    expected_row_count = models.IntegerField(null=True, blank=True)
-    actual_row_count = models.IntegerField(null=True, blank=True)
-    duplicate_count = models.IntegerField(null=True, blank=True)
-    audit_result = models.JSONField(
-        null=True, blank=True, help_text="Structured audit findings as JSONB."
-    )
-    import_status = models.TextField(
-        default="PENDING", help_text="Coarse import lifecycle status."
-    )
-    activated_table = models.TextField(
-        null=True, blank=True, help_text="Physical seed table this import activated."
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-    who = models.TextField(null=True, blank=True, help_text="Actor who ran the import.")
-
-    class Meta:
-        db_table = "seed_imports"
-
-    def __str__(self) -> str:
-        return f"seed_import:{self.pk} ({self.import_status})"
 
 
 class SystemEventManager(models.Manager["SystemEvent"]):

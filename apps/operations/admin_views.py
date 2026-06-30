@@ -1,4 +1,4 @@
-"""Admin operations: retry tasks, remote pause/resume, seed activation, backup status.
+"""Admin operations: retry tasks, remote pause/resume, backup status.
 
 All state is DB-backed (SystemEvent rows or model fields) so a future Go/Rust
 operator tool can read/write the same state.
@@ -101,20 +101,6 @@ def retry_failed_tasks(actor: str = "admin") -> int:
         payload={"count": count, "actor": actor},
     )
     return count
-
-
-# ---------------------------------------------------------------------------
-# Seed activation trigger
-# ---------------------------------------------------------------------------
-
-def trigger_seed_activation(seed_import_id: int, actor: str = "admin") -> SystemEvent:
-    """Log a seed activation trigger event. The actual activation runs async."""
-    ev = SystemEvent.objects.create(
-        category=EventCategory.SEED,
-        event_type="seed_activation_triggered",
-        payload={"seed_import_id": seed_import_id, "actor": actor},
-    )
-    return ev
 
 
 # ---------------------------------------------------------------------------

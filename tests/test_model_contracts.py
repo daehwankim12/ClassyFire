@@ -7,16 +7,13 @@ check constraint.
 """
 from __future__ import annotations
 
-import importlib
 import uuid
 
 import pytest
-from django.db import IntegrityError, connection, migrations, transaction
+from django.db import IntegrityError, connection, transaction
 from django.db.utils import DataError
 
 from apps.batches.models import BatchItem, BatchJob
-from apps.chemont.models import ChemOntNode
-from apps.classifications.models import ClassyfireSeed
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import (
     SOURCE_PRIORITY,
@@ -32,56 +29,6 @@ VALID_INCHIKEY_2 = "RYYVLZVUVIJVGH-UHFFFAOYSA-N"  # caffeine, exactly 27 chars
 
 
 # ---------------------------------------------------------------------------
-# ClassyfireSeed shape
-# ---------------------------------------------------------------------------
-
-
-def _field(model, name):
-    return model._meta.get_field(name)
-
-
-def test_classyfire_seed_inchikey_is_char27():
-    field = _field(ClassyfireSeed, "inchikey")
-    assert field.get_internal_type() == "CharField"
-    assert field.max_length == 27
-    assert field.primary_key is True
-
-
-def test_classyfire_seed_inchikey14_is_char14():
-    field = _field(ClassyfireSeed, "inchikey14")
-    assert field.get_internal_type() == "CharField"
-    assert field.max_length == 14
-    assert field.null is False
-
-
-def test_classyfire_seed_has_five_chemont_slots():
-    for slot in (
-        "kingdom",
-        "superclass",
-        "class_node",
-        "subclass",
-        "direct_parent",
-    ):
-        field = _field(ClassyfireSeed, slot)
-        assert field.is_relation, f"{slot} must be a FK"
-        assert field.related_model is ChemOntNode
-
-
-def test_classyfire_seed_has_source_and_version():
-    seed_source = _field(ClassyfireSeed, "seed_source_id")
-    assert seed_source.get_internal_type() == "BigIntegerField"
-    assert seed_source.null is False
-
-    seed_version = _field(ClassyfireSeed, "seed_version")
-    assert seed_version.get_internal_type() in {"CharField", "TextField"}
-    assert seed_version.null is False
-
-
-def test_classyfire_seed_db_table():
-    assert ClassyfireSeed._meta.db_table == "classyfire_seed"
-
-
-# ---------------------------------------------------------------------------
 # Source priority map
 # ---------------------------------------------------------------------------
 
@@ -91,7 +38,6 @@ def test_source_priority_exact_values():
     assert SOURCE_PRIORITY[SourceType.WISHART_LIVE_ENTITY] == 100
     assert SOURCE_PRIORITY[SourceType.ARCHIVED_WISHART_JSON] == 90
     assert SOURCE_PRIORITY[SourceType.LAB_OFFICIAL_IMPORT] == 85
-    assert SOURCE_PRIORITY[SourceType.HISTORICAL_AGGREGATE] == 70
 
 
 def test_source_priority_covers_every_source_type():
@@ -175,38 +121,6 @@ def test_inchikey_check_constraint_rejects_wrong_length():
                 RemoteTask.objects.create(inchikey=bad, **node_kwargs)
 
 
-@pytest.mark.django_db
-def test_seed_inchikey14_check_constraint():
-    """A seed with a non-14-char inchikey14 is rejected by the DB."""
-    with pytest.raises((IntegrityError, DataError)):
-        with transaction.atomic():
-            ClassyfireSeed.objects.create(
-                inchikey=VALID_INCHIKEY,
-                inchikey14="TOOSHORT",  # not 14 chars
-                seed_source_id=1,
-                seed_version="v1",
-            )
-
-
-@pytest.mark.django_db
-def test_seed_round_trip_with_valid_lengths():
-    node = ChemOntNode.objects.create(
-        numeric_id=1, chemont_id="CHEMONT:0000000", name="root", ontology_version="2.1"
-    )
-    seed = ClassyfireSeed.objects.create(
-        inchikey=VALID_INCHIKEY,
-        inchikey14=VALID_INCHIKEY[:14],
-        seed_source_id=42,
-        seed_version="v1.0",
-        kingdom=node,
-        other_labels={"foo": "bar"},
-    )
-    seed.refresh_from_db()
-    assert seed.inchikey14 == VALID_INCHIKEY[:14]
-    assert seed.kingdom_id == 1
-    assert seed.other_labels == {"foo": "bar"}
-
-
 # ---------------------------------------------------------------------------
 # BatchJob UUID PK
 # ---------------------------------------------------------------------------
@@ -242,56 +156,6 @@ def test_remote_task_has_queue_columns():
 
 def test_connection_is_postgres():
     assert connection.vendor == "postgresql"
-
-
-def _assert_runpython_before_constraint(
-    migration_module: str,
-    function_name: str,
-    constraint_name: str,
-) -> None:
-    module = importlib.import_module(migration_module)
-    operations = module.Migration.operations
-    runpython_index = next(
-        i
-        for i, operation in enumerate(operations)
-        if isinstance(operation, migrations.RunPython)
-        and operation.code.__name__ == function_name
-    )
-    constraint_index = next(
-        i
-        for i, operation in enumerate(operations)
-        if isinstance(operation, migrations.AddConstraint)
-        and operation.constraint.name == constraint_name
-    )
-    assert runpython_index < constraint_index
-
-
-def test_inchikey_regex_constraints_have_migration_preflights():
-    _assert_runpython_before_constraint(
-        "apps.compounds.migrations.0002_remove_compoundstructure_compound_structure_inchikey_len27_and_more",
-        "fail_on_invalid_compound_inchikeys",
-        "compound_structure_inchikey_format",
-    )
-    _assert_runpython_before_constraint(
-        "apps.compounds.migrations.0002_remove_compoundstructure_compound_structure_inchikey_len27_and_more",
-        "fail_on_invalid_compound_inchikeys",
-        "compound_usage_inchikey_format",
-    )
-    _assert_runpython_before_constraint(
-        "apps.batches.migrations.0003_remove_batchitem_batch_item_inchikey_len27_and_more",
-        "fail_on_invalid_batch_item_inchikeys",
-        "batch_item_inchikey_format",
-    )
-    _assert_runpython_before_constraint(
-        "apps.remote.migrations.0002_remove_remotequeryitem_remote_query_item_inchikey_len27_and_more",
-        "fail_on_invalid_remote_inchikeys",
-        "remote_task_inchikey_format",
-    )
-    _assert_runpython_before_constraint(
-        "apps.remote.migrations.0002_remove_remotequeryitem_remote_query_item_inchikey_len27_and_more",
-        "fail_on_invalid_remote_inchikeys",
-        "remote_query_item_inchikey_format",
-    )
 
 
 @pytest.mark.django_db

@@ -22,7 +22,6 @@ class SourceType(models.TextChoices):
     WISHART_LIVE_ENTITY = "WISHART_LIVE_ENTITY", "Wishart live entity"
     ARCHIVED_WISHART_JSON = "ARCHIVED_WISHART_JSON", "Archived Wishart JSON"
     LAB_OFFICIAL_IMPORT = "LAB_OFFICIAL_IMPORT", "Lab official import"
-    HISTORICAL_AGGREGATE = "HISTORICAL_AGGREGATE", "Historical aggregate"
 
 
 # Higher number = higher trust. A new result only overwrites the current live
@@ -34,7 +33,6 @@ SOURCE_PRIORITY: dict[str, int] = {
     SourceType.WISHART_LIVE_ENTITY: 100,
     SourceType.ARCHIVED_WISHART_JSON: 90,
     SourceType.LAB_OFFICIAL_IMPORT: 85,
-    SourceType.HISTORICAL_AGGREGATE: 70,
 }
 
 
@@ -171,7 +169,6 @@ class BatchItemStatus(models.TextChoices):
 
     PENDING_NORMALIZATION = "PENDING_NORMALIZATION", "Pending normalization"
     FOUND_LIVE_CACHE = "FOUND_LIVE_CACHE", "Found in live cache"
-    FOUND_SEED_CACHE = "FOUND_SEED_CACHE", "Found in seed cache"
     FOUND_WISHART_ENTITY = "FOUND_WISHART_ENTITY", "Found Wishart entity"
     PENDING_CLASSIFICATION = "PENDING_CLASSIFICATION", "Pending classification"
     COMPLETE_AFTER_WISHART = "COMPLETE_AFTER_WISHART", "Complete after Wishart"
@@ -340,21 +337,12 @@ class ProviderControlState(models.TextChoices):
     AUTH_BLOCKED = "AUTH_BLOCKED", "Auth blocked"
 
 
-class SeedProfile(models.TextChoices):
-    """Which seed shape was imported."""
-
-    FULL = "FULL", "Full"
-    LITE = "LITE", "Lite"
-    CUSTOM = "CUSTOM", "Custom"
-
-
 class EventCategory(models.TextChoices):
     """Category for a row in system_events."""
 
     WORKER = "WORKER", "Worker"
     REMOTE = "REMOTE", "Remote"
     BACKUP = "BACKUP", "Backup"
-    SEED = "SEED", "Seed"
     SECURITY = "SECURITY", "Security"
 
 

@@ -12,15 +12,6 @@ of chemical entities. When using ClassyFire classifications, please cite:
   J Cheminformatics. 2016;8:61.
   DOI: 10.1186/s13321-016-0174-y
 
-## Seed Dataset
-
-The local classification cache may be pre-seeded from:
-
-  InChIKey-Deduplicated ClassyFire/ChemOnt Label Collection v3
-  Zenodo record: 20472700
-  URL: https://zenodo.org/records/20472700
-  License: Creative Commons Attribution 4.0 International (CC BY 4.0)
-
 ## ChemOnt Taxonomy
 
 The ChemOnt chemical ontology is developed and maintained by the Wishart Lab:
@@ -49,12 +40,3 @@ This application uses the following open-source libraries and tools:
 - **ngrok** — ngrok Terms of Service — https://ngrok.com/tos
 
 Full dependency list is available in `pyproject.toml`.
-
-## Seed Dataset Attribution
-
-The seed dataset (Zenodo record 20472700) is made available under the
-Creative Commons Attribution 4.0 International (CC BY 4.0) licence.
-You are free to share and adapt the dataset provided you give appropriate
-credit, provide a link to the licence, and indicate if changes were made.
-
-Licence text: https://creativecommons.org/licenses/by/4.0/

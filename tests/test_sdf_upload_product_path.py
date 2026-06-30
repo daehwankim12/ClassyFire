@@ -44,7 +44,6 @@ def test_api_sdf_upload_is_normalized_as_sdf(client, settings):
     assert item.inchikey is not None
     assert item.status in {
         BatchItemStatus.FOUND_LIVE_CACHE,
-        BatchItemStatus.FOUND_SEED_CACHE,
         BatchItemStatus.REMOTE_DELAYED,
     }
 

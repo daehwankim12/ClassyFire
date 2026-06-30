@@ -104,7 +104,6 @@ COLUMNS = [
 # Statuses that warrant a classification lookup
 _FOUND_STATUSES = frozenset([
     "FOUND_LIVE_CACHE",
-    "FOUND_SEED_CACHE",
     "FOUND_WISHART_ENTITY",
     "COMPLETE_AFTER_WISHART",
 ])
@@ -460,7 +459,6 @@ def _job_state_signature(job: BatchJob) -> str:
         "total_count": job.total_count,
         "completed_count": job.completed_count,
         "local_hit_count": job.local_hit_count,
-        "seed_hit_count": job.seed_hit_count,
         "remote_pending_count": job.remote_pending_count,
         "need_structure_count": job.need_structure_count,
         "invalid_count": job.invalid_count,
