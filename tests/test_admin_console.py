@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 from django.contrib import admin
 from django.urls import reverse
+from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob, BatchQuotaEvent, ExportArtifact
 from apps.chemont.models import ChemOntNode
@@ -93,6 +94,32 @@ def test_changelist_loads(admin_client, model):
 # --------------------------------------------------------------------------
 # UUID search mixin
 # --------------------------------------------------------------------------
+
+
+def test_export_artifact_admin_does_not_expose_capability_token(admin_client):
+    job = BatchJob.objects.create(secret_hash="x")
+    artifact = ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token="live-export-token-secret",
+        path="/tmp/live-export-token-secret.csv",
+        checksum="a" * 64,
+        byte_size=10,
+        rows_signature="b" * 64,
+        row_count=1,
+        job_state_signature="c" * 64,
+        expires_at=timezone.now() + timezone.timedelta(hours=1),
+    )
+
+    changelist = admin_client.get(reverse("admin:batches_exportartifact_changelist"))
+    assert changelist.status_code == 200
+    assert b"live-export-token-secret" not in changelist.content
+
+    detail = admin_client.get(
+        reverse("admin:batches_exportartifact_change", args=[artifact.pk])
+    )
+    assert detail.status_code == 200
+    assert b"live-export-token-secret" not in detail.content
 
 def test_batchjob_uuid_search_and_garbage_term(admin_client):
     job = BatchJob.objects.create(secret_hash="x")

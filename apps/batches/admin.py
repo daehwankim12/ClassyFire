@@ -6,7 +6,7 @@ recomputing the denormalised job counters from the item rows.
 from __future__ import annotations
 
 from django.contrib import admin
-from django.db.models import QuerySet
+from django.db.models import Model, QuerySet
 from django.http import HttpRequest
 
 from apps.batches.models import BatchItem, BatchJob, BatchQuotaEvent, ExportArtifact
@@ -78,7 +78,7 @@ class BatchQuotaEventAdmin(ReadOnlyModelAdmin):
 class ExportArtifactAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
     uuid_search_field = "job_id"
     list_display = (
-        "token",
+        "id",
         "job",
         "fmt",
         "byte_size",
@@ -87,5 +87,24 @@ class ExportArtifactAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
         "expires_at",
     )
     list_filter = ("fmt",)
-    search_fields = ("token",)
+    search_fields = ("job__claimed_by", "job__remote_principal")
     list_select_related = ("job",)
+    fields = (
+        "id",
+        "job",
+        "fmt",
+        "checksum",
+        "byte_size",
+        "rows_signature",
+        "row_count",
+        "job_state_signature",
+        "created_at",
+        "expires_at",
+    )
+
+    def get_readonly_fields(
+        self, request: HttpRequest, obj: Model | None = None
+    ) -> list[str]:
+        # The export token is a bearer capability for /api/exports/<token>; do
+        # not render or search it in the admin inspection surface.
+        return list(self.fields)
