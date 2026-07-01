@@ -77,7 +77,10 @@ def test_timeout_resolves_stuck_task_and_completes_job():
     job.refresh_from_db()
     assert job.status == BatchJobStatus.COMPLETE
     assert job.processing_state == BatchProcessingState.COMPLETE
-    assert job.completed_count == 1
+    # Timed-out items are terminal failures, not successful classifications: they
+    # count toward "무효"(invalid), never "완료"(completed).
+    assert job.completed_count == 0
+    assert job.invalid_count == 1
 
 
 def test_timeout_leaves_fresh_task_untouched():
@@ -103,8 +106,9 @@ def test_timeout_disabled_when_hours_non_positive():
     assert item.status == BatchItemStatus.REMOTE_DELAYED
 
 
-def test_recompute_counts_timed_out_as_completed():
-    """A job whose only item is REMOTE_TIMED_OUT is terminal (COMPLETE)."""
+def test_recompute_counts_timed_out_as_invalid_but_job_completes():
+    """A job whose only item is REMOTE_TIMED_OUT is terminal (COMPLETE), and the
+    item counts as a failure (invalid), NOT a successful classification."""
     job = _job()
     BatchItem.objects.create(
         job=job,
@@ -116,7 +120,8 @@ def test_recompute_counts_timed_out_as_completed():
     recompute_job_counters(job.pk)
     job.refresh_from_db()
     assert job.status == BatchJobStatus.COMPLETE
-    assert job.completed_count == 1
+    assert job.completed_count == 0
+    assert job.invalid_count == 1
 
 
 def test_timeout_terminalizes_live_query_submission_state():

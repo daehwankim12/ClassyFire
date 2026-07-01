@@ -619,11 +619,16 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
 
     Canonical definitions
     ---------------------
-    completed  = FOUND_LIVE_CACHE + FOUND_WISHART_ENTITY
-                 + COMPLETE_AFTER_WISHART + INVALID_INPUT + RESULT_KEY_MISMATCH
-                 (every item in a terminal state that requires no further action)
+    completed  = FOUND_LIVE_CACHE + FOUND_WISHART_ENTITY + COMPLETE_AFTER_WISHART
+                 (successfully classified — the user-facing "완료" count ONLY)
+    invalid    = INVALID_INPUT + RESULT_KEY_MISMATCH + REMOTE_TIMED_OUT
+                 (terminal FAILURES; no further work but NOT classified — "무효")
     blocking = PENDING_NORMALIZATION + PENDING_CLASSIFICATION + REMOTE_DELAYED
     need_structure = NEED_STRUCTURE  (awaiting external user input)
+
+    ``completed`` and ``invalid`` are disjoint; with ``need_structure`` and the
+    pending/blocking rows they partition the job, so the four progress segments
+    never double-count an item. A job is terminal once ``blocking`` is empty.
 
     Status rules:
     - IN_PROGRESS while any blocking item remains.
@@ -635,15 +640,23 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
     """
     from django.db.models import Count
 
-    terminal_complete = (
+    # Successfully classified — the ONLY states that count toward the user-facing
+    # "완료"(completed) progress segment/count.
+    classified_statuses = (
         BatchItemStatus.FOUND_LIVE_CACHE,
         BatchItemStatus.FOUND_WISHART_ENTITY,
         BatchItemStatus.COMPLETE_AFTER_WISHART,
+    )
+    # Terminal FAILURES: no further work, but NOT a successful classification.
+    # These count toward the "무효"(invalid) segment — never "완료" — and render as
+    # non-FOUND "Failed" rows in exports (see exports._build_row_dict). Grouping
+    # them with INVALID_INPUT keeps the progress bar consistent with exports and
+    # avoids double-counting INVALID_INPUT (it used to land in BOTH buckets).
+    failed_statuses = (
         BatchItemStatus.INVALID_INPUT,
         BatchItemStatus.RESULT_KEY_MISMATCH,
-        # Remote give-up: a timed-out item requires no further work, so it counts
-        # toward "completed" and lets the job leave IN_PROGRESS (it renders as a
-        # non-FOUND row, i.e. "Failed", in exports — see exports._build_row_dict).
+        # Remote give-up: a timed-out item requires no further work, so it still
+        # lets the job leave IN_PROGRESS — but it was not classified.
         BatchItemStatus.REMOTE_TIMED_OUT,
     )
 
@@ -674,8 +687,8 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
             ),
             blocking=Count("pk", filter=Q(status__in=blocking_statuses)),
             need_structure=Count("pk", filter=Q(status=BatchItemStatus.NEED_STRUCTURE)),
-            invalid=Count("pk", filter=Q(status=BatchItemStatus.INVALID_INPUT)),
-            completed=Count("pk", filter=Q(status__in=terminal_complete)),
+            invalid=Count("pk", filter=Q(status__in=failed_statuses)),
+            completed=Count("pk", filter=Q(status__in=classified_statuses)),
         )
 
         total = counts["total"]
@@ -693,7 +706,11 @@ def recompute_job_counters(job_id: uuid.UUID | str) -> None:
         if blocking:
             new_status = BatchJobStatus.IN_PROGRESS
             completed_at = None
-        elif total and need_structure and completed + need_structure == total:
+        elif (
+            total
+            and need_structure
+            and completed + invalid + need_structure == total
+        ):
             new_status = BatchJobStatus.COMPLETE_WITH_ACTION_REQUIRED
             completed_at = job.completed_at or timezone.now()
         else:

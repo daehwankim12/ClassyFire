@@ -489,8 +489,9 @@ def test_job_counters_mixed():
     job = BatchJob.objects.get(pk=data["job_id"])
     assert job.total_count == 3
     assert job.local_hit_count == 1
-    # completed = all terminal items: FOUND_LIVE_CACHE + INVALID_INPUT (unified definition)
-    assert job.completed_count == 2
+    # completed = successfully classified ONLY (FOUND_LIVE_CACHE). The invalid row
+    # counts toward invalid, never completed — the buckets are disjoint.
+    assert job.completed_count == 1
     assert job.invalid_count == 1
     assert job.need_structure_count == 1
     assert job.remote_pending_count == 0
