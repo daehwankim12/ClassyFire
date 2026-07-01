@@ -273,6 +273,19 @@ class WishartDirectProvider:
                 raw_text=raw_text,
                 safe_headers=headers,
             )
+        # Wishart returns 200 with an empty object `{}` for a key it has NOT
+        # cached — a genuine miss, not a 404. Route it to NOT_FOUND so the worker
+        # calculates it via a structure submit, rather than failing it as a
+        # malformed / PROTOCOL_ERROR response (a non-empty body that fails the
+        # contract below is still a real protocol error).
+        if isinstance(raw, dict) and not raw:
+            return EntityLookupResult(
+                status=EntityLookupStatus.NOT_FOUND,
+                inchikey=inchikey,
+                http_status=resp.status_code,
+                raw_text=raw_text,
+                safe_headers=headers,
+            )
         try:
             validate_entity_lookup_payload(raw)
         except ProviderContractError as exc:

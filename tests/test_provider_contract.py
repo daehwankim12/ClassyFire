@@ -44,6 +44,17 @@ def test_entity_lookup_success_requires_consumed_entity_schema():
     assert "inchikey" in result.detail
 
 
+def test_entity_lookup_empty_object_200_is_a_miss_not_protocol_error():
+    # Wishart returns 200 with an empty `{}` for a key it has not cached — a
+    # genuine miss (alongside the more common 404), NOT a malformed response.
+    # It must route to NOT_FOUND (submittable) instead of PROTOCOL_ERROR.
+    result = _wishart_with_json(200, {}).lookup_entity(IK_A)
+
+    assert result.status == EntityLookupStatus.NOT_FOUND
+    assert result.status != EntityLookupStatus.PROTOCOL_ERROR
+    assert result.http_status == 200
+
+
 def test_entity_lookup_success_rejects_malformed_consumed_slot():
     raw = build_raw(IK_A)
     raw["kingdom"] = "Organic compounds"
