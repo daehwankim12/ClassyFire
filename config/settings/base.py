@@ -167,15 +167,14 @@ WISHART_BASE_URL: str = env_str(
     "WISHART_BASE_URL", "http://classyfire.wishartlab.com"
 )
 REMOTE_ENABLED: bool = env_bool("REMOTE_ENABLED", True)
-# Wishart rate-limits BOTH entity/poll GETs and POST submits at ~12/min per IP
-# (measured 2026-07-01: a burst of ~10 GETs is allowed, then it throttles to one
-# per ~5s, returning 429 with a long Retry-After above that — the earlier
-# assumption that GET was uncapped was wrong). Both are PINNED to 12/min (one per
-# ~5s), hard-coded (NOT env-overridable), and the token-bucket burst is pinned to
-# 1 in DbRateLimiter.from_settings so a fresh worker spends the budget smoothly
-# (one request per ~5s) instead of bursting a whole minute at once and tripping
-# the cap into 429 parks.
-REMOTE_ENTITY_REQUESTS_PER_MIN: int = 12
+# Wishart rate-limits per IP, pinned to the live-server 429 behaviour:
+#   - entity/poll GETs      → 10/min (one per ~6s)  ← server-confirmed 2026-07-02
+#   - POST /queries submits → 12/min (one per ~5s)
+# Both are hard-coded (NOT env-overridable), and the token-bucket burst is pinned
+# to 1 in DbRateLimiter.from_settings so a fresh worker spends the budget smoothly
+# instead of bursting a whole minute at once and tripping the cap into 429 parks
+# with a long Retry-After.
+REMOTE_ENTITY_REQUESTS_PER_MIN: int = 10
 REMOTE_SUBMITS_PER_MIN: int = 12
 # Structures per /queries POST. Default 1 — each entity MISS is POSTed on its
 # own, never bundling un-checked extra tasks. This keeps known compounds resolving
