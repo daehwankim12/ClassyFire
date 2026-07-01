@@ -113,7 +113,10 @@ AUTH_PASSWORD_VALIDATORS = [
 # ---------------------------------------------------------------------------
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# Display timezone. USE_TZ=True keeps ALL stored datetimes in UTC in the DB; this
+# only controls how aware datetimes are rendered (templates, timezone.localtime).
+# Override via TIME_ZONE env if deploying in another region.
+TIME_ZONE = env_str("TIME_ZONE", "Asia/Seoul")
 USE_I18N = True
 USE_TZ = True
 
