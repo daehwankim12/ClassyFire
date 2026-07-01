@@ -7,6 +7,7 @@ admin UI and tests share the same safety checks.
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,9 @@ class JobAdminOperationResult:
     remote_tasks_updated: int = 0
     remote_tasks_skipped_shared: int = 0
     remote_tasks_skipped_leased: int = 0
+    items_requeued: int = 0
+    items_skipped_not_timed_out: int = 0
+    items_skipped_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -354,6 +358,83 @@ def set_job_priority(
             "jobs_updated": result.jobs_updated,
             "remote_tasks_updated": result.remote_tasks_updated,
             "remote_tasks_skipped_leased": result.remote_tasks_skipped_leased,
+        },
+    )
+    return result
+
+
+def requeue_timed_out_items(
+    item_ids: Iterable[object],
+    *,
+    actor: str,
+) -> JobAdminOperationResult:
+    """Re-queue REMOTE_TIMED_OUT items for another remote attempt.
+
+    For each selected item still in ``REMOTE_TIMED_OUT``, create/reuse an active
+    remote task (a fresh task restores the full retry-attempt budget) and move the
+    item back to a live remote state, then recompute its job so it leaves the
+    terminal state. Items no longer timed out are skipped; items rejected by the
+    daily remote budget are skipped and counted (never silently dropped).
+    """
+    # Imported lazily to avoid an import cycle (services imports batches models).
+    from apps.batches.services import (
+        _get_or_create_remote_task,
+        _initial_status_for_remote_task,
+        recompute_job_counters,
+    )
+    from apps.remote.budget import RemoteBudgetExceededError
+
+    selected_ids = list(item_ids)
+    requeued = 0
+    skipped_not_timed_out = 0
+    skipped_budget = 0
+    affected_job_ids: set[uuid.UUID] = set()
+
+    with transaction.atomic():
+        # Lock only BatchItem rows (job is non-null → safe inner join for reads).
+        items = (
+            BatchItem.objects.select_for_update()
+            .select_related("job")
+            .filter(pk__in=selected_ids)
+        )
+        for item in items:
+            if item.status != BatchItemStatus.REMOTE_TIMED_OUT or not item.inchikey:
+                skipped_not_timed_out += 1
+                continue
+            job = item.job
+            try:
+                task = _get_or_create_remote_task(
+                    item.inchikey,
+                    item.compound,
+                    principal=job.remote_principal,
+                    priority=job.priority,
+                )
+            except RemoteBudgetExceededError:
+                skipped_budget += 1
+                continue
+            status, message = _initial_status_for_remote_task(task)
+            item.status = status
+            item.message = message
+            item.save(update_fields=["status", "message"])
+            requeued += 1
+            affected_job_ids.add(job.pk)
+
+        for job_id in affected_job_ids:
+            recompute_job_counters(job_id)
+
+    result = JobAdminOperationResult(
+        items_requeued=requeued,
+        items_skipped_not_timed_out=skipped_not_timed_out,
+        items_skipped_budget=skipped_budget,
+    )
+    _audit(
+        "admin_requeue_timed_out",
+        {
+            "actor": actor,
+            "items_requeued": result.items_requeued,
+            "items_skipped_not_timed_out": result.items_skipped_not_timed_out,
+            "items_skipped_budget": result.items_skipped_budget,
+            "job_ids": _job_id_strings(affected_job_ids),
         },
     )
     return result

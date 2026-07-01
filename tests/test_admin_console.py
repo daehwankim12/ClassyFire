@@ -592,3 +592,119 @@ def test_pause_then_resume_remote_buttons(admin_client):
     assert is_remote_paused() is True
     admin_client.post(reverse("admin:remote_remoteprovidercontrol_resume"))
     assert is_remote_paused() is False
+
+
+# --------------------------------------------------------------------------
+# Retry timed-out remote items (re-queue)
+# --------------------------------------------------------------------------
+
+
+def test_requeue_timed_out_reactivates_item_and_job():
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=1,
+        invalid_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.REMOTE_TIMED_OUT,
+    )
+
+    result = requeue_timed_out_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 1
+    assert result.items_skipped_not_timed_out == 0
+    assert result.items_skipped_budget == 0
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    # A fresh active remote task now exists for the key.
+    assert RemoteTask.objects.filter(
+        inchikey=IK1, state__in=[s.value for s in TaskState.active_states()]
+    ).exists()
+    job.refresh_from_db()
+    assert job.status == BatchJobStatus.IN_PROGRESS
+    event = SystemEvent.objects.filter(event_type="admin_requeue_timed_out").latest(
+        "created_at"
+    )
+    assert event.payload["items_requeued"] == 1
+    assert event.category == "SECURITY"
+
+
+def test_requeue_skips_non_timed_out_items():
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    job = BatchJob.objects.create(secret_hash="x", total_count=1, completed_count=1)
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK2,
+        inchikey=IK2,
+        status=BatchItemStatus.FOUND_LIVE_CACHE,
+    )
+
+    result = requeue_timed_out_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_skipped_not_timed_out == 1
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.FOUND_LIVE_CACHE
+    assert not RemoteTask.objects.filter(inchikey=IK2).exists()
+
+
+def test_requeue_skips_over_budget_items(settings):
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 0  # every new enqueue is over budget
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=1,
+        invalid_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK3,
+        inchikey=IK3,
+        status=BatchItemStatus.REMOTE_TIMED_OUT,
+    )
+
+    result = requeue_timed_out_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_skipped_budget == 1
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.REMOTE_TIMED_OUT  # unchanged
+    assert not RemoteTask.objects.filter(inchikey=IK3).exists()
+
+
+def test_batchitem_admin_retry_timed_out_action(admin_client):
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=1,
+        invalid_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.REMOTE_TIMED_OUT,
+    )
+
+    response = admin_client.post(
+        reverse("admin:batches_batchitem_changelist"),
+        {"action": "retry_timed_out", "_selected_action": [str(item.pk)]},
+    )
+
+    assert response.status_code == 302
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert SystemEvent.objects.filter(event_type="admin_requeue_timed_out").exists()

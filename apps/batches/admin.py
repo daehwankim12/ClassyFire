@@ -17,6 +17,7 @@ from django.utils.html import format_html
 from apps.batches.admin_ops import (
     cancel_and_delete_jobs,
     delete_jobs_with_artifacts,
+    requeue_timed_out_items,
     set_job_priority,
 )
 from apps.batches.models import BatchItem, BatchJob, BatchQuotaEvent, ExportArtifact
@@ -204,6 +205,27 @@ class BatchItemAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
     list_filter = ("status", "detected_type")
     search_fields = ("inchikey", "external_id")
     list_select_related = ("job",)
+    actions = ("retry_timed_out",)
+
+    @admin.action(
+        description="Retry timed-out remote items (re-queue)",
+        permissions=("operate",),
+    )
+    def retry_timed_out(
+        self, request: HttpRequest, queryset: QuerySet[BatchItem]
+    ) -> None:
+        result = requeue_timed_out_items(
+            queryset.values_list("pk", flat=True),
+            actor=request.user.get_username(),
+        )
+        self.message_user(
+            request,
+            (
+                f"Re-queued {result.items_requeued} item(s); "
+                f"skipped {result.items_skipped_not_timed_out} not-timed-out and "
+                f"{result.items_skipped_budget} over-budget."
+            ),
+        )
 
 
 @admin.register(BatchQuotaEvent)
