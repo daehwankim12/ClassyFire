@@ -169,6 +169,11 @@ def enqueue_task(
         inchikey=inchikey, state__in=[s.value for s in TaskState.active_states()]
     ).first()
     if existing is not None:
+        if priority > existing.priority:
+            RemoteTask.objects.filter(pk=existing.pk, priority__lt=priority).update(
+                priority=priority
+            )
+            existing.refresh_from_db(fields=["priority"])
         return existing
     max_depth = settings.REMOTE_MAX_QUEUE_DEPTH
     try:
@@ -194,10 +199,16 @@ def enqueue_task(
             return task
     except IntegrityError:
         # Lost the race: another worker inserted the active task first.
-        return RemoteTask.objects.filter(
+        existing = RemoteTask.objects.filter(
             inchikey=inchikey,
             state__in=[s.value for s in TaskState.active_states()],
         ).first()
+        if existing is not None and priority > existing.priority:
+            RemoteTask.objects.filter(pk=existing.pk, priority__lt=priority).update(
+                priority=priority
+            )
+            existing.refresh_from_db(fields=["priority"])
+        return existing
 
 
 def _due_ready_tasks(now):

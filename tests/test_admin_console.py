@@ -20,7 +20,14 @@ from apps.classifications.models import (
     SourceArtifact,
 )
 from apps.compounds.models import CompoundStructure, CompoundUsage
-from apps.core.enums import ProviderControlState, SubmissionState, TaskState
+from apps.core.enums import (
+    BatchItemStatus,
+    BatchJobStatus,
+    BatchProcessingState,
+    ProviderControlState,
+    SubmissionState,
+    TaskState,
+)
 from apps.core.models import LoginThrottle
 from apps.operations.admin_views import is_remote_paused
 from apps.operations.models import AuditSignature, SystemEvent
@@ -71,14 +78,34 @@ def test_all_target_models_registered():
         assert model in admin.site._registry, f"{model.__name__} not registered"
 
 
-def test_all_registered_admins_are_read_only(rf, django_user_model):
+def test_all_registered_admins_block_add_and_change(rf, django_user_model):
     request = rf.get("/admin/")
-    request.user = django_user_model(is_superuser=True, is_staff=True)
+    request.user = django_user_model(is_superuser=True, is_staff=True, is_active=True)
     for model in REGISTERED_MODELS:
         model_admin = admin.site._registry[model]
         assert model_admin.has_add_permission(request) is False
         assert model_admin.has_change_permission(request) is False
-        assert model_admin.has_delete_permission(request) is False
+
+
+def test_registered_admins_allow_native_delete_only_for_batch_jobs(
+    rf, django_user_model
+):
+    super_request = rf.get("/admin/")
+    super_request.user = django_user_model(
+        is_superuser=True,
+        is_staff=True,
+        is_active=True,
+    )
+    staff_request = rf.get("/admin/")
+    staff_request.user = django_user_model(
+        is_superuser=False,
+        is_staff=True,
+        is_active=True,
+    )
+    for model in REGISTERED_MODELS:
+        model_admin = admin.site._registry[model]
+        assert model_admin.has_delete_permission(super_request) is (model is BatchJob)
+        assert model_admin.has_delete_permission(staff_request) is False
 
 
 @pytest.mark.parametrize("model", REGISTERED_MODELS)
@@ -148,6 +175,27 @@ def test_uuid_search_uses_scoped_queryset_not_default_manager(rf, django_user_mo
     assert pending.id in set(qs2.values_list("id", flat=True))
 
 
+def test_claim_job_for_processing_prefers_higher_priority():
+    from apps.batches.services import claim_job_for_processing
+
+    low = BatchJob.objects.create(
+        secret_hash="x",
+        priority=0,
+        processing_state=BatchProcessingState.PARSING,
+    )
+    high = BatchJob.objects.create(
+        secret_hash="x",
+        priority=100,
+        processing_state=BatchProcessingState.PARSING,
+    )
+
+    claimed = claim_job_for_processing("worker-priority")
+
+    assert claimed is not None
+    assert claimed.pk == high.pk
+    assert claimed.pk != low.pk
+
+
 # --------------------------------------------------------------------------
 # Operate permission gates the mutating actions / pause-resume views
 # --------------------------------------------------------------------------
@@ -157,6 +205,9 @@ OPERATE_GATED_ACTIONS = [
     (RemoteProviderControl, "reset_auth"),
     (RemoteSubmission, "mark_failed"),
     (BatchJob, "recompute_counters"),
+    (BatchJob, "cancel_and_delete"),
+    (BatchJob, "set_high_priority"),
+    (BatchJob, "reset_priority"),
 ]
 
 
@@ -203,6 +254,218 @@ def test_recompute_counters_action(admin_client):
     assert SystemEvent.objects.filter(
         event_type="admin_recompute_counters"
     ).exists()
+
+
+# --------------------------------------------------------------------------
+# Batch job admin operations
+# --------------------------------------------------------------------------
+
+
+def test_delete_jobs_with_artifacts_removes_files(settings, tmp_path):
+    from apps.batches.admin_ops import delete_jobs_with_artifacts
+
+    upload_root = tmp_path / "uploads"
+    export_root = tmp_path / "exports"
+    upload_root.mkdir()
+    export_root.mkdir()
+    settings.UPLOAD_ARTIFACT_DIR = str(upload_root)
+    settings.EXPORT_DIR = export_root
+
+    upload_artifact = upload_root / "raw.csv"
+    upload_artifact.write_text("CCO\n")
+    export_payload = export_root / "export-token.csv"
+    export_payload.write_text("row\n")
+    export_sidecar = export_root / "export-token.meta.json"
+    export_sidecar.write_text("{}")
+
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        upload_artifact_path=upload_artifact.name,
+    )
+    ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token="export-token",
+        path=str(export_payload),
+        checksum="a" * 64,
+        byte_size=export_payload.stat().st_size,
+        rows_signature="b" * 64,
+        row_count=1,
+        job_state_signature="c" * 64,
+        expires_at=timezone.now() + timezone.timedelta(hours=1),
+    )
+
+    result = delete_jobs_with_artifacts([job.pk], actor="tester")
+
+    assert result.jobs_deleted == 1
+    assert result.upload_artifacts_deleted == 1
+    assert result.export_files_deleted == 2
+    assert not BatchJob.objects.filter(pk=job.pk).exists()
+    assert not upload_artifact.exists()
+    assert not export_payload.exists()
+    assert not export_sidecar.exists()
+    event = SystemEvent.objects.filter(event_type="admin_delete_jobs").latest("created_at")
+    assert event.payload["actor"] == "tester"
+    assert event.payload["jobs_deleted"] == 1
+
+
+def test_cancel_and_delete_preserves_shared_remote_tasks():
+    from apps.batches.admin_ops import cancel_and_delete_jobs
+
+    selected = BatchJob.objects.create(secret_hash="x", priority=100)
+    other = BatchJob.objects.create(secret_hash="x", priority=50)
+    BatchItem.objects.create(
+        job=selected,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    BatchItem.objects.create(
+        job=selected,
+        row_order=1,
+        original_input=IK2,
+        inchikey=IK2,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    BatchItem.objects.create(
+        job=selected,
+        row_order=2,
+        original_input=IK3,
+        inchikey=IK3,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    BatchItem.objects.create(
+        job=other,
+        row_order=0,
+        original_input=IK2,
+        inchikey=IK2,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    unshared = RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+    shared = RemoteTask.objects.create(inchikey=IK2, state=TaskState.READY, priority=100)
+    leased = RemoteTask.objects.create(
+        inchikey=IK3,
+        state=TaskState.RUNNING,
+        lock_owner="worker",
+    )
+
+    result = cancel_and_delete_jobs([selected.pk], actor="tester")
+
+    assert result.jobs_deleted == 1
+    assert result.remote_tasks_deleted == 1
+    assert result.remote_tasks_skipped_shared == 1
+    assert result.remote_tasks_skipped_leased == 1
+    assert not BatchJob.objects.filter(pk=selected.pk).exists()
+    assert not RemoteTask.objects.filter(pk=unshared.pk).exists()
+    shared.refresh_from_db()
+    assert shared.state == TaskState.READY
+    assert shared.priority == other.priority
+    leased.refresh_from_db()
+    assert leased.state == TaskState.RUNNING
+    event = SystemEvent.objects.filter(event_type="admin_cancel_delete_jobs").latest(
+        "created_at"
+    )
+    assert event.payload["remote_tasks_deleted"] == 1
+
+
+def test_set_job_priority_recomputes_remote_task_priority():
+    from apps.batches.admin_ops import set_job_priority
+
+    selected = BatchJob.objects.create(secret_hash="x", priority=0)
+    other = BatchJob.objects.create(secret_hash="x", priority=50)
+    BatchItem.objects.create(
+        job=selected,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    BatchItem.objects.create(
+        job=other,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    task = RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY, priority=0)
+
+    raised = set_job_priority([selected.pk], priority=100, actor="tester")
+    selected.refresh_from_db()
+    task.refresh_from_db()
+    assert selected.priority == 100
+    assert raised.remote_tasks_updated == 1
+    assert task.priority == 100
+
+    lowered = set_job_priority([selected.pk], priority=0, actor="tester")
+    selected.refresh_from_db()
+    task.refresh_from_db()
+    assert selected.priority == 0
+    assert lowered.remote_tasks_updated == 1
+    assert task.priority == other.priority
+
+
+def test_batchjob_admin_priority_actions(admin_client):
+    job = BatchJob.objects.create(secret_hash="x", priority=0)
+    url = reverse("admin:batches_batchjob_changelist")
+
+    high = admin_client.post(
+        url,
+        {"action": "set_high_priority", "_selected_action": [str(job.pk)]},
+    )
+    assert high.status_code == 302
+    job.refresh_from_db()
+    assert job.priority == 100
+
+    normal = admin_client.post(
+        url,
+        {"action": "reset_priority", "_selected_action": [str(job.pk)]},
+    )
+    assert normal.status_code == 302
+    job.refresh_from_db()
+    assert job.priority == 0
+    assert SystemEvent.objects.filter(event_type="admin_set_job_priority").count() == 2
+
+
+def test_batchjob_admin_cancel_and_delete_action(admin_client):
+    job = BatchJob.objects.create(secret_hash="x")
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    task = RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+
+    response = admin_client.post(
+        reverse("admin:batches_batchjob_changelist"),
+        {"action": "cancel_and_delete", "_selected_action": [str(job.pk)]},
+    )
+
+    assert response.status_code == 302
+    assert not BatchJob.objects.filter(pk=job.pk).exists()
+    assert not RemoteTask.objects.filter(pk=task.pk).exists()
+    assert SystemEvent.objects.filter(event_type="admin_cancel_delete_jobs").exists()
+
+
+def test_batchjob_admin_open_result_sets_cookie_and_redirects(admin_client):
+    from apps.core.security import job_access_cookie_name
+
+    job = BatchJob.objects.create(secret_hash="x")
+
+    response = admin_client.get(
+        reverse("admin:batches_batchjob_open_result", args=[job.pk])
+    )
+
+    assert response.status_code == 302
+    assert response["Location"] == f"/jobs/{job.pk}/"
+    assert job_access_cookie_name(job.pk) in response.cookies
+    event = SystemEvent.objects.filter(event_type="admin_open_job_result").latest(
+        "created_at"
+    )
+    assert event.payload["job_id"] == str(job.pk)
 
 
 # --------------------------------------------------------------------------

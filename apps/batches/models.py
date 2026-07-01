@@ -40,6 +40,11 @@ class BatchJob(models.Model):
         default=BatchJobStatus.PENDING,
         help_text="Coarse job lifecycle status.",
     )
+    priority = models.IntegerField(
+        default=0,
+        db_default=0,
+        help_text="Higher priority jobs are claimed first by ingest workers.",
+    )
 
     total_count = models.IntegerField(default=0)
     completed_count = models.IntegerField(default=0)
@@ -123,6 +128,10 @@ class BatchJob(models.Model):
             models.Index(
                 fields=["processing_state", "created_at"],
                 name="batch_job_proc_state_idx",
+            ),
+            models.Index(
+                fields=["processing_state", "priority", "created_at"],
+                name="batch_job_claim_prio_idx",
             ),
         ]
 

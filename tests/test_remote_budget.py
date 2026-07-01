@@ -74,6 +74,27 @@ def test_equal_priority_claims_rotate_between_principals():
     assert claimed_2.pk == first_b.pk
 
 
+@pytest.mark.django_db(transaction=True)
+def test_enqueue_existing_task_raises_priority_without_lowering():
+    from apps.remote import queue
+
+    task = queue.enqueue_task(IK_A, priority=10)
+    assert task is not None
+    assert task.priority == 10
+
+    again = queue.enqueue_task(IK_A, priority=100)
+    assert again is not None
+    again.refresh_from_db()
+    assert again.pk == task.pk
+    assert again.priority == 100
+
+    lower = queue.enqueue_task(IK_A, priority=1)
+    assert lower is not None
+    lower.refresh_from_db()
+    assert lower.pk == task.pk
+    assert lower.priority == 100
+
+
 def test_budget_advisory_lock_keys_are_stable_signed_ints():
     from datetime import UTC, datetime
 

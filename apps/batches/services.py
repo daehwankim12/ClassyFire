@@ -260,6 +260,7 @@ def _get_or_create_remote_task(
     compound: CompoundStructure | None,
     *,
     principal: str | None = None,
+    priority: int = 0,
 ) -> RemoteTask:
     """Get or create an active RemoteTask for *inchikey* (global dedupe).
 
@@ -281,6 +282,11 @@ def _get_or_create_remote_task(
         state__in=ACTIVE_TASK_STATES,
     ).first()
     if existing is not None:
+        if priority > existing.priority:
+            RemoteTask.objects.filter(pk=existing.pk, priority__lt=priority).update(
+                priority=priority
+            )
+            existing.refresh_from_db(fields=["priority"])
         if compound is not None and existing.compound_id is None:
             RemoteTask.objects.filter(pk=existing.pk, compound_id__isnull=True).update(
                 compound_id=compound.pk
@@ -295,6 +301,7 @@ def _get_or_create_remote_task(
                 inchikey=inchikey,
                 compound_id=compound.pk if compound is not None else None,
                 principal=principal,
+                priority=priority,
             )
             if task is None:
                 raise IntegrityError("remote task create race")
@@ -305,6 +312,11 @@ def _get_or_create_remote_task(
             inchikey=inchikey,
             state__in=ACTIVE_TASK_STATES,
         ).get()
+        if priority > existing.priority:
+            RemoteTask.objects.filter(pk=existing.pk, priority__lt=priority).update(
+                priority=priority
+            )
+            existing.refresh_from_db(fields=["priority"])
         if compound is not None and existing.compound_id is None:
             RemoteTask.objects.filter(pk=existing.pk, compound_id__isnull=True).update(
                 compound_id=compound.pk
@@ -421,6 +433,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                         resolved_inchikey,
                         compound,
                         principal=job.remote_principal,
+                        priority=job.priority,
                     )
                     status, message = _initial_status_for_remote_task(task)
                     if status != BatchItemStatus.PENDING_CLASSIFICATION:
@@ -471,6 +484,7 @@ def _process_item(
     *,
     remote_enabled: bool,
     remote_principal: str = "system",
+    job_priority: int = 0,
     lookup_override: object = _NO_LOOKUP_OVERRIDE,
     norm_override: object = _NO_LOOKUP_OVERRIDE,
 ) -> BatchItemStatus:
@@ -593,6 +607,7 @@ def _process_item(
                 norm.inchikey,
                 compound,
                 principal=remote_principal,
+                priority=job_priority,
             )
             status, message = _initial_status_for_remote_task(task)
             item.message = message
@@ -908,12 +923,14 @@ def _commit_prepared_chunk(
                     item,
                     remote_enabled=remote_enabled,
                     remote_principal=remote_principal,
+                    job_priority=locked_job.priority,
                 )
                 continue
             item.status = _process_item(
                 item,
                 remote_enabled=remote_enabled,
                 remote_principal=remote_principal,
+                job_priority=locked_job.priority,
                 lookup_override=entry.lookup,
                 norm_override=entry.norm,
             )
@@ -938,6 +955,7 @@ def _retry_backpressured_remote_delayed_items(
     *,
     remote_enabled: bool,
     remote_principal: str = "system",
+    job_priority: int = 0,
 ) -> None:
     """Retry durable enqueue for items delayed only by remote queue capacity.
 
@@ -981,6 +999,7 @@ def _retry_backpressured_remote_delayed_items(
                     inchikey,
                     item.compound,
                     principal=remote_principal,
+                    priority=job_priority,
                 )
             except RemoteBudgetExceededError:
                 item.message = "Remote budget exceeded for this principal."
@@ -1231,6 +1250,7 @@ def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> 
         claim,
         remote_enabled=job.remote_enabled,
         remote_principal=job.remote_principal,
+        job_priority=job.priority,
     )
     recompute_job_counters(job.pk)
     # Refresh in-memory
@@ -1261,7 +1281,7 @@ def claim_job_for_processing(worker_id: str) -> BatchJob | None:
             BatchJob.objects.select_for_update(skip_locked=True)
             .filter(processing_state__in=CLAIMABLE_PROCESSING_STATES)
             .filter(Q(claimed_by__isnull=True) | Q(claimed_at__lt=stale_before))
-            .order_by("created_at", "id")
+            .order_by("-priority", "created_at", "id")
             .first()
         )
         if job is None:
