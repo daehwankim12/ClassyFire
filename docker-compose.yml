@@ -158,6 +158,11 @@ services:
       - "--bind=0.0.0.0:8000"
       - "--workers=2"
       - "--timeout=120"
+      # gunicorn>=25.1 opens a control socket under $HOME/.gunicorn by default;
+      # appuser has no writable home (--no-create-home), so it errors on startup
+      # ("Control server error: [Errno 13] Permission denied: '/home/appuser'").
+      # We don't use the gunicornc control interface, so disable it.
+      - "--no-control-socket"
       # Caddy is the canonical access logger and skips secret-bearing job URLs.
       # Keep Gunicorn access logs disabled so raw upstream paths are not emitted.
       - "--access-logfile=/dev/null"

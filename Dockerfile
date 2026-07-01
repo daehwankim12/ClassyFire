@@ -109,4 +109,6 @@ EXPOSE 8000
 # Override `command:` in docker-compose.yml per service.
 # `web`    → gunicorn config.wsgi:application --bind 0.0.0.0:8000
 # `worker` → python manage.py runworker   (Task 9)
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120"]
+# --no-control-socket: appuser has no writable $HOME (--no-create-home), so
+# gunicorn>=25.1's default control socket under ~/.gunicorn fails to bind.
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120", "--no-control-socket"]
