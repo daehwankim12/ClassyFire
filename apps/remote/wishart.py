@@ -301,7 +301,12 @@ class WishartDirectProvider:
             "query_input": query_input,
             "query_type": "STRUCTURE",
         }
-        url = f"{self.base_url}/queries"
+        # POST the ".json" representation: without a format hint Rails answers a
+        # create with a 302 redirect to the HTML query page (Post/Redirect/Get),
+        # which carries no readable query id and is classified PROTOCOL_ERROR. The
+        # ".json" form returns 201 + the query JSON, matching the GET endpoints
+        # (/entities/{ik}.json, /queries/{id}.json).
+        url = f"{self.base_url}/queries.json"
         try:
             resp = self._request("POST", url, json_body=payload)
         except ResponseTooLargeError as exc:

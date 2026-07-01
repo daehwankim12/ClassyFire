@@ -229,7 +229,7 @@ class _RemoteOutcomeHarness:
         submit_raises = case_name in {"accepted_response_lost", "timeout"}
 
         def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path.endswith("/queries"):
+            if request.url.path.endswith("/queries.json"):
                 if submit_raises:
                     raise httpx.ConnectError("connection dropped after send")
                 return _submit_response(case_name)

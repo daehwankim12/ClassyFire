@@ -22,7 +22,7 @@ class AcceptedThenReadErrorTransport(httpx.BaseTransport):
             # Genuine entity miss (404) so the worker proceeds to a structure
             # submit — that POST is where the ambiguous transport error happens.
             return httpx.Response(404, request=request)
-        if request.method == "POST" and request.url.path == "/queries":
+        if request.method == "POST" and request.url.path == "/queries.json":
             self.submit_count += 1
             raise httpx.ReadError("response lost after provider accepted", request=request)
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
@@ -194,7 +194,7 @@ class Accepted2xxBodyTransport(httpx.BaseTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path.startswith("/entities/"):
             return httpx.Response(404, request=request)
-        if request.method == "POST" and request.url.path == "/queries":
+        if request.method == "POST" and request.url.path == "/queries.json":
             self.submit_count += 1
             return httpx.Response(200, content=self.body, request=request)
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
