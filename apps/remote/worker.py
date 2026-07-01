@@ -359,6 +359,21 @@ class RemoteWorker:
             return
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
+            # A persistent SERVER error (e.g. Wishart 500 for a specific key) never
+            # resolves via the entity GET. Once the cheap entity retries are
+            # exhausted, escalate a task that HAS a structure to a fresh
+            # calculation submit — a DIFFERENT endpoint (/queries.json) that can
+            # succeed where the /entities lookup 500s — instead of deferring into
+            # the 24h timeout. Rate limiting (429, or any Retry-After) still just
+            # retries: it is transient and not a key-specific server fault.
+            escalate_to_submit = (
+                self._structure_for(task) is not None
+                and result.retry_after is None
+                and result.http_status is not None
+                and result.http_status >= 500
+                and task.attempt + 1 >= queue.MAX_ATTEMPTS
+            )
+
             def write_retryable(locked: RemoteTask) -> None:
                 self.circuit.record_failure()
                 self._record_attempt(
@@ -372,13 +387,24 @@ class RemoteWorker:
                     raw_body_text=result.raw_text,
                     safe_headers=result.safe_headers,
                 )
+                if escalate_to_submit:
+                    return
                 if result.retry_after is not None:
                     self.rate_limiter.entity.penalize(result.retry_after)
                     queue.retry_after_override(locked, result.retry_after)
                 else:
                     queue.schedule_retry(locked)
 
-            if self._with_owned_claim(claim, write_retryable):
+            owned = self._with_owned_claim(claim, write_retryable)
+            if owned and escalate_to_submit:
+                logger.warning(
+                    "entity lookup exhausted with persistent HTTP %s for %s; "
+                    "escalating to a structure submit",
+                    result.http_status,
+                    task.inchikey,
+                )
+                self._submit_batch(task, claim)
+            elif owned:
                 fanout.mark_items_delayed(task.inchikey)
             return
 
