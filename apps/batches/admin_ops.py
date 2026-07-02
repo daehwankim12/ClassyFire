@@ -18,7 +18,7 @@ from django.db import transaction
 from django.db.models import Max
 
 from apps.batches.models import BatchItem, BatchJob, ExportArtifact
-from apps.core.enums import ACTIVE_TASK_STATES, BatchItemStatus, EventCategory
+from apps.core.enums import ACTIVE_TASK_STATES, BatchItemStatus, EventCategory, TaskState
 from apps.operations.models import SystemEvent
 from apps.remote.models import RemoteTask
 
@@ -27,6 +27,12 @@ logger = logging.getLogger(__name__)
 WAITING_REMOTE_STATUSES = (
     BatchItemStatus.PENDING_CLASSIFICATION,
     BatchItemStatus.REMOTE_DELAYED,
+)
+
+CANCEL_DELETE_TASK_STATES = (
+    TaskState.READY,
+    TaskState.RETRY_WAIT,
+    TaskState.DEFERRED,
 )
 
 
@@ -252,18 +258,21 @@ def cancel_and_delete_jobs(
         artifacts = _collect_artifacts(existing_ids)
         export_artifact_count = len(artifacts.export_refs)
         wanted_inchikeys = _waiting_inchikeys_for_jobs(existing_ids)
-        # Lock the deletable (active, unleased) tasks for the wanted keys FIRST,
-        # then re-check sharing as late as possible — immediately before the
-        # delete — so a job that started waiting on the same InChIKey after we
-        # began keeps its task (its item must not be orphaned). Concurrent
-        # enqueue reuses an existing task via a plain SELECT, so this narrows
-        # but does not fully close the window; a manual admin op is rare enough
-        # that the residual is acceptable.
+        # Lock the deletable unleased tasks for the wanted keys FIRST, then
+        # re-check sharing as late as possible — immediately before the delete
+        # — so a job that started waiting on the same InChIKey after we began
+        # keeps its task (its item must not be orphaned). Only pre-submission
+        # queue states are eligible: submitted/polling work can carry live
+        # RemoteSubmissionMember reservations that must be released by the
+        # normal query terminal paths, not by deleting the task underneath them.
+        # Concurrent enqueue reuses an existing task via a plain SELECT, so this
+        # narrows but does not fully close the window; a manual admin op is rare
+        # enough that the residual is acceptable.
         candidate_rows = list(
             RemoteTask.objects.select_for_update()
             .filter(
                 inchikey__in=wanted_inchikeys,
-                state__in=ACTIVE_TASK_STATES,
+                state__in=CANCEL_DELETE_TASK_STATES,
                 lock_owner__isnull=True,
             )
             .values_list("pk", "inchikey")
@@ -287,7 +296,9 @@ def cancel_and_delete_jobs(
         leased_task_count = RemoteTask.objects.filter(
             inchikey__in=unshared_inchikeys,
             state__in=ACTIVE_TASK_STATES,
-            lock_owner__isnull=False,
+        ).exclude(
+            state__in=CANCEL_DELETE_TASK_STATES,
+            lock_owner__isnull=True,
         ).count()
 
         BatchJob.objects.filter(pk__in=existing_ids).delete()
