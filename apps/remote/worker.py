@@ -469,13 +469,13 @@ class RemoteWorker:
 
             owned = self._with_owned_claim(claim, write_retryable)
             if owned and escalate_to_submit:
-                if not self.circuit.allow():
-                    queue.defer_task(task, delay_seconds=self.lease_seconds)
-                    fanout.mark_items_delayed(
-                        task.inchikey,
-                        message=CIRCUIT_OPEN_MESSAGE,
-                    )
-                    return
+                # Do NOT re-check the circuit here (the 404→submit path doesn't
+                # either): tick() already gated this task, and the 500 recorded
+                # above may itself have opened the circuit — a re-check would
+                # veto the escalation it just triggered, parking the tripping
+                # key in an endless probe → 500 → re-open → defer(300s) loop.
+                # The submit outcome drives the breaker: its success closes the
+                # circuit, its failure keeps it open.
                 logger.warning(
                     "entity lookup returned HTTP %s for %s; "
                     "bypassing entity backoff with a structure submit",

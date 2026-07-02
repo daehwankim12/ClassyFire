@@ -210,12 +210,29 @@ def test_repeated_entity_500_with_retry_after_without_structure_marks_need_struc
     assert item.status == BatchItemStatus.NEED_STRUCTURE
 
 
-def test_exhausted_entity_500_does_not_submit_after_circuit_opens():
+def test_entity_500_that_opens_circuit_still_escalates_to_submit():
+    """The 500 that trips the breaker must not veto its own escalation.
+
+    In production a burst of per-key 500s opened the circuit; the tripping key
+    then won every HALF_OPEN probe, its 500 re-opened the circuit, and the
+    escalate branch's circuit re-check deferred it for lease_seconds (300s) —
+    an endless 5-minute loop with the submit bypass never running. The submit
+    outcome, not the definitive per-key entity 500, must drive the breaker.
+    """
+    task = _claimed_task(with_compound=True, attempt=0)
+    provider = _provider_returning(500)
+    circuit = _OpeningCircuit()
+
+    _run_entity_first(task, provider, circuit=circuit)
+
+    assert provider.submit_calls == 1
+    assert circuit.open
+
+
+def test_exhausted_entity_500_escalates_to_submit_after_circuit_opens():
     task = _claimed_task(with_compound=True, attempt=queue.MAX_ATTEMPTS - 1)
     provider = _provider_returning(500)
 
     _run_entity_first(task, provider, circuit=_OpeningCircuit())
 
-    assert provider.submit_calls == 0
-    task.refresh_from_db()
-    assert task.state == TaskState.DEFERRED
+    assert provider.submit_calls == 1
