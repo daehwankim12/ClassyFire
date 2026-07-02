@@ -52,6 +52,20 @@ class _ClosedCircuit:
         pass
 
 
+class _OpeningCircuit:
+    def __init__(self) -> None:
+        self.open = False
+
+    def allow(self) -> bool:
+        return not self.open
+
+    def record_success(self) -> None:
+        self.open = False
+
+    def record_failure(self) -> None:
+        self.open = True
+
+
 def _provider_returning(status_code: int):
     """A WishartDirectProvider whose transport returns ``status_code`` for every
     request, counting how many times ``submit_structures`` is invoked."""
@@ -99,13 +113,13 @@ def _claimed_task(*, with_compound: bool, attempt: int) -> RemoteTask:
     return task
 
 
-def _run_entity_first(task: RemoteTask, provider) -> None:
+def _run_entity_first(task: RemoteTask, provider, circuit=None) -> None:
     claim = queue.claim_from_task(task)
     worker = RemoteWorker(
         provider,
         worker_id=str(task.lock_owner),
         rate_limiter=_AllowAllLimiter(),
-        circuit=_ClosedCircuit(),
+        circuit=circuit or _ClosedCircuit(),
     )
     worker._entity_first(task, claim)
 
@@ -137,3 +151,14 @@ def test_entity_500_without_structure_never_escalates():
     _run_entity_first(task, provider)
 
     assert provider.submit_calls == 0
+
+
+def test_exhausted_entity_500_does_not_submit_after_circuit_opens():
+    task = _claimed_task(with_compound=True, attempt=queue.MAX_ATTEMPTS - 1)
+    provider = _provider_returning(500)
+
+    _run_entity_first(task, provider, circuit=_OpeningCircuit())
+
+    assert provider.submit_calls == 0
+    task.refresh_from_db()
+    assert task.state == TaskState.DEFERRED
