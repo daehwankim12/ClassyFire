@@ -89,25 +89,54 @@ def _bucket_retry_delay_seconds(bucket: object, fallback: float = 5.0) -> float:
     return float(delay)
 
 
+ENTITY_5XX_RETRY_AFTER_BYPASS_ATTEMPTS = 5
+
+
+def _entity_5xx_retry_after_still_blocks(
+    *, retry_after: float | None, http_status: int | None, attempt: int
+) -> bool:
+    if retry_after is None:
+        return False
+    if http_status is None or http_status < 500:
+        return True
+    return attempt + 1 < ENTITY_5XX_RETRY_AFTER_BYPASS_ATTEMPTS
+
+
 def _should_escalate_entity_retry_to_submit(
-    *, has_structure: bool, retry_after: float | None, http_status: int | None
+    *,
+    has_structure: bool,
+    retry_after: float | None,
+    http_status: int | None,
+    attempt: int = 0,
 ) -> bool:
     """Whether a retryable entity response should bypass entity backoff."""
     return (
         has_structure
-        and retry_after is None
+        and not _entity_5xx_retry_after_still_blocks(
+            retry_after=retry_after,
+            http_status=http_status,
+            attempt=attempt,
+        )
         and http_status is not None
         and http_status >= 500
     )
 
 
 def _should_terminalize_entity_retry_as_need_structure(
-    *, has_structure: bool, retry_after: float | None, http_status: int | None
+    *,
+    has_structure: bool,
+    retry_after: float | None,
+    http_status: int | None,
+    attempt: int = 0,
 ) -> bool:
     """Whether a retryable entity response is blocked only by missing structure."""
     return (
         not has_structure
-        and retry_after is None
+        and not _entity_5xx_retry_after_still_blocks(
+            retry_after=retry_after,
+            http_status=http_status,
+            attempt=attempt,
+        )
         and http_status is not None
         and http_status >= 500
     )
@@ -386,20 +415,24 @@ class RemoteWorker:
             # A persistent SERVER error (e.g. Wishart 500 for a specific key)
             # does not resolve via repeated entity GETs. If we already have a
             # structure, skip the 1m/5m/30m entity backoff chain and submit a
-            # fresh calculation to /queries.json. Rate limits and explicit
+            # fresh calculation to /queries.json. Rate limits and first explicit
             # Retry-After responses still retry because the provider asked us to
-            # wait rather than try a different endpoint.
+            # wait. Repeated entity 5xx failures stop honoring Retry-After so a
+            # provider that stamps every 500 with a 5-minute wait cannot strand a
+            # specific key forever.
             structure = self._structure_for(task)
             escalate_to_submit = _should_escalate_entity_retry_to_submit(
                 has_structure=structure is not None,
                 retry_after=result.retry_after,
                 http_status=result.http_status,
+                attempt=task.attempt,
             )
             terminalize_need_structure = (
                 _should_terminalize_entity_retry_as_need_structure(
                     has_structure=structure is not None,
                     retry_after=result.retry_after,
                     http_status=result.http_status,
+                    attempt=task.attempt,
                 )
             )
 
