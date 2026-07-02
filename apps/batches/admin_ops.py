@@ -78,6 +78,29 @@ def _chunks(values: Sequence[object], size: int) -> Iterable[Sequence[object]]:
         yield values[index : index + size]
 
 
+def _remote_queue_at_capacity() -> bool:
+    max_depth = int(getattr(settings, "REMOTE_MAX_QUEUE_DEPTH", 0))
+    return (
+        RemoteTask.objects.filter(state__in=ACTIVE_TASK_STATES).count() >= max_depth
+    )
+
+
+def _bulk_mark_backpressured(
+    items: Sequence[BatchItem],
+) -> tuple[int, set[uuid.UUID], set[int]]:
+    item_ids = [item.pk for item in items]
+    if not item_ids:
+        return 0, set(), set()
+    updated = BatchItem.objects.filter(
+        pk__in=item_ids,
+        status=BatchItemStatus.REMOTE_TIMED_OUT,
+    ).update(
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+    )
+    return updated, {item.job_id for item in items}, set(item_ids)
+
+
 def _collect_artifacts(job_ids: Sequence[object]) -> _CollectedArtifacts:
     upload_paths = [
         str(path)
@@ -413,18 +436,24 @@ def requeue_timed_out_items(
     budget_exhausted_principals: set[str] = set()
     queue_backpressured = False
 
-    with transaction.atomic():
-        for chunk_ids in _chunks(selected_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
+    for chunk_ids in _chunks(selected_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
+        chunk_affected_job_ids: set[uuid.UUID] = set()
+        with transaction.atomic():
             # Lock only BatchItem rows (job is non-null → safe inner join for reads).
             items = list(
                 BatchItem.objects.select_for_update()
                 .select_related("job", "compound")
                 .filter(pk__in=chunk_ids)
             )
-            retryable_inchikeys = {
-                str(item.inchikey)
+            retryable_items = [
+                item
                 for item in items
                 if item.status == BatchItemStatus.REMOTE_TIMED_OUT and item.inchikey
+            ]
+            skipped_not_timed_out += len(items) - len(retryable_items)
+            retryable_inchikeys = {
+                str(item.inchikey)
+                for item in retryable_items
             }
             active_tasks = {
                 task.inchikey: task
@@ -433,21 +462,31 @@ def requeue_timed_out_items(
                     state__in=ACTIVE_TASK_STATES,
                 )
             }
-            for item in items:
-                if item.status != BatchItemStatus.REMOTE_TIMED_OUT or not item.inchikey:
-                    skipped_not_timed_out += 1
+
+            backpressured_item_ids: set[int] = set()
+            items_requiring_new_tasks = [
+                item
+                for item in retryable_items
+                if item.inchikey not in active_tasks
+            ]
+            if items_requiring_new_tasks and (
+                queue_backpressured or _remote_queue_at_capacity()
+            ):
+                queue_backpressured = True
+                updated, job_ids, item_ids = _bulk_mark_backpressured(
+                    items_requiring_new_tasks
+                )
+                skipped_backpressure += updated
+                chunk_affected_job_ids.update(job_ids)
+                backpressured_item_ids.update(item_ids)
+
+            for index, item in enumerate(retryable_items):
+                if item.pk in backpressured_item_ids:
                     continue
                 job = item.job
                 task = active_tasks.get(item.inchikey)
                 if task is None:
                     principal = normalize_principal(job.remote_principal)
-                    if queue_backpressured:
-                        item.status = BatchItemStatus.REMOTE_DELAYED
-                        item.message = REMOTE_QUEUE_BACKPRESSURE_MESSAGE
-                        item.save(update_fields=["status", "message"])
-                        skipped_backpressure += 1
-                        affected_job_ids.add(job.pk)
-                        continue
                     if principal in budget_exhausted_principals:
                         skipped_budget += 1
                         continue
@@ -464,11 +503,18 @@ def requeue_timed_out_items(
                         continue
                     except RemoteQueueBackpressure:
                         queue_backpressured = True
-                        item.status = BatchItemStatus.REMOTE_DELAYED
-                        item.message = REMOTE_QUEUE_BACKPRESSURE_MESSAGE
-                        item.save(update_fields=["status", "message"])
-                        skipped_backpressure += 1
-                        affected_job_ids.add(job.pk)
+                        remaining_without_tasks = [
+                            candidate
+                            for candidate in retryable_items[index:]
+                            if candidate.pk not in backpressured_item_ids
+                            and candidate.inchikey not in active_tasks
+                        ]
+                        updated, job_ids, item_ids = _bulk_mark_backpressured(
+                            remaining_without_tasks
+                        )
+                        skipped_backpressure += updated
+                        chunk_affected_job_ids.update(job_ids)
+                        backpressured_item_ids.update(item_ids)
                         continue
                     active_tasks[item.inchikey] = task
                 if job.priority > task.priority:
@@ -490,10 +536,11 @@ def requeue_timed_out_items(
                 item.message = message
                 item.save(update_fields=["status", "message"])
                 requeued += 1
-                affected_job_ids.add(job.pk)
+                chunk_affected_job_ids.add(job.pk)
 
-        for job_id in affected_job_ids:
-            recompute_job_counters(job_id)
+            for job_id in chunk_affected_job_ids:
+                recompute_job_counters(job_id)
+        affected_job_ids.update(chunk_affected_job_ids)
 
     result = JobAdminOperationResult(
         items_requeued=requeued,

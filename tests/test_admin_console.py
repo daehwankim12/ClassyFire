@@ -841,6 +841,60 @@ def test_requeue_parks_backpressure_items_and_audits(settings):
     assert event.payload["items_skipped_backpressure"] == 1
 
 
+def test_requeue_bulk_parks_when_queue_is_already_full(settings, monkeypatch):
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    settings.REMOTE_MAX_QUEUE_DEPTH = 1
+    RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=3,
+        invalid_count=3,
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=inchikey,
+            inchikey=inchikey,
+            status=BatchItemStatus.REMOTE_TIMED_OUT,
+        )
+        for index, inchikey in enumerate((IK2, IK3, "GGGGGGGGGGGGGG-HHHHHHHHHH-N"))
+    ]
+
+    def unexpected_enqueue(*_args, **_kwargs):
+        raise AssertionError("queue-full requeue must bulk park without enqueueing")
+
+    monkeypatch.setattr(
+        "apps.batches.services._get_or_create_remote_task",
+        unexpected_enqueue,
+    )
+
+    result = requeue_timed_out_items([item.pk for item in items], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_skipped_backpressure == 3
+    assert list(
+        BatchItem.objects.filter(pk__in=[item.pk for item in items])
+        .order_by("row_order")
+        .values_list("status", "message")
+    ) == [
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+    ]
+
+
 def test_requeue_stops_new_enqueue_attempts_after_backpressure(monkeypatch):
     from apps.batches.admin_ops import requeue_timed_out_items
     from apps.remote.queue import RemoteQueueBackpressure
@@ -921,3 +975,58 @@ def test_batchitem_admin_retry_timed_out_action(admin_client):
     item.refresh_from_db()
     assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
     assert SystemEvent.objects.filter(event_type="admin_requeue_timed_out").exists()
+
+
+def test_batchitem_admin_retry_timed_out_action_bulk_parks_when_queue_full(
+    admin_client, settings, monkeypatch
+):
+    settings.REMOTE_MAX_QUEUE_DEPTH = 1
+    RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=2,
+        invalid_count=2,
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=inchikey,
+            inchikey=inchikey,
+            status=BatchItemStatus.REMOTE_TIMED_OUT,
+        )
+        for index, inchikey in enumerate((IK2, IK3))
+    ]
+
+    def unexpected_enqueue(*_args, **_kwargs):
+        raise AssertionError("queue-full admin action must not enqueue per row")
+
+    monkeypatch.setattr(
+        "apps.batches.services._get_or_create_remote_task",
+        unexpected_enqueue,
+    )
+
+    response = admin_client.post(
+        reverse("admin:batches_batchitem_changelist"),
+        {
+            "action": "retry_timed_out",
+            "_selected_action": [str(item.pk) for item in items],
+        },
+    )
+
+    assert response.status_code == 302
+    assert list(
+        BatchItem.objects.filter(pk__in=[item.pk for item in items])
+        .order_by("row_order")
+        .values_list("status", "message")
+    ) == [
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+    ]
