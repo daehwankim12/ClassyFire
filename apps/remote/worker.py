@@ -89,6 +89,18 @@ def _bucket_retry_delay_seconds(bucket: object, fallback: float = 5.0) -> float:
     return float(delay)
 
 
+def _should_escalate_entity_retry_to_submit(
+    *, has_structure: bool, retry_after: float | None, http_status: int | None
+) -> bool:
+    """Whether a retryable entity response should bypass entity backoff."""
+    return (
+        has_structure
+        and retry_after is None
+        and http_status is not None
+        and http_status >= 500
+    )
+
+
 # Provider namespace for the outbox/circuit/rate-bucket rows. Single provider
 # today; kept explicit so the idempotency key and shared state are namespaced.
 PROVIDER = "wishart"
@@ -359,19 +371,16 @@ class RemoteWorker:
             return
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
-            # A persistent SERVER error (e.g. Wishart 500 for a specific key) never
-            # resolves via the entity GET. Once the cheap entity retries are
-            # exhausted, escalate a task that HAS a structure to a fresh
-            # calculation submit — a DIFFERENT endpoint (/queries.json) that can
-            # succeed where the /entities lookup 500s — instead of deferring into
-            # the 24h timeout. Rate limiting (429, or any Retry-After) still just
-            # retries: it is transient and not a key-specific server fault.
-            escalate_to_submit = (
-                self._structure_for(task) is not None
-                and result.retry_after is None
-                and result.http_status is not None
-                and result.http_status >= 500
-                and task.attempt + 1 >= queue.MAX_ATTEMPTS
+            # A persistent SERVER error (e.g. Wishart 500 for a specific key)
+            # does not resolve via repeated entity GETs. If we already have a
+            # structure, skip the 1m/5m/30m entity backoff chain and submit a
+            # fresh calculation to /queries.json. Rate limits and explicit
+            # Retry-After responses still retry because the provider asked us to
+            # wait rather than try a different endpoint.
+            escalate_to_submit = _should_escalate_entity_retry_to_submit(
+                has_structure=self._structure_for(task) is not None,
+                retry_after=result.retry_after,
+                http_status=result.http_status,
             )
 
             def write_retryable(locked: RemoteTask) -> None:
@@ -398,8 +407,8 @@ class RemoteWorker:
             owned = self._with_owned_claim(claim, write_retryable)
             if owned and escalate_to_submit:
                 logger.warning(
-                    "entity lookup exhausted with persistent HTTP %s for %s; "
-                    "escalating to a structure submit",
+                    "entity lookup returned HTTP %s for %s; "
+                    "bypassing entity backoff with a structure submit",
                     result.http_status,
                     task.inchikey,
                 )

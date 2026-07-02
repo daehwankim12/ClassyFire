@@ -1,11 +1,11 @@
-"""Persistent entity 500 escalates to a structure submit once retries are spent.
+"""Persistent entity 500 escalates to a structure submit immediately.
 
 Wishart returns HTTP 500 (server fault) for some specific keys — every entity
-GET for that key fails, forever. Rather than retrying the doomed GET into the
-24h timeout, once the cheap entity retries are exhausted the worker escalates a
-task that HAS a structure to a fresh calculation submit (a different endpoint,
-/queries.json, which can succeed where /entities 500s). Rate-limit 429s and
-structureless tasks still just retry.
+GET for that key fails, forever. Rather than retrying the doomed GET through
+1m/5m/30m backoff windows, the worker escalates a task that HAS a structure to
+a fresh calculation submit (a different endpoint, /queries.json, which can
+succeed where /entities 500s). Rate-limit 429s, explicit Retry-After responses,
+and structureless tasks still just retry.
 
 Style mirrors test_remote_side_effect_fencing: drive ``worker._entity_first``
 directly with an explicit claim, which works on the embedded-PG test harness.
@@ -52,13 +52,17 @@ class _ClosedCircuit:
         pass
 
 
-def _provider_returning(status_code: int):
+def _provider_returning(status_code: int, *, headers: dict[str, str] | None = None):
     """A WishartDirectProvider whose transport returns ``status_code`` for every
     request, counting how many times ``submit_structures`` is invoked."""
     from apps.remote.wishart import WishartDirectProvider
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code, json={"status": status_code})
+        return httpx.Response(
+            status_code,
+            headers=headers,
+            json={"status": status_code},
+        )
 
     provider = WishartDirectProvider(base_url="https://wishart.test")
     transport = httpx.MockTransport(handler)
@@ -110,8 +114,8 @@ def _run_entity_first(task: RemoteTask, provider) -> None:
     worker._entity_first(task, claim)
 
 
-def test_persistent_entity_500_escalates_to_submit_when_exhausted():
-    task = _claimed_task(with_compound=True, attempt=queue.MAX_ATTEMPTS - 1)
+def test_persistent_entity_500_escalates_to_submit_immediately():
+    task = _claimed_task(with_compound=True, attempt=0)
     provider = _provider_returning(500)
 
     _run_entity_first(task, provider)
@@ -119,15 +123,15 @@ def test_persistent_entity_500_escalates_to_submit_when_exhausted():
     assert provider.submit_calls == 1
 
 
-def test_entity_500_before_exhaustion_retries_without_submit():
+def test_entity_500_with_retry_after_retries_without_submit():
     task = _claimed_task(with_compound=True, attempt=0)
-    provider = _provider_returning(500)
+    provider = _provider_returning(500, headers={"Retry-After": "600"})
 
     _run_entity_first(task, provider)
 
     assert provider.submit_calls == 0
     task.refresh_from_db()
-    assert task.attempt == 1  # scheduled a retry instead of escalating
+    assert task.attempt == 1  # Retry-After still takes precedence.
 
 
 def test_entity_500_without_structure_never_escalates():
