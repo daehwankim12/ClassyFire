@@ -841,6 +841,62 @@ def test_requeue_parks_backpressure_items_and_audits(settings):
     assert event.payload["items_skipped_backpressure"] == 1
 
 
+def test_requeue_stops_new_enqueue_attempts_after_backpressure(monkeypatch):
+    from apps.batches.admin_ops import requeue_timed_out_items
+    from apps.remote.queue import RemoteQueueBackpressure
+
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=3,
+        invalid_count=3,
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=inchikey,
+            inchikey=inchikey,
+            status=BatchItemStatus.REMOTE_TIMED_OUT,
+        )
+        for index, inchikey in enumerate((IK1, IK2, IK3))
+    ]
+    enqueue_attempts: list[str] = []
+
+    def reject_enqueue(inchikey, compound, *, principal=None, priority=0):
+        enqueue_attempts.append(inchikey)
+        raise RemoteQueueBackpressure("remote queue depth limit reached")
+
+    monkeypatch.setattr(
+        "apps.batches.services._get_or_create_remote_task",
+        reject_enqueue,
+    )
+
+    result = requeue_timed_out_items([item.pk for item in items], actor="tester")
+
+    assert enqueue_attempts == [IK1]
+    assert result.items_requeued == 0
+    assert result.items_skipped_backpressure == 3
+    assert list(
+        BatchItem.objects.filter(pk__in=[item.pk for item in items])
+        .order_by("row_order")
+        .values_list("status", "message")
+    ) == [
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+    ]
+
+
 def test_batchitem_admin_retry_timed_out_action(admin_client):
     job = BatchJob.objects.create(
         secret_hash="x",

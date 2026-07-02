@@ -34,6 +34,8 @@ CANCEL_DELETE_TASK_STATES = (
     TaskState.RETRY_WAIT,
     TaskState.DEFERRED,
 )
+REQUEUE_TIMED_OUT_CHUNK_SIZE = 1_000
+REMOTE_QUEUE_BACKPRESSURE_MESSAGE = "Remote queue is at capacity; retrying later."
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,11 @@ class _CollectedArtifacts:
 
 def _job_id_strings(job_ids: Iterable[object]) -> list[str]:
     return [str(job_id) for job_id in job_ids]
+
+
+def _chunks(values: Sequence[object], size: int) -> Iterable[Sequence[object]]:
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
 
 
 def _collect_artifacts(job_ids: Sequence[object]) -> _CollectedArtifacts:
@@ -394,7 +401,7 @@ def requeue_timed_out_items(
         _initial_status_for_remote_task,
         recompute_job_counters,
     )
-    from apps.remote.budget import RemoteBudgetExceededError
+    from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
     from apps.remote.queue import RemoteQueueBackpressure
 
     selected_ids = list(item_ids)
@@ -403,42 +410,87 @@ def requeue_timed_out_items(
     skipped_budget = 0
     skipped_backpressure = 0
     affected_job_ids: set[uuid.UUID] = set()
+    budget_exhausted_principals: set[str] = set()
+    queue_backpressured = False
 
     with transaction.atomic():
-        # Lock only BatchItem rows (job is non-null → safe inner join for reads).
-        items = (
-            BatchItem.objects.select_for_update()
-            .select_related("job")
-            .filter(pk__in=selected_ids)
-        )
-        for item in items:
-            if item.status != BatchItemStatus.REMOTE_TIMED_OUT or not item.inchikey:
-                skipped_not_timed_out += 1
-                continue
-            job = item.job
-            try:
-                task = _get_or_create_remote_task(
-                    item.inchikey,
-                    item.compound,
-                    principal=job.remote_principal,
-                    priority=job.priority,
+        for chunk_ids in _chunks(selected_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
+            # Lock only BatchItem rows (job is non-null → safe inner join for reads).
+            items = list(
+                BatchItem.objects.select_for_update()
+                .select_related("job", "compound")
+                .filter(pk__in=chunk_ids)
+            )
+            retryable_inchikeys = {
+                str(item.inchikey)
+                for item in items
+                if item.status == BatchItemStatus.REMOTE_TIMED_OUT and item.inchikey
+            }
+            active_tasks = {
+                task.inchikey: task
+                for task in RemoteTask.objects.filter(
+                    inchikey__in=retryable_inchikeys,
+                    state__in=ACTIVE_TASK_STATES,
                 )
-            except RemoteBudgetExceededError:
-                skipped_budget += 1
-                continue
-            except RemoteQueueBackpressure:
-                item.status = BatchItemStatus.REMOTE_DELAYED
-                item.message = "Remote queue is at capacity; retrying later."
+            }
+            for item in items:
+                if item.status != BatchItemStatus.REMOTE_TIMED_OUT or not item.inchikey:
+                    skipped_not_timed_out += 1
+                    continue
+                job = item.job
+                task = active_tasks.get(item.inchikey)
+                if task is None:
+                    principal = normalize_principal(job.remote_principal)
+                    if queue_backpressured:
+                        item.status = BatchItemStatus.REMOTE_DELAYED
+                        item.message = REMOTE_QUEUE_BACKPRESSURE_MESSAGE
+                        item.save(update_fields=["status", "message"])
+                        skipped_backpressure += 1
+                        affected_job_ids.add(job.pk)
+                        continue
+                    if principal in budget_exhausted_principals:
+                        skipped_budget += 1
+                        continue
+                    try:
+                        task = _get_or_create_remote_task(
+                            item.inchikey,
+                            item.compound,
+                            principal=job.remote_principal,
+                            priority=job.priority,
+                        )
+                    except RemoteBudgetExceededError:
+                        budget_exhausted_principals.add(principal)
+                        skipped_budget += 1
+                        continue
+                    except RemoteQueueBackpressure:
+                        queue_backpressured = True
+                        item.status = BatchItemStatus.REMOTE_DELAYED
+                        item.message = REMOTE_QUEUE_BACKPRESSURE_MESSAGE
+                        item.save(update_fields=["status", "message"])
+                        skipped_backpressure += 1
+                        affected_job_ids.add(job.pk)
+                        continue
+                    active_tasks[item.inchikey] = task
+                if job.priority > task.priority:
+                    updated = RemoteTask.objects.filter(
+                        pk=task.pk,
+                        priority__lt=job.priority,
+                    ).update(priority=job.priority)
+                    if updated:
+                        task.priority = job.priority
+                if item.compound_id and task.compound_id is None:
+                    updated = RemoteTask.objects.filter(
+                        pk=task.pk,
+                        compound_id__isnull=True,
+                    ).update(compound_id=item.compound_id)
+                    if updated:
+                        task.compound_id = item.compound_id
+                status, message = _initial_status_for_remote_task(task)
+                item.status = status
+                item.message = message
                 item.save(update_fields=["status", "message"])
-                skipped_backpressure += 1
+                requeued += 1
                 affected_job_ids.add(job.pk)
-                continue
-            status, message = _initial_status_for_remote_task(task)
-            item.status = status
-            item.message = message
-            item.save(update_fields=["status", "message"])
-            requeued += 1
-            affected_job_ids.add(job.pk)
 
         for job_id in affected_job_ids:
             recompute_job_counters(job_id)
