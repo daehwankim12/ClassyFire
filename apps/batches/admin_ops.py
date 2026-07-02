@@ -46,6 +46,7 @@ class JobAdminOperationResult:
     items_requeued: int = 0
     items_skipped_not_timed_out: int = 0
     items_skipped_budget: int = 0
+    items_skipped_backpressure: int = 0
 
 
 @dataclass(frozen=True)
@@ -383,11 +384,13 @@ def requeue_timed_out_items(
         recompute_job_counters,
     )
     from apps.remote.budget import RemoteBudgetExceededError
+    from apps.remote.queue import RemoteQueueBackpressure
 
     selected_ids = list(item_ids)
     requeued = 0
     skipped_not_timed_out = 0
     skipped_budget = 0
+    skipped_backpressure = 0
     affected_job_ids: set[uuid.UUID] = set()
 
     with transaction.atomic():
@@ -412,6 +415,13 @@ def requeue_timed_out_items(
             except RemoteBudgetExceededError:
                 skipped_budget += 1
                 continue
+            except RemoteQueueBackpressure:
+                item.status = BatchItemStatus.REMOTE_DELAYED
+                item.message = "Remote queue is at capacity; retrying later."
+                item.save(update_fields=["status", "message"])
+                skipped_backpressure += 1
+                affected_job_ids.add(job.pk)
+                continue
             status, message = _initial_status_for_remote_task(task)
             item.status = status
             item.message = message
@@ -426,6 +436,7 @@ def requeue_timed_out_items(
         items_requeued=requeued,
         items_skipped_not_timed_out=skipped_not_timed_out,
         items_skipped_budget=skipped_budget,
+        items_skipped_backpressure=skipped_backpressure,
     )
     _audit(
         "admin_requeue_timed_out",
@@ -434,6 +445,7 @@ def requeue_timed_out_items(
             "items_requeued": result.items_requeued,
             "items_skipped_not_timed_out": result.items_skipped_not_timed_out,
             "items_skipped_budget": result.items_skipped_budget,
+            "items_skipped_backpressure": result.items_skipped_backpressure,
             "job_ids": _job_id_strings(affected_job_ids),
         },
     )
