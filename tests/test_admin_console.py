@@ -27,6 +27,7 @@ from apps.core.enums import (
     BatchJobStatus,
     BatchProcessingState,
     ProviderControlState,
+    QueryState,
     SubmissionState,
     TaskState,
 )
@@ -369,6 +370,51 @@ def test_cancel_and_delete_preserves_shared_remote_tasks():
         "created_at"
     )
     assert event.payload["remote_tasks_deleted"] == 1
+
+
+def test_cancel_and_delete_preserves_submitted_poll_wait_tasks():
+    from apps.batches.admin_ops import cancel_and_delete_jobs
+
+    selected = BatchJob.objects.create(secret_hash="x", priority=100)
+    BatchItem.objects.create(
+        job=selected,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    task = RemoteTask.objects.create(inchikey=IK1, state=TaskState.POLL_WAIT)
+    query = RemoteQuery.objects.create(
+        remote_query_id="admin-preserve-submitted",
+        payload_hash="a" * 64,
+        state=QueryState.SUBMITTED,
+    )
+    submission = RemoteSubmission.objects.create(
+        payload_hash="a" * 64,
+        state=SubmissionState.SUBMITTED,
+        query=query,
+        remote_query_id=query.remote_query_id,
+        request_payload={"structures": [IK1]},
+    )
+    RemoteSubmissionMember.objects.create(
+        submission=submission,
+        inchikey=IK1,
+        structure_hash="b" * 64,
+    )
+    query_item = RemoteQueryItem.objects.create(query=query, task=task, inchikey=IK1)
+
+    result = cancel_and_delete_jobs([selected.pk], actor="tester")
+
+    assert result.jobs_deleted == 1
+    assert result.remote_tasks_deleted == 0
+    assert result.remote_tasks_skipped_leased == 1
+    task.refresh_from_db()
+    assert task.state == TaskState.POLL_WAIT
+    query_item.refresh_from_db()
+    assert query_item.task_id == task.pk
+    assert RemoteSubmissionMember.objects.filter(
+        submission=submission, inchikey=IK1, active=True
+    ).exists()
 
 
 def test_set_job_priority_recomputes_remote_task_priority():
