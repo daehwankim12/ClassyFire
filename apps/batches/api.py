@@ -109,11 +109,16 @@ FOUND_STATUSES = [
     BatchItemStatus.FOUND_WISHART_ENTITY,
     BatchItemStatus.COMPLETE_AFTER_WISHART,
 ]
+INVALID_STATUSES = [
+    BatchItemStatus.INVALID_INPUT,
+    BatchItemStatus.RESULT_KEY_MISMATCH,
+    BatchItemStatus.REMOTE_TIMED_OUT,
+]
 STATUS_FILTER_MAP: dict[str, list[BatchItemStatus]] = {
     "FOUND": FOUND_STATUSES,
     "PENDING": [BatchItemStatus.PENDING_CLASSIFICATION],
     "NEED_STRUCTURE": [BatchItemStatus.NEED_STRUCTURE],
-    "INVALID": [BatchItemStatus.INVALID_INPUT],
+    "INVALID": INVALID_STATUSES,
     "DELAYED": [BatchItemStatus.REMOTE_DELAYED],
 }
 
