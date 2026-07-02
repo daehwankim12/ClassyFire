@@ -895,6 +895,42 @@ def test_requeue_bulk_parks_when_queue_is_already_full(settings, monkeypatch):
     ]
 
 
+def test_requeue_locks_only_batch_items(monkeypatch):
+    from django.db.models.query import QuerySet
+
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=1,
+        invalid_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.REMOTE_TIMED_OUT,
+    )
+    RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+    batch_item_lock_kwargs = []
+    original_select_for_update = QuerySet.select_for_update
+
+    def spy_select_for_update(self, *args, **kwargs):
+        if self.model is BatchItem:
+            batch_item_lock_kwargs.append(kwargs.copy())
+        return original_select_for_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", spy_select_for_update)
+
+    result = requeue_timed_out_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 1
+    assert batch_item_lock_kwargs
+    assert batch_item_lock_kwargs[0]["of"] == ("self",)
+
+
 def test_requeue_stops_new_enqueue_attempts_after_backpressure(monkeypatch):
     from apps.batches.admin_ops import requeue_timed_out_items
     from apps.remote.queue import RemoteQueueBackpressure

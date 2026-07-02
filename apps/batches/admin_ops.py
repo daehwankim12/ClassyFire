@@ -439,9 +439,9 @@ def requeue_timed_out_items(
     for chunk_ids in _chunks(selected_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
         chunk_affected_job_ids: set[uuid.UUID] = set()
         with transaction.atomic():
-            # Lock only BatchItem rows (job is non-null → safe inner join for reads).
+            # Lock only BatchItem rows; compound is nullable and joins with LEFT OUTER.
             items = list(
-                BatchItem.objects.select_for_update()
+                BatchItem.objects.select_for_update(of=("self",))
                 .select_related("job", "compound")
                 .filter(pk__in=chunk_ids)
             )
