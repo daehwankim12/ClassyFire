@@ -89,17 +89,26 @@ def _bucket_retry_delay_seconds(bucket: object, fallback: float = 5.0) -> float:
     return float(delay)
 
 
-ENTITY_5XX_RETRY_AFTER_BYPASS_ATTEMPTS = 5
+RETRY_AFTER_RATE_LIMIT_STATUSES = frozenset({429})
 
 
-def _entity_5xx_retry_after_still_blocks(
-    *, retry_after: float | None, http_status: int | None, attempt: int
+def _should_honor_retry_after(
+    *, retry_after: float | None, http_status: int | None
 ) -> bool:
-    if retry_after is None:
-        return False
-    if http_status is None or http_status < 500:
-        return True
-    return attempt + 1 < ENTITY_5XX_RETRY_AFTER_BYPASS_ATTEMPTS
+    return (
+        retry_after is not None
+        and retry_after > 0
+        and http_status in RETRY_AFTER_RATE_LIMIT_STATUSES
+    )
+
+
+def _should_penalize_entity_retry_after(
+    *, retry_after: float | None, http_status: int | None
+) -> bool:
+    return _should_honor_retry_after(
+        retry_after=retry_after,
+        http_status=http_status,
+    )
 
 
 def _should_escalate_entity_retry_to_submit(
@@ -112,11 +121,6 @@ def _should_escalate_entity_retry_to_submit(
     """Whether a retryable entity response should bypass entity backoff."""
     return (
         has_structure
-        and not _entity_5xx_retry_after_still_blocks(
-            retry_after=retry_after,
-            http_status=http_status,
-            attempt=attempt,
-        )
         and http_status is not None
         and http_status >= 500
     )
@@ -132,11 +136,6 @@ def _should_terminalize_entity_retry_as_need_structure(
     """Whether a retryable entity response is blocked only by missing structure."""
     return (
         not has_structure
-        and not _entity_5xx_retry_after_still_blocks(
-            retry_after=retry_after,
-            http_status=http_status,
-            attempt=attempt,
-        )
         and http_status is not None
         and http_status >= 500
     )
@@ -414,12 +413,11 @@ class RemoteWorker:
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
             # A persistent SERVER error (e.g. Wishart 500 for a specific key)
             # does not resolve via repeated entity GETs. If we already have a
-            # structure, skip the 1m/5m/30m entity backoff chain and submit a
-            # fresh calculation to /queries.json. Rate limits and first explicit
-            # Retry-After responses still retry because the provider asked us to
-            # wait. Repeated entity 5xx failures stop honoring Retry-After so a
-            # provider that stamps every 500 with a 5-minute wait cannot strand a
-            # specific key forever.
+            # structure, skip the entity Retry-After/backoff chain and submit a
+            # fresh calculation to /queries.json. Rate-limit 429s still honor
+            # Retry-After globally, but entity 5xx Retry-After is task-local
+            # noise in practice for Wishart's per-key failures. Letting a 500
+            # park the shared request bucket strands unrelated keys for 5m.
             structure = self._structure_for(task)
             escalate_to_submit = _should_escalate_entity_retry_to_submit(
                 has_structure=structure is not None,
@@ -460,7 +458,11 @@ class RemoteWorker:
                     )
                     return
                 if result.retry_after is not None:
-                    self.rate_limiter.entity.penalize(result.retry_after)
+                    if _should_penalize_entity_retry_after(
+                        retry_after=result.retry_after,
+                        http_status=result.http_status,
+                    ):
+                        self.rate_limiter.entity.penalize(result.retry_after)
                     queue.retry_after_override(locked, result.retry_after)
                 else:
                     queue.schedule_retry(locked)
@@ -960,10 +962,14 @@ class RemoteWorker:
             # Free the idempotency key so a later retry can re-submit.
             self._fail_submission(submission, detail=f"retryable: {exc}")
             retry_after = exc.retry_after
-            if retry_after is not None:
+            honor_retry_after = _should_honor_retry_after(
+                retry_after=retry_after,
+                http_status=exc.http_status,
+            )
+            if honor_retry_after:
                 self.rate_limiter.submit.penalize(retry_after)
             for member in members:
-                if retry_after is not None:
+                if honor_retry_after:
                     queue.retry_after_override(member, retry_after)
                 else:
                     queue.schedule_retry(member)

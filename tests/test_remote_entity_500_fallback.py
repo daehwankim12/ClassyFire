@@ -4,11 +4,10 @@ Wishart returns HTTP 500 (server fault) for some specific keys — every entity
 GET for that key fails, forever. Rather than retrying the doomed GET through
 1m/5m/30m backoff windows, the worker escalates a task that HAS a structure to
 a fresh calculation submit (a different endpoint, /queries.json, which can
-succeed where /entities 500s). Rate-limit 429s and first explicit Retry-After
-responses still retry, but repeated entity 5xx failures stop honoring
-Retry-After so they cannot keep the queue in 5-minute waits forever.
-Structureless tasks move to NEED_STRUCTURE instead of blocking the remote queue
-on entity backoff.
+succeed where /entities 500s). Rate-limit 429s still retry, but entity 5xx
+failures ignore Retry-After so they cannot keep the queue in 5-minute waits
+forever. Structureless tasks move to NEED_STRUCTURE instead of blocking the
+remote queue on entity backoff.
 
 Style mirrors test_remote_side_effect_fencing: drive ``worker._entity_first``
 directly with an explicit claim, which works on the embedded-PG test harness.
@@ -17,6 +16,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob
 from apps.compounds.models import CompoundStructure
@@ -33,11 +33,15 @@ SMILES = "CCO"
 
 class _AllowAllLimiter:
     class _Bucket:
+        def __init__(self) -> None:
+            self.penalties: list[float] = []
+
         def allow(self) -> bool:
             return True
 
         def penalize(self, retry_after: float | None) -> None:
-            pass
+            if retry_after is not None:
+                self.penalties.append(retry_after)
 
     def __init__(self) -> None:
         self.entity = self._Bucket()
@@ -120,12 +124,12 @@ def _claimed_task(*, with_compound: bool, attempt: int) -> RemoteTask:
     return task
 
 
-def _run_entity_first(task: RemoteTask, provider, circuit=None) -> None:
+def _run_entity_first(task: RemoteTask, provider, circuit=None, limiter=None) -> None:
     claim = queue.claim_from_task(task)
     worker = RemoteWorker(
         provider,
         worker_id=str(task.lock_owner),
-        rate_limiter=_AllowAllLimiter(),
+        rate_limiter=limiter or _AllowAllLimiter(),
         circuit=circuit or _ClosedCircuit(),
     )
     worker._entity_first(task, claim)
@@ -140,15 +144,20 @@ def test_persistent_entity_500_escalates_to_submit_immediately():
     assert provider.submit_calls == 1
 
 
-def test_entity_500_with_retry_after_retries_without_submit():
+def test_entity_500_with_retry_after_escalates_to_submit_without_waiting():
     task = _claimed_task(with_compound=True, attempt=0)
     provider = _provider_returning(500, headers={"Retry-After": "600"})
+    limiter = _AllowAllLimiter()
 
-    _run_entity_first(task, provider)
+    _run_entity_first(task, provider, limiter=limiter)
 
-    assert provider.submit_calls == 0
+    assert provider.submit_calls == 1
+    assert limiter.entity.penalties == []
+    assert limiter.submit.penalties == []
     task.refresh_from_db()
-    assert task.attempt == 1  # Retry-After still takes precedence.
+    assert task.attempt == 1
+    assert task.next_run_at is not None
+    assert (task.next_run_at - timezone.now()).total_seconds() < 120
 
 
 def test_repeated_entity_500_with_retry_after_escalates_to_submit():
@@ -167,6 +176,21 @@ def test_entity_500_without_structure_marks_need_structure():
     _run_entity_first(task, provider)
 
     assert provider.submit_calls == 0
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    item = BatchItem.objects.get(inchikey=IK)
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
+
+
+def test_entity_500_with_retry_after_without_structure_marks_need_structure():
+    task = _claimed_task(with_compound=False, attempt=0)
+    provider = _provider_returning(500, headers={"Retry-After": "300"})
+    limiter = _AllowAllLimiter()
+
+    _run_entity_first(task, provider, limiter=limiter)
+
+    assert provider.submit_calls == 0
+    assert limiter.entity.penalties == []
     task.refresh_from_db()
     assert task.state == TaskState.DONE
     item = BatchItem.objects.get(inchikey=IK)
