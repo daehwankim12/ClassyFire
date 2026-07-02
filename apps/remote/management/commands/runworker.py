@@ -52,22 +52,26 @@ class Command(BaseCommand):
         )
         once = options["once"]
         idle_sleep = options["idle_sleep"]
-        # Run the stale-task timeout reaper at most once per minute (it is a
-        # cheap indexed scan but need not run on every tight tick). Seed it in
-        # the past so the first cycle reaps immediately.
+        # Run stale-task timeout only while the live queue is idle. In production
+        # this cleanup can fan out hundreds of timed-out tasks; keeping it off
+        # the hot path prevents it from starving request-rate-limited remote work.
+        # Seed it in the past so the first idle cycle can reap immediately.
         last_reap = time.monotonic() - self._REAP_INTERVAL_SECONDS
         try:
             while True:
-                now = time.monotonic()
-                if now - last_reap >= self._REAP_INTERVAL_SECONDS:
-                    last_reap = now
-                    self._reap_stale_tasks()
                 # Tick EVERY worker each cycle — do NOT short-circuit. The old
                 # ``any(worker.tick() for ...)`` stopped at the first truthy tick,
                 # so only one worker ever ran per cycle. Materialise all results
                 # so every worker claims + processes a task this cycle (F-08).
                 results = [worker.tick() for worker in workers]
                 did_work = any(results)
+                now = time.monotonic()
+                if (
+                    not did_work
+                    and now - last_reap >= self._REAP_INTERVAL_SECONDS
+                ):
+                    self._reap_stale_tasks()
+                    last_reap = time.monotonic()
                 if once:
                     break
                 if not did_work:
