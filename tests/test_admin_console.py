@@ -755,6 +755,40 @@ def test_requeue_skips_over_budget_items(settings):
     assert not RemoteTask.objects.filter(inchikey=IK3).exists()
 
 
+def test_requeue_parks_backpressure_items_and_audits(settings):
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    settings.REMOTE_MAX_QUEUE_DEPTH = 1
+    RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        total_count=1,
+        invalid_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK2,
+        inchikey=IK2,
+        status=BatchItemStatus.REMOTE_TIMED_OUT,
+    )
+
+    result = requeue_timed_out_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_skipped_backpressure == 1
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.message == "Remote queue is at capacity; retrying later."
+    job.refresh_from_db()
+    assert job.status == BatchJobStatus.IN_PROGRESS
+    event = SystemEvent.objects.filter(event_type="admin_requeue_timed_out").latest(
+        "created_at"
+    )
+    assert event.payload["items_skipped_backpressure"] == 1
+
+
 def test_batchitem_admin_retry_timed_out_action(admin_client):
     job = BatchJob.objects.create(
         secret_hash="x",

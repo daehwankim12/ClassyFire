@@ -216,7 +216,8 @@ class BatchItemAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
             (
                 f"Re-queued {result.items_requeued} item(s); "
                 f"skipped {result.items_skipped_not_timed_out} not-timed-out and "
-                f"{result.items_skipped_budget} over-budget."
+                f"{result.items_skipped_budget} over-budget and "
+                f"{result.items_skipped_backpressure} at-capacity."
             ),
         )
 
