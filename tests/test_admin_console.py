@@ -1,8 +1,9 @@
 """Tests for the inspection-only Django admin operations console.
 
-Covers: every target model is registered; add/change stay blocked; superusers
-can delete rows; each changelist loads; curated operational actions perform the
-right state transitions and emit SystemEvent audit rows.
+Covers: every target model is registered; add/change stay blocked; only
+BatchJob exposes curated superuser deletion; each changelist loads; curated
+operational actions perform the right state transitions and emit SystemEvent
+audit rows.
 """
 from __future__ import annotations
 
@@ -10,9 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 from django.contrib import admin
+from django.contrib.admin.options import ModelAdmin
 from django.urls import reverse
 from django.utils import timezone
 
+from apps.batches import admin as batch_admin_module
 from apps.batches.models import BatchItem, BatchJob, BatchQuotaEvent, ExportArtifact
 from apps.chemont.models import ChemOntNode
 from apps.classifications.models import (
@@ -99,15 +102,51 @@ def test_all_registered_admins_block_add_and_change(rf):
         assert model_admin.has_change_permission(request) is False
 
 
-def test_registered_admins_allow_native_delete_only_for_superusers(rf):
+def test_registered_admins_deny_native_delete_except_batchjob_cleanup(rf):
     super_request = rf.get("/admin/")
     super_request.user = _admin_user(is_superuser=True)
     staff_request = rf.get("/admin/")
     staff_request.user = _admin_user(is_superuser=False)
     for model in REGISTERED_MODELS:
         model_admin = admin.site._registry[model]
-        assert model_admin.has_delete_permission(super_request) is True
+        expected_superuser_delete = model is BatchJob
+        assert model_admin.has_delete_permission(super_request) is expected_superuser_delete
         assert model_admin.has_delete_permission(staff_request) is False
+
+
+def test_batchjob_related_admins_allow_delete_only_inside_job_cascade(rf):
+    request = rf.get("/admin/")
+    request.user = _admin_user(is_superuser=True)
+    attr = batch_admin_module._ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR
+
+    for model in (BatchItem, ExportArtifact):
+        model_admin = admin.site._registry[model]
+        assert model_admin.has_delete_permission(request) is False
+
+        setattr(request, attr, True)
+        assert model_admin.has_delete_permission(request) is True
+
+        setattr(request, attr, False)
+        assert model_admin.has_delete_permission(request) is False
+
+
+def test_batchjob_delete_collector_scopes_related_delete_permission(rf, monkeypatch):
+    request = rf.get("/admin/")
+    request.user = _admin_user(is_superuser=True)
+    attr = batch_admin_module._ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR
+    job_admin = admin.site._registry[BatchJob]
+    seen_flags: list[bool] = []
+
+    def fake_get_deleted_objects(self, objs, request):
+        seen_flags.append(bool(getattr(request, attr, False)))
+        return [], {}, set(), []
+
+    monkeypatch.setattr(ModelAdmin, "get_deleted_objects", fake_get_deleted_objects)
+
+    job_admin.get_deleted_objects([], request)
+
+    assert seen_flags == [True]
+    assert not hasattr(request, attr)
 
 
 @pytest.mark.parametrize("model", REGISTERED_MODELS)
@@ -497,7 +536,7 @@ def test_batchjob_admin_cancel_and_delete_action(admin_client):
     assert SystemEvent.objects.filter(event_type="admin_cancel_delete_jobs").exists()
 
 
-def test_batchjob_admin_delete_view_allows_related_batch_items(admin_client):
+def test_batchjob_admin_delete_view_allows_related_rows(admin_client):
     job = BatchJob.objects.create(secret_hash="x")
     item = BatchItem.objects.create(
         job=job,
@@ -505,6 +544,18 @@ def test_batchjob_admin_delete_view_allows_related_batch_items(admin_client):
         original_input=IK1,
         inchikey=IK1,
         status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    artifact = ExportArtifact.objects.create(
+        job=job,
+        fmt="csv",
+        token="delete-view-token",
+        path="/tmp/delete-view-token.csv",
+        checksum="a" * 64,
+        byte_size=10,
+        rows_signature="b" * 64,
+        row_count=1,
+        job_state_signature="c" * 64,
+        expires_at=timezone.now() + timezone.timedelta(hours=1),
     )
     url = reverse("admin:batches_batchjob_delete", args=[job.pk])
 
@@ -518,6 +569,7 @@ def test_batchjob_admin_delete_view_allows_related_batch_items(admin_client):
     assert response.status_code == 302
     assert not BatchJob.objects.filter(pk=job.pk).exists()
     assert not BatchItem.objects.filter(pk=item.pk).exists()
+    assert not ExportArtifact.objects.filter(pk=artifact.pk).exists()
     assert SystemEvent.objects.filter(event_type="admin_delete_jobs").exists()
 
 

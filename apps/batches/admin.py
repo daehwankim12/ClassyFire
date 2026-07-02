@@ -1,11 +1,12 @@
 """Admin registration for batch jobs, items, quota events, and exports.
 
-Rows are inspection-only for add/change. Superusers can delete rows and run
-curated operational actions such as counter recomputation and job cleanup.
+Rows are inspection-only for add/change. Batch jobs expose curated cleanup
+paths; related rows remain protected from direct admin deletion.
 """
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from django.contrib import admin
 from django.core.exceptions import PermissionDenied
@@ -25,6 +26,21 @@ from apps.core.admin_base import ReadOnlyModelAdmin, UuidSearchMixin
 from apps.core.enums import EventCategory
 from apps.core.security import set_job_access_cookie
 from apps.operations.models import SystemEvent
+
+_ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR = "_allow_batch_job_cascade_delete"
+
+
+class BatchJobCascadeDeletePermissionMixin:
+    """Permit related-row collection only from BatchJob's curated delete view."""
+
+    def has_delete_permission(
+        self,
+        request: HttpRequest,
+        obj: Model | None = None,
+    ) -> bool:
+        if getattr(request, _ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR, False):
+            return self.has_operate_permission(request)
+        return super().has_delete_permission(request, obj)  # type: ignore[misc]
 
 
 @admin.register(BatchJob)
@@ -89,6 +105,29 @@ class BatchJobAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
             },
         )
         return response
+
+    def has_delete_permission(
+        self,
+        request: HttpRequest,
+        obj: Model | None = None,
+    ) -> bool:
+        return self.has_operate_permission(request)
+
+    def get_deleted_objects(
+        self,
+        objs: list[Model] | QuerySet[Model],
+        request: HttpRequest,
+    ) -> tuple[list[Any], dict[str, int], set[str], list[Any]]:
+        had_attr = hasattr(request, _ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR)
+        previous = getattr(request, _ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR, None)
+        setattr(request, _ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR, True)
+        try:
+            return super().get_deleted_objects(objs, request)
+        finally:
+            if had_attr:
+                setattr(request, _ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR, previous)
+            else:
+                delattr(request, _ALLOW_BATCH_JOB_CASCADE_DELETE_ATTR)
 
     def delete_queryset(
         self,
@@ -192,7 +231,11 @@ class BatchJobAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
 
 
 @admin.register(BatchItem)
-class BatchItemAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
+class BatchItemAdmin(
+    BatchJobCascadeDeletePermissionMixin,
+    UuidSearchMixin,
+    ReadOnlyModelAdmin,
+):
     uuid_search_field = "job_id"
     list_display = ("job", "row_order", "detected_type", "status", "inchikey")
     list_filter = ("status", "detected_type")
@@ -230,7 +273,11 @@ class BatchQuotaEventAdmin(ReadOnlyModelAdmin):
 
 
 @admin.register(ExportArtifact)
-class ExportArtifactAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
+class ExportArtifactAdmin(
+    BatchJobCascadeDeletePermissionMixin,
+    UuidSearchMixin,
+    ReadOnlyModelAdmin,
+):
     uuid_search_field = "job_id"
     list_display = (
         "id",
