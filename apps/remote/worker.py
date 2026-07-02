@@ -434,6 +434,13 @@ class RemoteWorker:
 
             owned = self._with_owned_claim(claim, write_retryable)
             if owned and escalate_to_submit:
+                if not self.circuit.allow():
+                    queue.defer_task(task, delay_seconds=self.lease_seconds)
+                    fanout.mark_items_delayed(
+                        task.inchikey,
+                        message=CIRCUIT_OPEN_MESSAGE,
+                    )
+                    return
                 logger.warning(
                     "entity lookup returned HTTP %s for %s; "
                     "bypassing entity backoff with a structure submit",
