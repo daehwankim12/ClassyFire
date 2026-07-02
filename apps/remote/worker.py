@@ -101,6 +101,18 @@ def _should_escalate_entity_retry_to_submit(
     )
 
 
+def _should_terminalize_entity_retry_as_need_structure(
+    *, has_structure: bool, retry_after: float | None, http_status: int | None
+) -> bool:
+    """Whether a retryable entity response is blocked only by missing structure."""
+    return (
+        not has_structure
+        and retry_after is None
+        and http_status is not None
+        and http_status >= 500
+    )
+
+
 # Provider namespace for the outbox/circuit/rate-bucket rows. Single provider
 # today; kept explicit so the idempotency key and shared state are namespaced.
 PROVIDER = "wishart"
@@ -377,10 +389,18 @@ class RemoteWorker:
             # fresh calculation to /queries.json. Rate limits and explicit
             # Retry-After responses still retry because the provider asked us to
             # wait rather than try a different endpoint.
+            structure = self._structure_for(task)
             escalate_to_submit = _should_escalate_entity_retry_to_submit(
-                has_structure=self._structure_for(task) is not None,
+                has_structure=structure is not None,
                 retry_after=result.retry_after,
                 http_status=result.http_status,
+            )
+            terminalize_need_structure = (
+                _should_terminalize_entity_retry_as_need_structure(
+                    has_structure=structure is not None,
+                    retry_after=result.retry_after,
+                    http_status=result.http_status,
+                )
             )
 
             def write_retryable(locked: RemoteTask) -> None:
@@ -398,6 +418,14 @@ class RemoteWorker:
                 )
                 if escalate_to_submit:
                     return
+                if terminalize_need_structure:
+                    fanout.fan_out_result(
+                        locked.inchikey, BatchItemStatus.NEED_STRUCTURE
+                    )
+                    queue.transition_locked(
+                        locked, TaskState.DONE, lock_owner=None, locked_at=None
+                    )
+                    return
                 if result.retry_after is not None:
                     self.rate_limiter.entity.penalize(result.retry_after)
                     queue.retry_after_override(locked, result.retry_after)
@@ -413,6 +441,13 @@ class RemoteWorker:
                     task.inchikey,
                 )
                 self._submit_batch(task, claim)
+            elif owned and terminalize_need_structure:
+                logger.warning(
+                    "entity lookup returned HTTP %s for %s without a submittable "
+                    "structure; marking NEED_STRUCTURE instead of retrying",
+                    result.http_status,
+                    task.inchikey,
+                )
             elif owned:
                 fanout.mark_items_delayed(task.inchikey)
             return

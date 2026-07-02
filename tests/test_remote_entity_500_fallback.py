@@ -5,7 +5,8 @@ GET for that key fails, forever. Rather than retrying the doomed GET through
 1m/5m/30m backoff windows, the worker escalates a task that HAS a structure to
 a fresh calculation submit (a different endpoint, /queries.json, which can
 succeed where /entities 500s). Rate-limit 429s, explicit Retry-After responses,
-and structureless tasks still just retry.
+and structureless tasks move to NEED_STRUCTURE instead of blocking the remote
+queue on entity backoff.
 
 Style mirrors test_remote_side_effect_fencing: drive ``worker._entity_first``
 directly with an explicit claim, which works on the embedded-PG test harness.
@@ -93,7 +94,7 @@ def _claimed_task(*, with_compound: bool, attempt: int) -> RemoteTask:
         original_input=IK,
         inchikey=IK,
         compound=compound,
-        status=BatchItemStatus.REMOTE_TIMED_OUT,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
     )
     RemoteTask.objects.create(inchikey=IK, compound=compound, state=TaskState.READY)
     task = queue.claim_task("owner-worker")
@@ -134,10 +135,14 @@ def test_entity_500_with_retry_after_retries_without_submit():
     assert task.attempt == 1  # Retry-After still takes precedence.
 
 
-def test_entity_500_without_structure_never_escalates():
+def test_entity_500_without_structure_marks_need_structure():
     task = _claimed_task(with_compound=False, attempt=queue.MAX_ATTEMPTS - 1)
     provider = _provider_returning(500)
 
     _run_entity_first(task, provider)
 
     assert provider.submit_calls == 0
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    item = BatchItem.objects.get(inchikey=IK)
+    assert item.status == BatchItemStatus.NEED_STRUCTURE
