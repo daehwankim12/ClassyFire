@@ -35,6 +35,9 @@ CANCEL_DELETE_TASK_STATES = (
     TaskState.DEFERRED,
 )
 REQUEUE_TIMED_OUT_CHUNK_SIZE = 1_000
+# Keep admin POSTs bounded. Operators commonly requeue one changelist page
+# immediately; larger selections are handed to the durable ingest-worker retry.
+REQUEUE_TIMED_OUT_INLINE_LIMIT = 100
 REMOTE_QUEUE_BACKPRESSURE_MESSAGE = "Remote queue is at capacity; retrying later."
 
 
@@ -52,6 +55,7 @@ class JobAdminOperationResult:
     remote_tasks_skipped_shared: int = 0
     remote_tasks_skipped_leased: int = 0
     items_requeued: int = 0
+    items_deferred: int = 0
     items_skipped_not_timed_out: int = 0
     items_skipped_budget: int = 0
     items_skipped_backpressure: int = 0
@@ -99,6 +103,53 @@ def _bulk_mark_backpressured(
         message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
     )
     return updated, {item.job_id for item in items}, set(item_ids)
+
+
+def _bulk_defer_timed_out_items(
+    item_ids: Sequence[object],
+) -> tuple[int, int, set[uuid.UUID]]:
+    deferred = 0
+    skipped_not_timed_out = 0
+    affected_job_ids: set[uuid.UUID] = set()
+
+    for chunk_ids in _chunks(item_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
+        with transaction.atomic():
+            existing_count = BatchItem.objects.filter(pk__in=chunk_ids).count()
+            retryable_rows = list(
+                BatchItem.objects.filter(
+                    pk__in=chunk_ids,
+                    status=BatchItemStatus.REMOTE_TIMED_OUT,
+                    inchikey__isnull=False,
+                )
+                .exclude(inchikey="")
+                .values_list("pk", "job_id")
+            )
+            retryable_ids = [pk for pk, _job_id in retryable_rows]
+            updated = 0
+            if retryable_ids:
+                updated = BatchItem.objects.filter(
+                    pk__in=retryable_ids,
+                    status=BatchItemStatus.REMOTE_TIMED_OUT,
+                ).update(
+                    status=BatchItemStatus.REMOTE_DELAYED,
+                    message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+                )
+            deferred += updated
+            skipped_not_timed_out += existing_count - updated
+            affected_job_ids.update(job_id for _pk, job_id in retryable_rows)
+
+    return deferred, skipped_not_timed_out, affected_job_ids
+
+
+def _release_jobs_for_remote_retry(job_ids: Iterable[object]) -> None:
+    ids = list(job_ids)
+    if not ids:
+        return
+    BatchJob.objects.filter(pk__in=ids).update(
+        claimed_by=None,
+        claimed_at=None,
+        processing_error=None,
+    )
 
 
 def _collect_artifacts(job_ids: Sequence[object]) -> _CollectedArtifacts:
@@ -432,12 +483,39 @@ def requeue_timed_out_items(
     skipped_not_timed_out = 0
     skipped_budget = 0
     skipped_backpressure = 0
+    deferred = 0
     affected_job_ids: set[uuid.UUID] = set()
     budget_exhausted_principals: set[str] = set()
     queue_backpressured = False
 
+    if len(selected_ids) > REQUEUE_TIMED_OUT_INLINE_LIMIT:
+        deferred, skipped_not_timed_out, affected_job_ids = _bulk_defer_timed_out_items(
+            selected_ids
+        )
+        _release_jobs_for_remote_retry(affected_job_ids)
+        for job_id in affected_job_ids:
+            recompute_job_counters(job_id)
+        result = JobAdminOperationResult(
+            items_deferred=deferred,
+            items_skipped_not_timed_out=skipped_not_timed_out,
+        )
+        _audit(
+            "admin_requeue_timed_out",
+            {
+                "actor": actor,
+                "items_requeued": result.items_requeued,
+                "items_deferred": result.items_deferred,
+                "items_skipped_not_timed_out": result.items_skipped_not_timed_out,
+                "items_skipped_budget": result.items_skipped_budget,
+                "items_skipped_backpressure": result.items_skipped_backpressure,
+                "job_ids": _job_id_strings(affected_job_ids),
+            },
+        )
+        return result
+
     for chunk_ids in _chunks(selected_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
         chunk_affected_job_ids: set[uuid.UUID] = set()
+        chunk_release_job_ids: set[uuid.UUID] = set()
         with transaction.atomic():
             # Lock only BatchItem rows; compound is nullable and joins with LEFT OUTER.
             items = list(
@@ -478,6 +556,7 @@ def requeue_timed_out_items(
                 )
                 skipped_backpressure += updated
                 chunk_affected_job_ids.update(job_ids)
+                chunk_release_job_ids.update(job_ids)
                 backpressured_item_ids.update(item_ids)
 
             for index, item in enumerate(retryable_items):
@@ -514,6 +593,7 @@ def requeue_timed_out_items(
                         )
                         skipped_backpressure += updated
                         chunk_affected_job_ids.update(job_ids)
+                        chunk_release_job_ids.update(job_ids)
                         backpressured_item_ids.update(item_ids)
                         continue
                     active_tasks[item.inchikey] = task
@@ -538,12 +618,14 @@ def requeue_timed_out_items(
                 requeued += 1
                 chunk_affected_job_ids.add(job.pk)
 
+            _release_jobs_for_remote_retry(chunk_release_job_ids)
             for job_id in chunk_affected_job_ids:
                 recompute_job_counters(job_id)
         affected_job_ids.update(chunk_affected_job_ids)
 
     result = JobAdminOperationResult(
         items_requeued=requeued,
+        items_deferred=deferred,
         items_skipped_not_timed_out=skipped_not_timed_out,
         items_skipped_budget=skipped_budget,
         items_skipped_backpressure=skipped_backpressure,
@@ -553,6 +635,7 @@ def requeue_timed_out_items(
         {
             "actor": actor,
             "items_requeued": result.items_requeued,
+            "items_deferred": result.items_deferred,
             "items_skipped_not_timed_out": result.items_skipped_not_timed_out,
             "items_skipped_budget": result.items_skipped_budget,
             "items_skipped_backpressure": result.items_skipped_backpressure,

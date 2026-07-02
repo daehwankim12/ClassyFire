@@ -258,6 +258,7 @@ class BatchItemAdmin(
             request,
             (
                 f"Re-queued {result.items_requeued} item(s); "
+                f"deferred {result.items_deferred} for worker retry; "
                 f"skipped {result.items_skipped_not_timed_out} not-timed-out and "
                 f"{result.items_skipped_budget} over-budget and "
                 f"{result.items_skipped_backpressure} at-capacity."

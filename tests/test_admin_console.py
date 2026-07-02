@@ -931,6 +931,76 @@ def test_requeue_locks_only_batch_items(monkeypatch):
     assert batch_item_lock_kwargs[0]["of"] == ("self",)
 
 
+def test_requeue_large_selection_defers_to_ingest_worker(monkeypatch):
+    from apps.batches.admin_ops import requeue_timed_out_items
+
+    monkeypatch.setattr("apps.batches.admin_ops.REQUEUE_TIMED_OUT_INLINE_LIMIT", 2)
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        processing_state=BatchProcessingState.COMPLETE,
+        claimed_by="previous-worker",
+        claimed_at=timezone.now(),
+        total_count=3,
+        invalid_count=3,
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=inchikey,
+            inchikey=inchikey,
+            status=BatchItemStatus.REMOTE_TIMED_OUT,
+        )
+        for index, inchikey in enumerate((IK1, IK2, IK3))
+    ]
+
+    def unexpected_enqueue(*_args, **_kwargs):
+        raise AssertionError("large admin requeue must defer without enqueueing")
+
+    monkeypatch.setattr(
+        "apps.batches.services._get_or_create_remote_task",
+        unexpected_enqueue,
+    )
+
+    result = requeue_timed_out_items([item.pk for item in items], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_deferred == 3
+    assert result.items_skipped_backpressure == 0
+    assert not RemoteTask.objects.exists()
+    assert list(
+        BatchItem.objects.filter(pk__in=[item.pk for item in items])
+        .order_by("row_order")
+        .values_list("status", "message")
+    ) == [
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+    ]
+    job.refresh_from_db()
+    assert job.status == BatchJobStatus.IN_PROGRESS
+    assert job.processing_state == BatchProcessingState.REMOTE_PENDING
+    assert job.remote_pending_count == 3
+    assert job.invalid_count == 0
+    assert job.completed_at is None
+    assert job.claimed_by is None
+    assert job.claimed_at is None
+    event = SystemEvent.objects.filter(event_type="admin_requeue_timed_out").latest(
+        "created_at"
+    )
+    assert event.payload["items_deferred"] == 3
+
+
 def test_requeue_stops_new_enqueue_attempts_after_backpressure(monkeypatch):
     from apps.batches.admin_ops import requeue_timed_out_items
     from apps.remote.queue import RemoteQueueBackpressure
@@ -1011,6 +1081,57 @@ def test_batchitem_admin_retry_timed_out_action(admin_client):
     item.refresh_from_db()
     assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
     assert SystemEvent.objects.filter(event_type="admin_requeue_timed_out").exists()
+
+
+def test_batchitem_admin_retry_timed_out_action_large_selection_defers(
+    admin_client, monkeypatch
+):
+    monkeypatch.setattr("apps.batches.admin_ops.REQUEUE_TIMED_OUT_INLINE_LIMIT", 2)
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.COMPLETE,
+        processing_state=BatchProcessingState.COMPLETE,
+        total_count=3,
+        invalid_count=3,
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=inchikey,
+            inchikey=inchikey,
+            status=BatchItemStatus.REMOTE_TIMED_OUT,
+        )
+        for index, inchikey in enumerate((IK1, IK2, IK3))
+    ]
+
+    response = admin_client.post(
+        reverse("admin:batches_batchitem_changelist"),
+        {
+            "action": "retry_timed_out",
+            "_selected_action": [str(item.pk) for item in items],
+        },
+    )
+
+    assert response.status_code == 302
+    assert list(
+        BatchItem.objects.filter(pk__in=[item.pk for item in items])
+        .order_by("row_order")
+        .values_list("status", "message")
+    ) == [
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+        (
+            BatchItemStatus.REMOTE_DELAYED,
+            "Remote queue is at capacity; retrying later.",
+        ),
+    ]
 
 
 def test_batchitem_admin_retry_timed_out_action_bulk_parks_when_queue_full(

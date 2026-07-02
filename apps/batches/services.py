@@ -1006,8 +1006,9 @@ def _retry_backpressured_remote_delayed_items(
                 item.save(update_fields=["message"])
             except RemoteQueueBackpressure:
                 # Capacity is still exhausted. Leave the item as the durable
-                # retry record for a later ingest-worker pass.
-                continue
+                # retry record for a later ingest-worker pass. Stop this pass so
+                # large delayed jobs do not scan thousands of rows while full.
+                break
             else:
                 item.status = BatchItemStatus.PENDING_CLASSIFICATION
                 item.message = None

@@ -82,3 +82,57 @@ def test_backpressured_batch_item_is_retried_by_ingest_worker(settings):
     assert item.message is None
     assert job.processing_state == BatchProcessingState.REMOTE_PENDING
     assert RemoteTask.objects.filter(inchikey=item.inchikey, state=TaskState.READY).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_ingest_worker_stops_delayed_retry_after_queue_backpressure(monkeypatch):
+    from apps.batches.models import BatchItem, BatchJob
+    from apps.batches.services import (
+        _retry_backpressured_remote_delayed_items,
+        claim_from_job,
+    )
+    from apps.core.enums import BatchItemStatus, BatchJobStatus, BatchProcessingState
+
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        remote_enabled=True,
+        total_count=3,
+        remote_pending_count=3,
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=key,
+            inchikey=key,
+            status=BatchItemStatus.REMOTE_DELAYED,
+            message="Remote queue is at capacity; retrying later.",
+        )
+        for index, key in enumerate(KEYS[:3])
+    ]
+    enqueue_attempts: list[str] = []
+
+    monkeypatch.setattr(
+        "apps.batches.services.lookup_current_classification",
+        lambda _inchikey: None,
+    )
+
+    def reject_enqueue(inchikey, _compound, *, principal=None, priority=0):
+        enqueue_attempts.append(inchikey)
+        raise RemoteQueueBackpressure("remote queue depth limit reached")
+
+    monkeypatch.setattr(
+        "apps.batches.services._get_or_create_remote_task",
+        reject_enqueue,
+    )
+
+    _retry_backpressured_remote_delayed_items(
+        claim_from_job(job),
+        remote_enabled=True,
+        remote_principal=job.remote_principal,
+        job_priority=job.priority,
+    )
+
+    assert enqueue_attempts == [items[0].inchikey]
