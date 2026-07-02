@@ -8,9 +8,12 @@ Two implementations share one duck-typed interface (a limiter exposes
   token bucket** (one ``remote_rate_buckets`` row per ``(provider, bucket)``):
   tokens are drawn ATOMICALLY with ``UPDATE ... SET tokens = tokens - 1 WHERE
   tokens >= 1 RETURNING`` under a row lock, so N workers across processes
-  respect ONE global rate. Tokens refill lazily from ``refill_rate_per_sec``
-  based on elapsed wall-clock time, capped at ``capacity``. A server
-  ``Retry-After`` parks the bucket (``blocked_until``) with absolute precedence.
+  respect ONE global rate. In production, ``from_settings()`` aliases entity
+  GETs, polls, and submit POSTs to a single ``request`` bucket because Wishart
+  429s on aggregate per-IP traffic. Tokens refill lazily from
+  ``refill_rate_per_sec`` based on elapsed wall-clock time, capped at
+  ``capacity``. A server ``Retry-After`` parks the bucket (``blocked_until``)
+  with absolute precedence.
 
 * :class:`RateLimiter` — the legacy in-process sliding-window limiter, retained
   so tests that inject a deterministic, network-free limiter keep working. It is
@@ -168,7 +171,12 @@ class DbTokenBucket:
 
 
 class DbRateLimiter:
-    """Holds the shared DB-backed entity + submit token buckets."""
+    """Holds DB-backed entity + submit token buckets.
+
+    Direct construction keeps separate buckets for targeted tests and injected
+    limiters. ``from_settings()`` is the production path and deliberately aliases
+    both operations to one request bucket.
+    """
 
     def __init__(
         self,
@@ -196,18 +204,30 @@ class DbRateLimiter:
     def from_settings(cls, provider: str = "wishart") -> DbRateLimiter:
         from django.conf import settings
 
-        return cls(
-            entity_per_min=settings.REMOTE_ENTITY_REQUESTS_PER_MIN,
-            submit_per_min=settings.REMOTE_SUBMITS_PER_MIN,
-            # Pin BOTH burst sizes to 1 so each shared bucket is spent SMOOTHLY at
-            # its refill rate with no catch-up spike: Wishart caps BOTH GET and POST
-            # at ~12/min per IP, so both run at one request per ~5s instead of
-            # bursting a whole minute's budget at once (which trips 429 + long
-            # Retry-After parks).
-            entity_capacity=1,
-            submit_capacity=1,
+        request_per_min = min(
+            settings.REMOTE_ENTITY_REQUESTS_PER_MIN,
+            settings.REMOTE_SUBMITS_PER_MIN,
+        )
+        # Wishart's live 429 behaviour is IP-wide in practice: entity GETs,
+        # query polls, and query POSTs all draw from the same upstream allowance.
+        # Use one shared bucket so a POST cannot race past GET/poll traffic and
+        # push the aggregate request rate over the provider cap.
+        request_bucket = DbTokenBucket(
+            "request",
+            capacity=1,
+            refill_per_min=request_per_min,
             provider=provider,
         )
+        limiter = cls(
+            entity_per_min=0,
+            submit_per_min=0,
+            entity_capacity=0,
+            submit_capacity=0,
+            provider=provider,
+        )
+        limiter.entity = request_bucket
+        limiter.submit = request_bucket
+        return limiter
 
 
 # ---------------------------------------------------------------------------

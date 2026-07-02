@@ -1313,15 +1313,11 @@ class RemoteWorker:
             fanout.mark_items_delayed(task.inchikey)
             return
 
-        # Deliberate: polls draw from the entity bucket rather than a dedicated
-        # poll budget. A poll is a cheap GET against the same host as an entity
-        # lookup, and submit (the expensive, separately-budgeted call) already
-        # gates how many polls can ever exist — every poll corresponds to an
-        # earlier submit. Poll volume is therefore bounded by the submit budget,
-        # and a parked poll simply re-parks in POLL_WAIT (no retry counted), so
-        # sharing the entity bucket cannot starve fresh entity lookups in
-        # practice. A dedicated poll bucket is deferred until poll volume is
-        # shown to crowd out entity lookups under real load.
+        # Polls use the same limiter handle as entity GETs. In production,
+        # DbRateLimiter.from_settings aliases entity GETs, polls, and submit
+        # POSTs to one upstream "request" bucket because Wishart 429s on
+        # aggregate per-IP traffic. Injected test limiters may still model
+        # separate entity/submit buckets.
         if not self.rate_limiter.entity.allow():
             queue.transition(
                 task,
