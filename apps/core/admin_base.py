@@ -1,12 +1,13 @@
 """Shared admin building blocks for the read-only operations console.
 
-The whole admin surface is a *console*: operators inspect durable state and
-trigger a small, curated set of audited operational actions. Direct row
-editing is forbidden everywhere because many tables are append-only / immutable
-by contract (classification events, the live pointer, system events, remote
-attempt logs, audit signatures); letting the admin mutate them would break
-those invariants. :class:`ReadOnlyModelAdmin` enforces that uniformly. The
-curated mutating actions are NOT left open to any viewer: they declare
+The whole admin surface is a *console*: operators inspect durable state, delete
+rows when cleanup is required, and trigger a small, curated set of audited
+operational actions. Direct row editing is forbidden everywhere because many
+tables are append-only / immutable by contract (classification events, the live
+pointer, system events, remote attempt logs, audit signatures); letting the
+admin mutate them would break those invariants. :class:`ReadOnlyModelAdmin`
+enforces that uniformly for add/change. The curated mutating actions are NOT
+left open to any viewer: they declare
 ``permissions=("operate",)`` so Django gates them on
 :meth:`ReadOnlyModelAdmin.has_operate_permission` (superuser-only), and the
 custom pause/resume views enforce the same check — a view-only operator can
@@ -23,12 +24,14 @@ from django.http import HttpRequest
 
 
 class ReadOnlyModelAdmin(admin.ModelAdmin):
-    """A :class:`~django.contrib.admin.ModelAdmin` that forbids all mutation.
+    """A :class:`~django.contrib.admin.ModelAdmin` that forbids row editing.
 
-    Add / change / delete are denied; every concrete field is rendered
-    read-only so the detail view is immutable too. ``show_full_result_count``
-    is disabled so the changelist never runs an unbounded ``COUNT(*)`` over a
-    large table. Subclasses keep view, search, filter, and registered actions.
+    Add / change are denied; delete is available only to superusers so Django's
+    native deletion collector can cascade related rows. Every concrete field is
+    rendered read-only so the detail view is immutable too.
+    ``show_full_result_count`` is disabled so the changelist never runs an
+    unbounded ``COUNT(*)`` over a large table. Subclasses keep view, search,
+    filter, and registered actions.
     """
 
     show_full_result_count = False
@@ -44,7 +47,7 @@ class ReadOnlyModelAdmin(admin.ModelAdmin):
     def has_delete_permission(
         self, request: HttpRequest, obj: Model | None = None
     ) -> bool:
-        return False
+        return self.has_operate_permission(request)
 
     def get_readonly_fields(
         self, request: HttpRequest, obj: Model | None = None
@@ -54,12 +57,10 @@ class ReadOnlyModelAdmin(admin.ModelAdmin):
     def has_operate_permission(self, request: HttpRequest) -> bool:
         """Permission gate for the curated mutating admin actions.
 
-        Row editing stays forbidden via ``has_change_permission=False``; the
-        operational actions instead declare ``permissions=("operate",)`` so
-        Django filters them out unless this returns True. Restricted to
-        superusers — triggering state changes (pausing remote, retrying tasks,
-        resetting provider auth, recomputing counters, failing submissions) is
-        an admin-only capability, never available to a view-only operator.
+        Row editing stays forbidden via ``has_change_permission=False``; native
+        row deletion and the operational actions are restricted to superusers.
+        Actions declare ``permissions=("operate",)`` so Django filters them out
+        unless this returns True.
         """
         return bool(request.user.is_active and request.user.is_superuser)
 

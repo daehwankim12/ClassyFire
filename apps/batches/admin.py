@@ -1,7 +1,7 @@
 """Admin registration for batch jobs, items, quota events, and exports.
 
-All read-only. ``BatchJobAdmin`` exposes one audited operational action —
-recomputing the denormalised job counters from the item rows.
+Rows are inspection-only for add/change. Superusers can delete rows and run
+curated operational actions such as counter recomputation and job cleanup.
 """
 from __future__ import annotations
 
@@ -50,13 +50,6 @@ class BatchJobAdmin(UuidSearchMixin, ReadOnlyModelAdmin):
         "set_high_priority",
         "reset_priority",
     )
-
-    def has_delete_permission(
-        self,
-        request: HttpRequest,
-        obj: Model | None = None,
-    ) -> bool:
-        return self.has_operate_permission(request)
 
     def get_urls(self) -> list[URLPattern]:
         custom: list[URLPattern] = [

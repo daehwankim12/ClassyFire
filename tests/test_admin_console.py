@@ -1,10 +1,12 @@
-"""Tests for the read-only Django admin operations console.
+"""Tests for the inspection-only Django admin operations console.
 
-Covers: every target model is registered and read-only; each changelist loads;
-the curated operational actions perform the right (and only the right) state
-transitions and emit SystemEvent audit rows; immutability is enforced.
+Covers: every target model is registered; add/change stay blocked; superusers
+can delete rows; each changelist loads; curated operational actions perform the
+right state transitions and emit SystemEvent audit rows.
 """
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 from django.contrib import admin
@@ -69,6 +71,15 @@ IK2 = "CCCCCCCCCCCCCC-DDDDDDDDDD-N"
 IK3 = "EEEEEEEEEEEEEE-FFFFFFFFFF-N"
 
 
+def _admin_user(*, is_superuser: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        is_active=True,
+        is_staff=True,
+        is_superuser=is_superuser,
+        has_perm=lambda _perm: is_superuser,
+    )
+
+
 # --------------------------------------------------------------------------
 # Registration & read-only contract
 # --------------------------------------------------------------------------
@@ -78,33 +89,23 @@ def test_all_target_models_registered():
         assert model in admin.site._registry, f"{model.__name__} not registered"
 
 
-def test_all_registered_admins_block_add_and_change(rf, django_user_model):
+def test_all_registered_admins_block_add_and_change(rf):
     request = rf.get("/admin/")
-    request.user = django_user_model(is_superuser=True, is_staff=True, is_active=True)
+    request.user = _admin_user(is_superuser=True)
     for model in REGISTERED_MODELS:
         model_admin = admin.site._registry[model]
         assert model_admin.has_add_permission(request) is False
         assert model_admin.has_change_permission(request) is False
 
 
-def test_registered_admins_allow_native_delete_only_for_batch_jobs(
-    rf, django_user_model
-):
+def test_registered_admins_allow_native_delete_only_for_superusers(rf):
     super_request = rf.get("/admin/")
-    super_request.user = django_user_model(
-        is_superuser=True,
-        is_staff=True,
-        is_active=True,
-    )
+    super_request.user = _admin_user(is_superuser=True)
     staff_request = rf.get("/admin/")
-    staff_request.user = django_user_model(
-        is_superuser=False,
-        is_staff=True,
-        is_active=True,
-    )
+    staff_request.user = _admin_user(is_superuser=False)
     for model in REGISTERED_MODELS:
         model_admin = admin.site._registry[model]
-        assert model_admin.has_delete_permission(super_request) is (model is BatchJob)
+        assert model_admin.has_delete_permission(super_request) is True
         assert model_admin.has_delete_permission(staff_request) is False
 
 
@@ -448,6 +449,30 @@ def test_batchjob_admin_cancel_and_delete_action(admin_client):
     assert not BatchJob.objects.filter(pk=job.pk).exists()
     assert not RemoteTask.objects.filter(pk=task.pk).exists()
     assert SystemEvent.objects.filter(event_type="admin_cancel_delete_jobs").exists()
+
+
+def test_batchjob_admin_delete_view_allows_related_batch_items(admin_client):
+    job = BatchJob.objects.create(secret_hash="x")
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    url = reverse("admin:batches_batchjob_delete", args=[job.pk])
+
+    confirmation = admin_client.get(url)
+
+    assert confirmation.status_code == 200
+    assert confirmation.context["perms_lacking"] == set()
+
+    response = admin_client.post(url, {"post": "yes"})
+
+    assert response.status_code == 302
+    assert not BatchJob.objects.filter(pk=job.pk).exists()
+    assert not BatchItem.objects.filter(pk=item.pk).exists()
+    assert SystemEvent.objects.filter(event_type="admin_delete_jobs").exists()
 
 
 def test_batchjob_admin_open_result_sets_cookie_and_redirects(admin_client):
