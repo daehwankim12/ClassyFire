@@ -25,7 +25,6 @@ from apps.core.enums import EventCategory, SubmissionState, TaskState
 from apps.operations.admin_views import is_remote_paused, pause_remote, resume_remote
 from apps.operations.models import SystemEvent
 from apps.remote.models import (
-    ManualClassificationOverride,
     RemoteAttempt,
     RemoteBudgetLedger,
     RemoteCircuit,
@@ -319,62 +318,6 @@ class RemoteNegativeCacheAdmin(ReadOnlyModelAdmin):
             f"Queued {queued} Wishart recheck task(s); skipped {skipped_full} at capacity.",
             level=messages.WARNING if skipped_full else messages.INFO,
         )
-
-
-@admin.register(ManualClassificationOverride)
-class ManualClassificationOverrideAdmin(admin.ModelAdmin):
-    list_display = ("inchikey", "negative_cache", "actor", "updated_at")
-    list_filter = ("actor",)
-    search_fields = ("inchikey", "admin_note")
-    readonly_fields = ("inchikey", "created_at", "updated_at")
-    fields = (
-        "negative_cache",
-        "inchikey",
-        "labels",
-        "raw_payload",
-        "classification_version",
-        "source_ref",
-        "actor",
-        "admin_note",
-        "created_at",
-        "updated_at",
-    )
-
-    def has_add_permission(self, request: HttpRequest) -> bool:
-        return bool(request.user.is_active and request.user.is_superuser)
-
-    def has_change_permission(
-        self, request: HttpRequest, obj: ManualClassificationOverride | None = None
-    ) -> bool:
-        return bool(request.user.is_active and request.user.is_superuser)
-
-    def has_delete_permission(
-        self, request: HttpRequest, obj: ManualClassificationOverride | None = None
-    ) -> bool:
-        return bool(request.user.is_active and request.user.is_superuser)
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == "negative_cache":
-            kwargs["queryset"] = RemoteNegativeCache.objects.filter(
-                state=RemoteNegativeCache.State.HARD_FAILED
-            ).order_by("inchikey")
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
-
-    def save_model(
-        self,
-        request: HttpRequest,
-        obj: ManualClassificationOverride,
-        form,
-        change: bool,
-    ) -> None:
-        if obj.negative_cache.state != RemoteNegativeCache.State.HARD_FAILED:
-            raise PermissionDenied(
-                "Manual fallback can only be saved for HARD_FAILED negative cache rows."
-            )
-        obj.inchikey = obj.negative_cache.inchikey
-        if not obj.actor:
-            obj.actor = request.user.get_username()
-        super().save_model(request, obj, form, change)
 
 
 @admin.register(RemoteRateBucket)

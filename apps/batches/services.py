@@ -97,8 +97,6 @@ from apps.remote.models import RemoteTask
 from apps.remote.negative_cache import (
     NEGATIVE_HARD_FAILED_MESSAGE,
     hard_negative_inchikeys,
-    lookup_manual_fallback,
-    lookup_manual_fallbacks,
 )
 from apps.remote.queue import RemoteQueueBackpressure
 
@@ -570,7 +568,6 @@ def _process_item(
         if lookup_override is _NO_LOOKUP_OVERRIDE:
             result = lookup_current_classification(norm.inchikey)
             if result is None:
-                result = lookup_manual_fallback(norm.inchikey)
                 negative_blocked = norm.inchikey in hard_negative_inchikeys(
                     [norm.inchikey]
                 )
@@ -893,10 +890,7 @@ def _prepare_chunk(items: list[BatchItem]) -> list[PreparedItem]:
     # Pass 2: ONE bulk lookup for the whole chunk (kills the per-item N+1).
     lookups = lookup_current_classifications(candidate_keys)
     unresolved_keys = [key for key in dict.fromkeys(candidate_keys) if key not in lookups]
-    manual_lookups = lookup_manual_fallbacks(unresolved_keys)
-    hard_negatives = hard_negative_inchikeys(
-        key for key in unresolved_keys if key not in manual_lookups
-    )
+    hard_negatives = hard_negative_inchikeys(unresolved_keys)
 
     prepared: list[PreparedItem] = []
     for item in items:
@@ -908,9 +902,7 @@ def _prepare_chunk(items: list[BatchItem]) -> list[PreparedItem]:
             and len(row_norm.inchikey) == 27
             and row_norm.error is None
         ):
-            override = lookups.get(row_norm.inchikey) or manual_lookups.get(
-                row_norm.inchikey
-            )
+            override = lookups.get(row_norm.inchikey)
         prepared.append(
             PreparedItem(
                 item_id=item.id,
@@ -1019,14 +1011,6 @@ def _retry_backpressured_remote_delayed_items(
         for item in items:
             inchikey = cast(str, item.inchikey)
             result = lookup_current_classification(inchikey)
-            if result is not None:
-                item.classification_snapshot = classification_lookup_snapshot(result)
-                _pin_resolved_classification(item, item.classification_snapshot)
-                item.status = BatchItemStatus.FOUND_LIVE_CACHE
-                item.message = None
-                item.save(update_fields=_ITEM_UPDATE_FIELDS)
-                continue
-            result = lookup_manual_fallback(inchikey)
             if result is not None:
                 item.classification_snapshot = classification_lookup_snapshot(result)
                 _pin_resolved_classification(item, item.classification_snapshot)

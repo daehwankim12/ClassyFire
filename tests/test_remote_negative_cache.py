@@ -41,7 +41,7 @@ def test_negative_cache_hard_fails_after_three_remote_failures():
     assert cached.last_http_status == 500
 
 
-def test_hard_negative_without_manual_fallback_finishes_new_rows_without_remote_task():
+def test_hard_negative_finishes_new_rows_without_remote_task():
     from apps.remote.negative_cache import record_negative_failure
 
     for _ in range(3):
@@ -55,72 +55,32 @@ def test_hard_negative_without_manual_fallback_finishes_new_rows_without_remote_
     assert not RemoteTask.objects.filter(inchikey=IK).exclude(state=TaskState.DONE).exists()
 
 
-def test_manual_fallback_resolves_hard_negative_without_writing_live_cache():
-    from apps.classifications.models import ClassyfireLive
-    from apps.remote.models import ManualClassificationOverride, RemoteNegativeCache
-    from apps.remote.negative_cache import create_manual_fallback, record_negative_failure
-
-    for _ in range(3):
-        record_negative_failure(IK, operation="SUBMIT", http_status=500, detail="failed")
-    negative = RemoteNegativeCache.objects.get(inchikey=IK)
-    create_manual_fallback(
-        negative,
-        labels={"kingdom": {"chemont_id": None, "name": "Manual Kingdom"}},
-        actor="admin",
-        admin_note="temporary curation",
-    )
-
-    job, _secret = create_job([_row()], remote_enabled=True)
-
-    item = BatchItem.objects.get(job=job)
-    assert item.status == BatchItemStatus.FOUND_LIVE_CACHE
-    assert item.classification_snapshot["source_type"] == "ADMIN_MANUAL_FALLBACK"
-    assert item.classification_snapshot["kingdom"]["name"] == "Manual Kingdom"
-    assert item.resolved_classification_id is None
-    assert ManualClassificationOverride.objects.filter(inchikey=IK).exists()
-    assert not ClassyfireLive.objects.filter(inchikey=IK).exists()
-
-
-def test_mark_resolved_without_wishart_live_keeps_manual_fallback():
-    from apps.remote.models import ManualClassificationOverride, RemoteNegativeCache
+def test_mark_resolved_without_wishart_live_keeps_negative_hard_failed():
+    from apps.remote.models import RemoteNegativeCache
     from apps.remote.negative_cache import (
-        create_manual_fallback,
         mark_negative_resolved_from_wishart,
         record_negative_failure,
     )
 
     for _ in range(3):
         record_negative_failure(IK, operation="SUBMIT", http_status=500, detail="failed")
-    negative = RemoteNegativeCache.objects.get(inchikey=IK)
-    create_manual_fallback(
-        negative,
-        labels={"kingdom": {"chemont_id": None, "name": "Manual Kingdom"}},
-        actor="admin",
-    )
 
     mark_negative_resolved_from_wishart(IK)
 
+    negative = RemoteNegativeCache.objects.get(inchikey=IK)
     negative.refresh_from_db()
     assert negative.state == RemoteNegativeCache.State.HARD_FAILED
-    assert ManualClassificationOverride.objects.filter(inchikey=IK).exists()
 
 
-def test_wishart_live_result_resolves_negative_cache_and_deletes_manual_fallback():
-    from apps.remote.models import ManualClassificationOverride, RemoteNegativeCache
+def test_wishart_live_result_resolves_negative_cache():
+    from apps.remote.models import RemoteNegativeCache
     from apps.remote.negative_cache import (
-        create_manual_fallback,
         mark_negative_resolved_from_wishart,
         record_negative_failure,
     )
 
     for _ in range(3):
         record_negative_failure(IK, operation="SUBMIT", http_status=500, detail="failed")
-    negative = RemoteNegativeCache.objects.get(inchikey=IK)
-    create_manual_fallback(
-        negative,
-        labels={"kingdom": {"chemont_id": None, "name": "Manual Kingdom"}},
-        actor="admin",
-    )
     ClassyfireLive.objects.create(
         inchikey=IK,
         source_type=SourceType.WISHART_LIVE_QUERY,
@@ -131,9 +91,9 @@ def test_wishart_live_result_resolves_negative_cache_and_deletes_manual_fallback
 
     mark_negative_resolved_from_wishart(IK)
 
+    negative = RemoteNegativeCache.objects.get(inchikey=IK)
     negative.refresh_from_db()
     assert negative.state == RemoteNegativeCache.State.RESOLVED
-    assert not ManualClassificationOverride.objects.filter(inchikey=IK).exists()
 
 
 def test_resolved_negative_restarts_failure_count_on_new_failure():
@@ -227,22 +187,14 @@ def test_worker_submit_failure_hard_fails_on_third_negative_count():
     assert BatchItem.objects.get(inchikey=IK).status == BatchItemStatus.REMOTE_TIMED_OUT
 
 
-def test_worker_wishart_success_deletes_manual_fallback():
-    from apps.remote.models import ManualClassificationOverride, RemoteNegativeCache
-    from apps.remote.negative_cache import create_manual_fallback, record_negative_failure
+def test_worker_wishart_success_resolves_negative_cache():
+    from apps.remote.models import RemoteNegativeCache
+    from apps.remote.negative_cache import record_negative_failure
     from apps.remote.provider import ChemOntSlot, NormalizedClassification
 
     for _ in range(3):
         record_negative_failure(IK, operation="SUBMIT", http_status=500, detail="failed")
     negative = RemoteNegativeCache.objects.get(inchikey=IK)
-    create_manual_fallback(
-        negative,
-        labels={"kingdom": {"chemont_id": None, "name": "Manual Kingdom"}},
-        actor="admin",
-    )
-    manual_job, _secret = create_job([_row()], remote_enabled=True)
-    manual_item = BatchItem.objects.get(job=manual_job)
-    assert manual_item.classification_snapshot["source_type"] == "ADMIN_MANUAL_FALLBACK"
     task = _claimed_structure_task()
     norm = NormalizedClassification(
         inchikey=IK,
@@ -260,12 +212,7 @@ def test_worker_wishart_success_deletes_manual_fallback():
         circuit=_ClosedCircuit(),
     )
 
-    worker.apply_fenced_result_for_test(task, norm, remote_query_id="manual-cleanup")
+    worker.apply_fenced_result_for_test(task, norm, remote_query_id="negative-cleanup")
 
     negative.refresh_from_db()
     assert negative.state == RemoteNegativeCache.State.RESOLVED
-    assert not ManualClassificationOverride.objects.filter(inchikey=IK).exists()
-    manual_item.refresh_from_db()
-    assert manual_item.classification_snapshot["source_type"] == "WISHART_LIVE_QUERY"
-    assert manual_item.classification_snapshot["kingdom"]["name"] == "Wishart Kingdom"
-    assert manual_item.resolved_classification_id is not None

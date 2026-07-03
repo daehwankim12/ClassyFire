@@ -10,9 +10,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from django.apps import apps
 from django.contrib import admin
 from django.contrib.admin.options import ModelAdmin
-from django.core.exceptions import PermissionDenied
 from django.urls import reverse
 from django.utils import timezone
 
@@ -39,7 +39,6 @@ from apps.core.models import LoginThrottle
 from apps.operations.admin_views import is_remote_paused
 from apps.operations.models import AuditSignature, SystemEvent
 from apps.remote.models import (
-    ManualClassificationOverride,
     RemoteAttempt,
     RemoteBudgetLedger,
     RemoteCircuit,
@@ -64,7 +63,7 @@ REGISTERED_MODELS = [
     RemoteTask, RemoteQuery, RemoteQueryItem, RemoteSubmission,
     RemoteSubmissionMember, RemoteAttempt, RemoteCircuit, RemoteRateBucket,
     RemoteProviderControl, RemoteBudgetLedger, RemotePrincipalState,
-    RemoteQueueControl, RemoteNegativeCache, ManualClassificationOverride,
+    RemoteQueueControl, RemoteNegativeCache,
     ClassificationResult, ClassyfireLive, ClassificationHistory,
     SourceArtifact,
     SystemEvent, AuditSignature,
@@ -97,14 +96,18 @@ def test_all_target_models_registered():
         assert model in admin.site._registry, f"{model.__name__} not registered"
 
 
+def test_manual_classification_override_model_is_not_exposed():
+    with pytest.raises(LookupError):
+        apps.get_model("remote", "ManualClassificationOverride")
+
+
 def test_all_registered_admins_block_add_and_change(rf):
     request = rf.get("/admin/")
     request.user = _admin_user(is_superuser=True)
     for model in REGISTERED_MODELS:
         model_admin = admin.site._registry[model]
-        expected = model is ManualClassificationOverride
-        assert model_admin.has_add_permission(request) is expected
-        assert model_admin.has_change_permission(request) is expected
+        assert model_admin.has_add_permission(request) is False
+        assert model_admin.has_change_permission(request) is False
 
 
 def test_registered_admins_deny_native_delete_except_batchjob_cleanup(rf):
@@ -114,41 +117,9 @@ def test_registered_admins_deny_native_delete_except_batchjob_cleanup(rf):
     staff_request.user = _admin_user(is_superuser=False)
     for model in REGISTERED_MODELS:
         model_admin = admin.site._registry[model]
-        expected_superuser_delete = model in (BatchJob, ManualClassificationOverride)
+        expected_superuser_delete = model is BatchJob
         assert model_admin.has_delete_permission(super_request) is expected_superuser_delete
         assert model_admin.has_delete_permission(staff_request) is False
-
-
-def test_manual_override_admin_only_allows_hard_failed_negative_rows(rf):
-    model_admin = admin.site._registry[ManualClassificationOverride]
-    request = rf.post("/admin/remote/manualclassificationoverride/add/")
-    request.user = _admin_user(is_superuser=True)
-    candidate = RemoteNegativeCache.objects.create(inchikey=IK1)
-    hard_failed = RemoteNegativeCache.objects.create(
-        inchikey=IK2,
-        state=RemoteNegativeCache.State.HARD_FAILED,
-        failure_count=3,
-    )
-
-    forbidden = ManualClassificationOverride(
-        negative_cache=candidate,
-        inchikey=candidate.inchikey,
-        labels={},
-        actor="admin",
-    )
-    with pytest.raises(PermissionDenied):
-        model_admin.save_model(request, forbidden, form=None, change=False)
-
-    allowed = ManualClassificationOverride(
-        negative_cache=hard_failed,
-        labels={"kingdom": {"name": "Manual Kingdom"}},
-        actor="",
-    )
-    model_admin.save_model(request, allowed, form=None, change=False)
-
-    allowed.refresh_from_db()
-    assert allowed.inchikey == IK2
-    assert allowed.actor == "admin"
 
 
 def test_batchjob_related_admins_allow_delete_only_inside_job_cascade(rf):

@@ -706,44 +706,6 @@ class RemoteNegativeCache(models.Model):
         return f"negative:{self.inchikey} ({self.state})"
 
 
-class ManualClassificationOverride(models.Model):
-    """Admin-provided fallback data for a negative-cache InChIKey.
-
-    This table deliberately does not write to ``classyfire_live``. It is an
-    operational fallback used only while Wishart has no verified result.
-    """
-
-    negative_cache = models.ForeignKey(
-        RemoteNegativeCache,
-        on_delete=models.CASCADE,
-        related_name="manual_overrides",
-    )
-    inchikey = models.CharField(max_length=27, unique=True)
-    labels = models.JSONField(
-        default=dict,
-        help_text="Classification labels in snapshot shape.",
-    )
-    raw_payload = models.JSONField(null=True, blank=True)
-    classification_version = models.TextField(null=True, blank=True)
-    source_ref = models.TextField(null=True, blank=True)
-    actor = models.CharField(max_length=150)
-    admin_note = models.TextField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "manual_classification_overrides"
-        constraints = [
-            models.CheckConstraint(
-                name="manual_override_inchikey_format",
-                condition=Q(inchikey__regex=INCHIKEY_REGEX),
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"manual-fallback:{self.inchikey}"
-
-
 class RemoteProviderControl(models.Model):
     """Durable operator-controlled gate for a remote provider (one row each).
 
