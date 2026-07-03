@@ -1093,15 +1093,28 @@ def test_retryable_error_schedules_retry_with_backoff():
 
 
 def test_retry_after_header_takes_precedence():
+    from apps.remote.provider import EntityLookupResult, EntityLookupStatus
+
+    class RetryAfter429Provider(MockProvider):
+        def lookup_entity(self, inchikey: str) -> EntityLookupResult:
+            self.entity_calls.append(inchikey)
+            return EntityLookupResult(
+                status=EntityLookupStatus.RETRYABLE_ERROR,
+                inchikey=inchikey,
+                retry_after=600.0,
+                http_status=429,
+                detail="simulated 429",
+            )
+
     queue.enqueue_task(IK_A)
-    provider = MockProvider(entity_retryable_for={IK_A}, entity_retry_after=600.0)
+    provider = RetryAfter429Provider()
     worker = _worker(provider)
     worker.tick()
 
     task = RemoteTask.objects.get(inchikey=IK_A)
     assert task.state == TaskState.RETRY_WAIT
     delta = (task.next_run_at - timezone.now()).total_seconds()
-    # ~600s, NOT the 60s first-backoff: server Retry-After wins.
+    # ~600s, NOT the 60s first-backoff: rate-limit Retry-After wins.
     assert 590 < delta < 610
 
 

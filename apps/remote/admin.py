@@ -25,9 +25,11 @@ from apps.core.enums import EventCategory, SubmissionState, TaskState
 from apps.operations.admin_views import is_remote_paused, pause_remote, resume_remote
 from apps.operations.models import SystemEvent
 from apps.remote.models import (
+    ManualClassificationOverride,
     RemoteAttempt,
     RemoteBudgetLedger,
     RemoteCircuit,
+    RemoteNegativeCache,
     RemotePrincipalState,
     RemoteProviderControl,
     RemoteQuery,
@@ -38,6 +40,8 @@ from apps.remote.models import (
     RemoteSubmissionMember,
     RemoteTask,
 )
+from apps.remote.negative_cache import reset_negative_for_recheck
+from apps.remote.queue import RemoteQueueBackpressure, enqueue_task
 from apps.remote.services import fail_unknown_submission, reset_provider_auth
 
 # States safe to force back to READY: parked, not held by any worker. In-flight
@@ -264,6 +268,113 @@ class RemoteCircuitAdmin(ReadOnlyModelAdmin):
         "updated_at",
     )
     list_filter = ("state",)
+
+
+@admin.register(RemoteNegativeCache)
+class RemoteNegativeCacheAdmin(ReadOnlyModelAdmin):
+    list_display = (
+        "inchikey",
+        "state",
+        "failure_count",
+        "last_failure_operation",
+        "last_http_status",
+        "last_failed_at",
+        "updated_at",
+    )
+    list_filter = ("state", "last_failure_operation")
+    search_fields = ("inchikey", "last_detail")
+    actions = ("recheck_with_wishart",)
+
+    @admin.action(
+        description="Recheck selected negative-cache keys with Wishart",
+        permissions=("operate",),
+    )
+    def recheck_with_wishart(
+        self, request: HttpRequest, queryset: QuerySet[RemoteNegativeCache]
+    ) -> None:
+        actor = request.user.get_username()
+        queued = 0
+        skipped_full = 0
+        for negative in queryset:
+            reset_negative_for_recheck(negative, actor=actor)
+            try:
+                task = enqueue_task(negative.inchikey, principal="admin-recheck")
+            except RemoteQueueBackpressure:
+                skipped_full += 1
+                continue
+            if task is not None:
+                queued += 1
+        SystemEvent.objects.create(
+            category=EventCategory.REMOTE,
+            event_type="negative_cache_recheck_requested",
+            payload={
+                "actor": actor,
+                "selected": queryset.count(),
+                "queued": queued,
+                "skipped_full": skipped_full,
+            },
+        )
+        self.message_user(
+            request,
+            f"Queued {queued} Wishart recheck task(s); skipped {skipped_full} at capacity.",
+            level=messages.WARNING if skipped_full else messages.INFO,
+        )
+
+
+@admin.register(ManualClassificationOverride)
+class ManualClassificationOverrideAdmin(admin.ModelAdmin):
+    list_display = ("inchikey", "negative_cache", "actor", "updated_at")
+    list_filter = ("actor",)
+    search_fields = ("inchikey", "admin_note")
+    readonly_fields = ("inchikey", "created_at", "updated_at")
+    fields = (
+        "negative_cache",
+        "inchikey",
+        "labels",
+        "raw_payload",
+        "classification_version",
+        "source_ref",
+        "actor",
+        "admin_note",
+        "created_at",
+        "updated_at",
+    )
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return bool(request.user.is_active and request.user.is_superuser)
+
+    def has_change_permission(
+        self, request: HttpRequest, obj: ManualClassificationOverride | None = None
+    ) -> bool:
+        return bool(request.user.is_active and request.user.is_superuser)
+
+    def has_delete_permission(
+        self, request: HttpRequest, obj: ManualClassificationOverride | None = None
+    ) -> bool:
+        return bool(request.user.is_active and request.user.is_superuser)
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "negative_cache":
+            kwargs["queryset"] = RemoteNegativeCache.objects.filter(
+                state=RemoteNegativeCache.State.HARD_FAILED
+            ).order_by("inchikey")
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def save_model(
+        self,
+        request: HttpRequest,
+        obj: ManualClassificationOverride,
+        form,
+        change: bool,
+    ) -> None:
+        if obj.negative_cache.state != RemoteNegativeCache.State.HARD_FAILED:
+            raise PermissionDenied(
+                "Manual fallback can only be saved for HARD_FAILED negative cache rows."
+            )
+        obj.inchikey = obj.negative_cache.inchikey
+        if not obj.actor:
+            obj.actor = request.user.get_username()
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(RemoteRateBucket)

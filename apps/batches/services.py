@@ -94,6 +94,12 @@ from apps.core.security import MAX_STRUCTURE_LEN, RowTooLongError, check_structu
 from apps.remote import queue as remote_queue
 from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
 from apps.remote.models import RemoteTask
+from apps.remote.negative_cache import (
+    NEGATIVE_HARD_FAILED_MESSAGE,
+    hard_negative_inchikeys,
+    lookup_manual_fallback,
+    lookup_manual_fallbacks,
+)
 from apps.remote.queue import RemoteQueueBackpressure
 
 # Shown for a bare NON-STANDARD InChIKey input: it cannot be matched against the
@@ -487,6 +493,7 @@ def _process_item(
     job_priority: int = 0,
     lookup_override: object = _NO_LOOKUP_OVERRIDE,
     norm_override: object = _NO_LOOKUP_OVERRIDE,
+    negative_blocked: bool = False,
 ) -> BatchItemStatus:
     """Normalize + local lookup for a single item.  Returns the final status.
 
@@ -562,12 +569,20 @@ def _process_item(
         result: ClassificationLookupResult | None
         if lookup_override is _NO_LOOKUP_OVERRIDE:
             result = lookup_current_classification(norm.inchikey)
+            if result is None:
+                result = lookup_manual_fallback(norm.inchikey)
+                negative_blocked = norm.inchikey in hard_negative_inchikeys(
+                    [norm.inchikey]
+                )
         else:
             result = cast("ClassificationLookupResult | None", lookup_override)
         if result is not None:
             item.classification_snapshot = classification_lookup_snapshot(result)
             _pin_resolved_classification(item, item.classification_snapshot)
             return BatchItemStatus.FOUND_LIVE_CACHE
+        if negative_blocked:
+            item.message = NEGATIVE_HARD_FAILED_MESSAGE
+            return BatchItemStatus.REMOTE_TIMED_OUT
 
         # Step 4: Local miss — create/reuse structure only if one was supplied.
         has_structure = norm.detected_type != DetectedInputType.INCHIKEY
@@ -793,6 +808,7 @@ class PreparedItem:
     item_id: int
     norm: NormalizedRow | None
     lookup: object
+    negative_blocked: bool = False
 
 
 def claim_from_job(job: BatchJob) -> IngestJobClaim:
@@ -876,6 +892,11 @@ def _prepare_chunk(items: list[BatchItem]) -> list[PreparedItem]:
 
     # Pass 2: ONE bulk lookup for the whole chunk (kills the per-item N+1).
     lookups = lookup_current_classifications(candidate_keys)
+    unresolved_keys = [key for key in dict.fromkeys(candidate_keys) if key not in lookups]
+    manual_lookups = lookup_manual_fallbacks(unresolved_keys)
+    hard_negatives = hard_negative_inchikeys(
+        key for key in unresolved_keys if key not in manual_lookups
+    )
 
     prepared: list[PreparedItem] = []
     for item in items:
@@ -887,8 +908,19 @@ def _prepare_chunk(items: list[BatchItem]) -> list[PreparedItem]:
             and len(row_norm.inchikey) == 27
             and row_norm.error is None
         ):
-            override = lookups.get(row_norm.inchikey)
-        prepared.append(PreparedItem(item_id=item.id, norm=row_norm, lookup=override))
+            override = lookups.get(row_norm.inchikey) or manual_lookups.get(
+                row_norm.inchikey
+            )
+        prepared.append(
+            PreparedItem(
+                item_id=item.id,
+                norm=row_norm,
+                lookup=override,
+                negative_blocked=(
+                    bool(row_norm and row_norm.inchikey in hard_negatives)
+                ),
+            )
+        )
     return prepared
 
 
@@ -933,6 +965,7 @@ def _commit_prepared_chunk(
                 job_priority=locked_job.priority,
                 lookup_override=entry.lookup,
                 norm_override=entry.norm,
+                negative_blocked=entry.negative_blocked,
             )
         BatchItem.objects.bulk_update(items, _ITEM_UPDATE_FIELDS)
         locked_job.processing_state = BatchProcessingState.LOCAL_LOOKUP
@@ -992,6 +1025,19 @@ def _retry_backpressured_remote_delayed_items(
                 item.status = BatchItemStatus.FOUND_LIVE_CACHE
                 item.message = None
                 item.save(update_fields=_ITEM_UPDATE_FIELDS)
+                continue
+            result = lookup_manual_fallback(inchikey)
+            if result is not None:
+                item.classification_snapshot = classification_lookup_snapshot(result)
+                _pin_resolved_classification(item, item.classification_snapshot)
+                item.status = BatchItemStatus.FOUND_LIVE_CACHE
+                item.message = None
+                item.save(update_fields=_ITEM_UPDATE_FIELDS)
+                continue
+            if inchikey in hard_negative_inchikeys([inchikey]):
+                item.status = BatchItemStatus.REMOTE_TIMED_OUT
+                item.message = NEGATIVE_HARD_FAILED_MESSAGE
+                item.save(update_fields=["status", "message"])
                 continue
 
             try:

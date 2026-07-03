@@ -1,11 +1,11 @@
-"""Persistent entity 500 escalates to a structure submit immediately.
+"""Persistent entity 500 escalates to a structure submit after confirmation.
 
 Wishart returns HTTP 500 (server fault) for some specific keys — every entity
-GET for that key fails, forever. Rather than retrying the doomed GET through
-1m/5m/30m backoff windows, the worker escalates a task that HAS a structure to
-a fresh calculation submit (a different endpoint, /queries.json, which can
-succeed where /entities 500s). Rate-limit 429s still retry, but entity 5xx
-failures ignore Retry-After so they cannot keep the queue in 5-minute waits
+GET for that key may fail repeatedly. The worker confirms that the entity
+endpoint is persistently bad for the key, then escalates a task that HAS a
+structure to a fresh calculation submit (a different endpoint, /queries.json,
+which can succeed where /entities 500s). Rate-limit 429s still retry, but entity
+5xx failures ignore Retry-After so they cannot keep the queue in 5-minute waits
 forever. Structureless tasks move to NEED_STRUCTURE instead of blocking the
 remote queue on entity backoff.
 
@@ -135,23 +135,26 @@ def _run_entity_first(task: RemoteTask, provider, circuit=None, limiter=None) ->
     worker._entity_first(task, claim)
 
 
-def test_persistent_entity_500_escalates_to_submit_immediately():
+def test_first_entity_500_with_structure_retries_entity_before_submit():
     task = _claimed_task(with_compound=True, attempt=0)
     provider = _provider_returning(500)
 
     _run_entity_first(task, provider)
 
-    assert provider.submit_calls == 1
+    assert provider.submit_calls == 0
+    task.refresh_from_db()
+    assert task.state == TaskState.RETRY_WAIT
+    assert task.attempt == 1
 
 
-def test_entity_500_with_retry_after_escalates_to_submit_without_waiting():
+def test_entity_500_with_retry_after_retries_without_honoring_retry_after():
     task = _claimed_task(with_compound=True, attempt=0)
     provider = _provider_returning(500, headers={"Retry-After": "600"})
     limiter = _AllowAllLimiter()
 
     _run_entity_first(task, provider, limiter=limiter)
 
-    assert provider.submit_calls == 1
+    assert provider.submit_calls == 0
     assert limiter.entity.penalties == []
     assert limiter.submit.penalties == []
     task.refresh_from_db()
@@ -160,8 +163,8 @@ def test_entity_500_with_retry_after_escalates_to_submit_without_waiting():
     assert (task.next_run_at - timezone.now()).total_seconds() < 120
 
 
-def test_repeated_entity_500_with_retry_after_escalates_to_submit():
-    task = _claimed_task(with_compound=True, attempt=4)
+def test_third_entity_500_with_retry_after_escalates_to_submit():
+    task = _claimed_task(with_compound=True, attempt=2)
     provider = _provider_returning(500, headers={"Retry-After": "300"})
 
     _run_entity_first(task, provider)
@@ -219,7 +222,7 @@ def test_entity_500_that_opens_circuit_still_escalates_to_submit():
     an endless 5-minute loop with the submit bypass never running. The submit
     outcome, not the definitive per-key entity 500, must drive the breaker.
     """
-    task = _claimed_task(with_compound=True, attempt=0)
+    task = _claimed_task(with_compound=True, attempt=2)
     provider = _provider_returning(500)
     circuit = _OpeningCircuit()
 

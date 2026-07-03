@@ -61,6 +61,11 @@ from apps.remote.models import (
     RemoteSubmissionMember,
     RemoteTask,
 )
+from apps.remote.negative_cache import (
+    NEGATIVE_FAILURE_THRESHOLD,
+    mark_negative_resolved_from_wishart,
+    record_negative_failure,
+)
 from apps.remote.provider import (
     AmbiguousSubmissionError,
     AuthProviderError,
@@ -123,6 +128,7 @@ def _should_escalate_entity_retry_to_submit(
         has_structure
         and http_status is not None
         and http_status >= 500
+        and attempt >= NEGATIVE_FAILURE_THRESHOLD - 1
     )
 
 
@@ -305,7 +311,10 @@ class RemoteWorker:
             # Remote disabled: do NOT make any remote call. Park the task so the
             # queue keeps accumulating without losing work.
             queue.defer_task(task, delay_seconds=self.lease_seconds)
-            fanout.mark_items_delayed(task.inchikey)
+            if not RemoteTask.objects.filter(
+                pk=task.pk, state=TaskState.DONE
+            ).exists():
+                fanout.mark_items_delayed(task.inchikey)
             return
         if not self.circuit.allow():
             # Circuit open: skip remote calls, park as DEFERRED. Local lookups +
@@ -457,7 +466,10 @@ class RemoteWorker:
                         locked, TaskState.DONE, lock_owner=None, locked_at=None
                     )
                     return
-                if result.retry_after is not None:
+                if _should_honor_retry_after(
+                    retry_after=result.retry_after,
+                    http_status=result.http_status,
+                ):
                     if _should_penalize_entity_retry_after(
                         retry_after=result.retry_after,
                         http_status=result.http_status,
@@ -969,11 +981,23 @@ class RemoteWorker:
             if honor_retry_after:
                 self.rate_limiter.submit.penalize(retry_after)
             for member in members:
-                if honor_retry_after:
+                negative = record_negative_failure(
+                    member.inchikey,
+                    operation=RemoteAttempt.OPERATION_SUBMIT,
+                    http_status=exc.http_status,
+                    detail=str(exc),
+                )
+                if negative.state == negative.State.HARD_FAILED:
+                    fanout.fan_out_result(
+                        member.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                    )
+                    queue.finish_task(member)
+                elif honor_retry_after:
                     queue.retry_after_override(member, retry_after)
                 else:
                     queue.schedule_retry(member)
-                fanout.mark_items_delayed(member.inchikey)
+                if negative.state != negative.State.HARD_FAILED:
+                    fanout.mark_items_delayed(member.inchikey)
             return
         except AuthProviderError as exc:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
@@ -1019,8 +1043,20 @@ class RemoteWorker:
             self._fail_submission(submission, detail=f"protocol: {exc}")
             logger.error("remote submit PROTOCOL_ERROR: %s", exc)
             for member in members:
-                queue.schedule_retry(member)
-                fanout.mark_items_delayed(member.inchikey)
+                negative = record_negative_failure(
+                    member.inchikey,
+                    operation=RemoteAttempt.OPERATION_SUBMIT,
+                    http_status=exc.http_status,
+                    detail=str(exc),
+                )
+                if negative.state == negative.State.HARD_FAILED:
+                    fanout.fan_out_result(
+                        member.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                    )
+                    queue.finish_task(member)
+                else:
+                    queue.schedule_retry(member)
+                    fanout.mark_items_delayed(member.inchikey)
             return
         except NonRetryableProviderError as exc:
             self.circuit.record_success()
@@ -1447,14 +1483,28 @@ class RemoteWorker:
                         raw_body_text=poll.raw_text,
                         safe_headers=poll.safe_headers,
                     )
-                    if poll.retry_after is not None:
+                    negative = record_negative_failure(
+                        locked.inchikey,
+                        operation=RemoteAttempt.OPERATION_POLL,
+                        http_status=poll.http_status,
+                        detail=poll.detail,
+                    )
+                    if negative.state == negative.State.HARD_FAILED:
+                        fanout.fan_out_result(
+                            locked.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                        )
+                        queue.finish_task(locked)
+                    elif poll.retry_after is not None:
                         queue.retry_after_override(locked, poll.retry_after)
                     else:
                         queue.schedule_retry(locked)
             except LeaseLost:
                 self._log_poll_lease_lost(task, "RETRYABLE")
                 return
-            fanout.mark_items_delayed(task.inchikey)
+            if not RemoteTask.objects.filter(
+                pk=task.pk, state=TaskState.DONE
+            ).exists():
+                fanout.mark_items_delayed(task.inchikey)
             return
 
         if poll.status == PollStatus.AUTH_FAILURE:
@@ -1518,12 +1568,27 @@ class RemoteWorker:
                         self._fail_query_for_poll_protocol_error(
                             query, detail=poll.detail
                         )
-                    queue.schedule_retry(locked)
+                    negative = record_negative_failure(
+                        locked.inchikey,
+                        operation=RemoteAttempt.OPERATION_POLL,
+                        http_status=poll.http_status,
+                        detail=poll.detail,
+                    )
+                    if negative.state == negative.State.HARD_FAILED:
+                        fanout.fan_out_result(
+                            locked.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                        )
+                        queue.finish_task(locked)
+                    else:
+                        queue.schedule_retry(locked)
             except LeaseLost:
                 self._log_poll_lease_lost(task, str(poll.status))
                 return
             logger.error("remote poll %s: %s", poll.status, poll.detail)
-            fanout.mark_items_delayed(task.inchikey)
+            if not RemoteTask.objects.filter(
+                pk=task.pk, state=TaskState.DONE
+            ).exists():
+                fanout.mark_items_delayed(task.inchikey)
             return
 
         self.circuit.record_success()
@@ -1889,7 +1954,19 @@ class RemoteWorker:
             try:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
-                    queue.schedule_retry(locked)
+                    negative = record_negative_failure(
+                        locked.inchikey,
+                        operation=RemoteAttempt.OPERATION_POLL,
+                        http_status=None,
+                        detail="missing from completed provider response",
+                    )
+                    if negative.state == negative.State.HARD_FAILED:
+                        fanout.fan_out_result(
+                            locked.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                        )
+                        queue.finish_task(locked)
+                    else:
+                        queue.schedule_retry(locked)
                     # Only mark the member terminally FAILED when it is genuinely
                     # absent from an otherwise-COMPLETE response, so the query can
                     # finish. When the WHOLE response was rejected as malformed,
@@ -1963,6 +2040,7 @@ class RemoteWorker:
                 remote_query_id=query.remote_query_id if query is not None else None,
                 retrieved_at=query.submitted_at if query is not None else timezone.now(),
             )
+            mark_negative_resolved_from_wishart(locked.inchikey)
             fanout.fan_out_result(locked.inchikey, final_status)
             queue.transition_locked(
                 locked, TaskState.DONE, lock_owner=None, locked_at=None

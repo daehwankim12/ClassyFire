@@ -663,6 +663,87 @@ class RemoteQueueControl(models.Model):
         return f"remote-queue-control:{self.provider}"
 
 
+class RemoteNegativeCache(models.Model):
+    """Per-InChIKey record for repeatedly failing Wishart tail items."""
+
+    class State(models.TextChoices):
+        CANDIDATE = "CANDIDATE", "Candidate"
+        HARD_FAILED = "HARD_FAILED", "Hard failed"
+        RESOLVED = "RESOLVED", "Resolved"
+
+    inchikey = models.CharField(max_length=27, unique=True)
+    state = models.CharField(
+        max_length=16,
+        choices=State.choices,
+        default=State.CANDIDATE,
+    )
+    failure_count = models.IntegerField(default=0)
+    last_failure_operation = models.CharField(max_length=16, null=True, blank=True)
+    last_http_status = models.IntegerField(null=True, blank=True)
+    last_detail = models.TextField(null=True, blank=True)
+    last_failed_at = models.DateTimeField(null=True, blank=True)
+    next_recheck_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "remote_negative_cache"
+        indexes = [
+            models.Index(fields=["state", "updated_at"], name="remote_neg_state_idx"),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                name="remote_negative_cache_inchikey_format",
+                condition=Q(inchikey__regex=INCHIKEY_REGEX),
+            ),
+            models.CheckConstraint(
+                name="remote_negative_failure_count_nonneg",
+                condition=Q(failure_count__gte=0),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"negative:{self.inchikey} ({self.state})"
+
+
+class ManualClassificationOverride(models.Model):
+    """Admin-provided fallback data for a negative-cache InChIKey.
+
+    This table deliberately does not write to ``classyfire_live``. It is an
+    operational fallback used only while Wishart has no verified result.
+    """
+
+    negative_cache = models.ForeignKey(
+        RemoteNegativeCache,
+        on_delete=models.CASCADE,
+        related_name="manual_overrides",
+    )
+    inchikey = models.CharField(max_length=27, unique=True)
+    labels = models.JSONField(
+        default=dict,
+        help_text="Classification labels in snapshot shape.",
+    )
+    raw_payload = models.JSONField(null=True, blank=True)
+    classification_version = models.TextField(null=True, blank=True)
+    source_ref = models.TextField(null=True, blank=True)
+    actor = models.CharField(max_length=150)
+    admin_note = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "manual_classification_overrides"
+        constraints = [
+            models.CheckConstraint(
+                name="manual_override_inchikey_format",
+                condition=Q(inchikey__regex=INCHIKEY_REGEX),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"manual-fallback:{self.inchikey}"
+
+
 class RemoteProviderControl(models.Model):
     """Durable operator-controlled gate for a remote provider (one row each).
 
