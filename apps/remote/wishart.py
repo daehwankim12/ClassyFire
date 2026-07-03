@@ -497,6 +497,53 @@ class WishartDirectProvider:
             safe_headers=headers,
         )
 
+    def download_query_csv(self, remote_query_id: str) -> bytes:
+        """Download the web CSV export for a completed query.
+
+        Used as a fallback when ``/queries/{id}.json`` is unusable but the
+        official ClassyFire web CSV export is still available.
+        """
+        url = f"{self.base_url}/queries/{remote_query_id}.csv"
+        try:
+            resp = self._request("GET", url)
+        except ResponseTooLargeError as exc:
+            raise ProtocolProviderError(str(exc)) from exc
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            raise RetryableProviderError(str(exc)) from exc
+        outcome = classify_http_status(resp.status_code)
+        raw_text = resp.raw_text
+        headers = _safe_headers(resp)
+        if outcome is HttpOutcome.SUCCESS:
+            return raw_text.encode("utf-8")
+        if outcome is HttpOutcome.RETRYABLE:
+            raise RetryableProviderError(
+                f"HTTP {resp.status_code}",
+                retry_after=_parse_retry_after(resp),
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
+        if outcome is HttpOutcome.AUTH_FAILURE:
+            raise AuthProviderError(
+                f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
+        if outcome in (HttpOutcome.PERMANENT, HttpOutcome.NOT_FOUND):
+            raise NonRetryableProviderError(
+                f"HTTP {resp.status_code}",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
+        raise ProtocolProviderError(
+            f"unmapped HTTP {resp.status_code}",
+            raw_text=raw_text,
+            safe_headers=headers,
+            http_status=resp.status_code,
+        )
+
     def parse_result(self, raw_json: dict[str, Any]) -> NormalizedClassification:
         # Wishart query results wrap entities; unwrap the single-entity case.
         payload = raw_json

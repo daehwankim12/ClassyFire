@@ -215,6 +215,30 @@ def test_wishart_submit_returns_query_id():
     assert submit.remote_query_id == "7777"
 
 
+def test_wishart_download_query_csv_returns_bytes():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/queries/q1.csv"
+        return httpx.Response(
+            200,
+            text="CompoundID,ChemOntID,ClassifiedResults\nq1,NotAvailable,foo: bar\n",
+        )
+
+    provider = _wishart_with(handler)
+
+    assert provider.download_query_csv("q1").startswith(b"CompoundID,ChemOntID")
+
+
+def test_wishart_download_query_csv_429_retryable_with_retry_after():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "30"})
+
+    provider = _wishart_with(handler)
+
+    with pytest.raises(RetryableProviderError) as excinfo:
+        provider.download_query_csv("q1")
+    assert excinfo.value.retry_after == 30.0
+
+
 def test_wishart_poll_running_then_complete():
     state = {"calls": 0}
 

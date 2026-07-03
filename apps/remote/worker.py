@@ -37,6 +37,10 @@ from django.db import DataError, IntegrityError, transaction
 from django.utils import timezone
 
 from apps.batches.remote_delay import CIRCUIT_OPEN_MESSAGE
+from apps.classifications.classyfire_web_csv import (
+    ClassyfireWebCsvImportError,
+    import_classyfire_web_csv_artifact,
+)
 from apps.classifications.result_writer import (
     persistable_returned_inchikey,
     write_live_result,
@@ -1717,6 +1721,13 @@ class RemoteWorker:
         try:
             results = self.provider.parse_results(raw, max_entities=max_entities)
         except ProtocolProviderError as exc:
+            if self._try_apply_query_csv_fallback(
+                claim,
+                query=query,
+                members=members,
+                detail=str(exc),
+            ):
+                return
             logger.error(
                 "remote query malformed for %s: %s", query.remote_query_id, exc
             )
@@ -1750,6 +1761,90 @@ class RemoteWorker:
         # apply state. A PENDING_OWNER (or still-PENDING/RETRY) member keeps the
         # query open so its owner's later poll/apply finishes it.
         self._complete_query_if_terminal(query)
+
+    def _try_apply_query_csv_fallback(
+        self,
+        claim: queue.TaskClaim,
+        *,
+        query: RemoteQuery,
+        members: list[RemoteTask],
+        detail: str,
+    ) -> bool:
+        """Apply a completed query via ClassyFire web CSV when JSON is unusable."""
+        remote_query_id = query.remote_query_id
+        downloader = getattr(self.provider, "download_query_csv", None)
+        if remote_query_id is None or not callable(downloader):
+            return False
+        try:
+            raw_csv = downloader(remote_query_id)
+        except Exception as exc:  # pragma: no cover - defensive provider boundary
+            logger.error(
+                "remote query CSV fallback download failed for %s: %s",
+                remote_query_id,
+                exc,
+            )
+            return False
+        if not isinstance(raw_csv, bytes):
+            logger.error(
+                "remote query CSV fallback returned non-bytes payload for %s",
+                remote_query_id,
+            )
+            return False
+
+        identifier_to_inchikey = {
+            member.inchikey: member.inchikey for member in members
+        }
+        try:
+            import_classyfire_web_csv_artifact(
+                raw_csv,
+                identifier_to_inchikey=identifier_to_inchikey,
+                name=f"classyfire-query-{remote_query_id}.csv",
+                uri=f"{settings.WISHART_BASE_URL.rstrip('/')}/queries/{remote_query_id}.csv",
+                metadata={
+                    "remote_query_id": remote_query_id,
+                    "fallback_reason": detail,
+                },
+                retrieved_at=query.submitted_at,
+            )
+        except ClassyfireWebCsvImportError as exc:
+            logger.error(
+                "remote query CSV fallback import failed for %s: %s",
+                remote_query_id,
+                exc,
+            )
+            return False
+
+        for member in members:
+            member_claim = self._member_claim(member, claim)
+            if member_claim is None:
+                self._park_member_pending_owner(query, member)
+                continue
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(member_claim)
+                    fanout.fan_out_result(
+                        locked.inchikey, BatchItemStatus.COMPLETE_AFTER_WISHART
+                    )
+                    queue.transition_locked(
+                        locked, TaskState.DONE, lock_owner=None, locked_at=None
+                    )
+                    RemoteQueryItem.objects.filter(query=query, task=locked).exclude(
+                        apply_state__in=[
+                            RemoteQueryItemApplyState.APPLIED,
+                            RemoteQueryItemApplyState.MISMATCH,
+                            RemoteQueryItemApplyState.FAILED,
+                        ]
+                    ).update(
+                        apply_state=RemoteQueryItemApplyState.APPLIED,
+                        apply_detail="applied from ClassyFire web CSV fallback",
+                        applied_at=timezone.now(),
+                    )
+            except LeaseLost:
+                self._log_poll_lease_lost(member, "CSV_FALLBACK")
+                continue
+        self._complete_query_if_terminal(query)
+        logger.info("applied ClassyFire web CSV fallback for query %s", remote_query_id)
+        return True
 
     def _dispatch_member(
         self,
