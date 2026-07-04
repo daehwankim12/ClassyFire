@@ -294,3 +294,64 @@ def test_worker_uses_query_csv_when_poll_json_returns_500(settings, tmp_path):
     query_item.refresh_from_db()
     assert query_item.apply_state == RemoteQueryItemApplyState.APPLIED
     assert not RemoteNegativeCache.objects.filter(inchikey=IK).exists()
+
+
+def test_worker_uses_query_csv_when_poll_json_is_still_running(settings, tmp_path):
+    settings.SOURCE_ARTIFACT_DIR = str(tmp_path / "artifacts")
+    _node(0, "Organic compounds")
+    job = BatchJob.objects.create(secret_hash="secret", total_count=1)
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK,
+        inchikey=IK,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    task = RemoteTask.objects.create(
+        inchikey=IK,
+        state=TaskState.POLL_WAIT,
+        next_run_at=timezone.now(),
+    )
+    query = RemoteQuery.objects.create(
+        remote_query_id="QCSVRUNNING",
+        payload_hash="payload",
+        state=QueryState.SUBMITTED,
+    )
+    query_item = RemoteQueryItem.objects.create(query=query, task=task, inchikey=IK)
+
+    class CsvFallbackProvider:
+        csv_calls: list[str]
+
+        def __init__(self) -> None:
+            self.csv_calls = []
+
+        def poll_query(self, remote_query_id: str) -> PollResult:
+            assert remote_query_id == "QCSVRUNNING"
+            return PollResult(
+                status=PollStatus.RUNNING,
+                http_status=200,
+                detail="Processing",
+                raw_json={"classification_status": "Processing"},
+            )
+
+        def download_query_csv(self, remote_query_id: str) -> bytes:
+            self.csv_calls.append(remote_query_id)
+            return _csv_bytes(IK)
+
+    provider = CsvFallbackProvider()
+    worker = RemoteWorker(provider, worker_id="csv-running-worker")
+
+    assert worker.tick() is True
+
+    assert provider.csv_calls == ["QCSVRUNNING"]
+    live = ClassyfireLive.objects.get(inchikey=IK)
+    assert live.source_type == SourceType.WISHART_LIVE_QUERY
+    item = BatchItem.objects.get(job=job)
+    assert item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
+    assert item.resolved_classification_id == live.result_id
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    query.refresh_from_db()
+    assert query.state == QueryState.COMPLETE
+    query_item.refresh_from_db()
+    assert query_item.apply_state == RemoteQueryItemApplyState.APPLIED

@@ -66,7 +66,6 @@ from apps.remote.models import (
     RemoteTask,
 )
 from apps.remote.negative_cache import (
-    NEGATIVE_FAILURE_THRESHOLD,
     mark_negative_resolved_from_wishart,
     record_negative_failure,
 )
@@ -133,7 +132,6 @@ def _should_escalate_entity_retry_to_submit(
         has_structure
         and http_status is not None
         and http_status >= 500
-        and attempt >= NEGATIVE_FAILURE_THRESHOLD - 1
     )
 
 
@@ -1649,6 +1647,22 @@ class RemoteWorker:
                         raw_body_text=poll.raw_text,
                         safe_headers=poll.safe_headers,
                     )
+            except LeaseLost:
+                self._log_poll_lease_lost(task, "RUNNING")
+                return
+
+            members = self._query_members(query, task)
+            if self._try_apply_query_csv_fallback(
+                claim,
+                query=query,
+                members=members,
+                detail="query JSON still running but CSV export was available",
+            ):
+                return
+
+            try:
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
                     query.state = QueryState.POLLING
                     query.next_poll_at = timezone.now() + timedelta(
                         seconds=settings.REMOTE_POLL_MIN_SECONDS

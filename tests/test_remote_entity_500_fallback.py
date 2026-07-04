@@ -135,26 +135,26 @@ def _run_entity_first(task: RemoteTask, provider, circuit=None, limiter=None) ->
     worker._entity_first(task, claim)
 
 
-def test_first_entity_500_with_structure_retries_entity_before_submit():
+def test_first_entity_500_with_structure_submits_immediately():
     task = _claimed_task(with_compound=True, attempt=0)
     provider = _provider_returning(500)
 
     _run_entity_first(task, provider)
 
-    assert provider.submit_calls == 0
+    assert provider.submit_calls == 1
     task.refresh_from_db()
     assert task.state == TaskState.RETRY_WAIT
     assert task.attempt == 1
 
 
-def test_entity_500_with_retry_after_retries_without_honoring_retry_after():
+def test_entity_500_with_retry_after_submits_without_honoring_retry_after():
     task = _claimed_task(with_compound=True, attempt=0)
     provider = _provider_returning(500, headers={"Retry-After": "600"})
     limiter = _AllowAllLimiter()
 
     _run_entity_first(task, provider, limiter=limiter)
 
-    assert provider.submit_calls == 0
+    assert provider.submit_calls == 1
     assert limiter.entity.penalties == []
     assert limiter.submit.penalties == []
     task.refresh_from_db()
