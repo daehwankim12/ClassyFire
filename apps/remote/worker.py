@@ -76,6 +76,7 @@ from apps.remote.provider import (
     EntityLookupStatus,
     NonRetryableProviderError,
     NormalizedClassification,
+    PollResult,
     PollStatus,
     ProtocolProviderError,
     Provider,
@@ -1469,24 +1470,58 @@ class RemoteWorker:
         # A stale worker whose lease was stolen raises LeaseLost here and writes
         # NOTHING — no attempt, no query.state, no transition.
         if poll.status == PollStatus.RETRYABLE_ERROR:
+            retryable_attempt_recorded = False
+            if self._retryable_poll_can_try_csv_fallback(poll):
+                try:
+                    with transaction.atomic():
+                        locked = queue.lock_owned_claim(claim)
+                        self._record_attempt(
+                            RemoteAttempt.OPERATION_POLL,
+                            classification="RETRYABLE",
+                            raw_payload=poll.raw_json,
+                            query=query,
+                            http_status=poll.http_status,
+                            remote_query_id=remote_query_id,
+                            request_payload_hash=query.payload_hash,
+                            detail=poll.detail,
+                            task=locked,
+                            request_inchikey=locked.inchikey,
+                            raw_body_text=poll.raw_text,
+                            safe_headers=poll.safe_headers,
+                        )
+                        retryable_attempt_recorded = True
+                except LeaseLost:
+                    self._log_poll_lease_lost(task, "RETRYABLE")
+                    return
+                members = self._query_members(query, task)
+                if self._try_apply_query_csv_fallback(
+                    claim,
+                    query=query,
+                    members=members,
+                    detail=poll.detail or f"HTTP {poll.http_status}",
+                ):
+                    self.circuit.record_success()
+                    return
+
             self.circuit.record_failure()
             try:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
-                    self._record_attempt(
-                        RemoteAttempt.OPERATION_POLL,
-                        classification="RETRYABLE",
-                        raw_payload=poll.raw_json,
-                        query=query,
-                        http_status=poll.http_status,
-                        remote_query_id=remote_query_id,
-                        request_payload_hash=query.payload_hash,
-                        detail=poll.detail,
-                        task=locked,
-                        request_inchikey=locked.inchikey,
-                        raw_body_text=poll.raw_text,
-                        safe_headers=poll.safe_headers,
-                    )
+                    if not retryable_attempt_recorded:
+                        self._record_attempt(
+                            RemoteAttempt.OPERATION_POLL,
+                            classification="RETRYABLE",
+                            raw_payload=poll.raw_json,
+                            query=query,
+                            http_status=poll.http_status,
+                            remote_query_id=remote_query_id,
+                            request_payload_hash=query.payload_hash,
+                            detail=poll.detail,
+                            task=locked,
+                            request_inchikey=locked.inchikey,
+                            raw_body_text=poll.raw_text,
+                            safe_headers=poll.safe_headers,
+                        )
                     negative = record_negative_failure(
                         locked.inchikey,
                         operation=RemoteAttempt.OPERATION_POLL,
@@ -1664,6 +1699,10 @@ class RemoteWorker:
         self._apply_query_result(claim, task, query, raw)
 
     @staticmethod
+    def _retryable_poll_can_try_csv_fallback(poll: PollResult) -> bool:
+        return poll.http_status is not None and 500 <= poll.http_status < 600
+
+    @staticmethod
     def _log_poll_lease_lost(task: RemoteTask, outcome: str) -> None:
         logger.warning(
             "lease lost on poll %s for task %s (inchikey=%s); aborting write",
@@ -1671,6 +1710,23 @@ class RemoteWorker:
             task.pk,
             task.inchikey,
         )
+
+    @staticmethod
+    def _query_members(query: RemoteQuery, task: RemoteTask) -> list[RemoteTask]:
+        # Members in deterministic submit order (== the order entities arrive).
+        members: list[RemoteTask] = []
+        seen_task_ids: set[int] = set()
+        for item in query.items.select_related("task").order_by("id"):
+            member = item.task
+            if member is None or member.id in seen_task_ids:
+                continue
+            seen_task_ids.add(member.id)
+            members.append(member)
+        # Defensive: never strand the task we polled with even if its
+        # RemoteQueryItem link was severed (SET_NULL).
+        if task.id not in seen_task_ids:
+            members.append(task)
+        return members
 
     def _apply_query_result(
         self,
@@ -1703,19 +1759,7 @@ class RemoteWorker:
         ``task`` (the one we polled with) is resolved on the same footing as its
         batch siblings via the RemoteQueryItem set.
         """
-        # Members in deterministic submit order (== the order entities arrive).
-        members: list[RemoteTask] = []
-        seen_task_ids: set[int] = set()
-        for item in query.items.select_related("task").order_by("id"):
-            member = item.task
-            if member is None or member.id in seen_task_ids:
-                continue
-            seen_task_ids.add(member.id)
-            members.append(member)
-        # Defensive: never strand the task we polled with even if its
-        # RemoteQueryItem link was severed (SET_NULL).
-        if task.id not in seen_task_ids:
-            members.append(task)
+        members = self._query_members(query, task)
 
         max_entities = min(len(members), _effective_batch_size())
         try:

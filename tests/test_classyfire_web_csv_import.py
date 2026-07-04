@@ -5,6 +5,7 @@ import json
 
 import pytest
 from django.core.management import call_command
+from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob
 from apps.chemont.models import ChemOntNode
@@ -23,7 +24,7 @@ from apps.core.enums import (
 )
 from apps.remote import queue
 from apps.remote.models import RemoteNegativeCache, RemoteQuery, RemoteQueryItem, RemoteTask
-from apps.remote.provider import ProtocolProviderError
+from apps.remote.provider import PollResult, PollStatus, ProtocolProviderError
 from apps.remote.worker import RemoteWorker
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -231,3 +232,65 @@ def test_worker_uses_query_csv_when_completed_json_is_unparseable(settings, tmp_
     assert query.state == QueryState.COMPLETE
     query_item.refresh_from_db()
     assert query_item.apply_state == RemoteQueryItemApplyState.APPLIED
+
+
+def test_worker_uses_query_csv_when_poll_json_returns_500(settings, tmp_path):
+    settings.SOURCE_ARTIFACT_DIR = str(tmp_path / "artifacts")
+    _node(0, "Organic compounds")
+    job = BatchJob.objects.create(secret_hash="secret", total_count=1)
+    BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK,
+        inchikey=IK,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    task = RemoteTask.objects.create(
+        inchikey=IK,
+        state=TaskState.POLL_WAIT,
+        next_run_at=timezone.now(),
+    )
+    query = RemoteQuery.objects.create(
+        remote_query_id="QCSV500",
+        payload_hash="payload",
+        state=QueryState.SUBMITTED,
+    )
+    query_item = RemoteQueryItem.objects.create(query=query, task=task, inchikey=IK)
+
+    class CsvFallbackProvider:
+        csv_calls: list[str]
+
+        def __init__(self) -> None:
+            self.csv_calls = []
+
+        def poll_query(self, remote_query_id: str) -> PollResult:
+            assert remote_query_id == "QCSV500"
+            return PollResult(
+                status=PollStatus.RETRYABLE_ERROR,
+                http_status=500,
+                detail="HTTP 500",
+                raw_text='{"status":500,"error":"Internal Server Error"}',
+            )
+
+        def download_query_csv(self, remote_query_id: str) -> bytes:
+            self.csv_calls.append(remote_query_id)
+            return _csv_bytes(IK)
+
+    provider = CsvFallbackProvider()
+    worker = RemoteWorker(provider, worker_id="csv-poll-500-worker")
+
+    assert worker.tick() is True
+
+    assert provider.csv_calls == ["QCSV500"]
+    live = ClassyfireLive.objects.get(inchikey=IK)
+    assert live.source_type == SourceType.WISHART_LIVE_QUERY
+    item = BatchItem.objects.get(job=job)
+    assert item.status == BatchItemStatus.COMPLETE_AFTER_WISHART
+    assert item.resolved_classification_id == live.result_id
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    query.refresh_from_db()
+    assert query.state == QueryState.COMPLETE
+    query_item.refresh_from_db()
+    assert query_item.apply_state == RemoteQueryItemApplyState.APPLIED
+    assert not RemoteNegativeCache.objects.filter(inchikey=IK).exists()
