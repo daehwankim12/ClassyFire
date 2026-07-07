@@ -88,7 +88,7 @@ def test_backpressured_batch_item_is_retried_by_ingest_worker(settings):
 def test_ingest_worker_stops_delayed_retry_after_queue_backpressure(monkeypatch):
     from apps.batches.models import BatchItem, BatchJob
     from apps.batches.services import (
-        _retry_backpressured_remote_delayed_items,
+        _retry_transiently_delayed_remote_items,
         claim_from_job,
     )
     from apps.core.enums import BatchItemStatus, BatchJobStatus, BatchProcessingState
@@ -128,7 +128,7 @@ def test_ingest_worker_stops_delayed_retry_after_queue_backpressure(monkeypatch)
         reject_enqueue,
     )
 
-    _retry_backpressured_remote_delayed_items(
+    _retry_transiently_delayed_remote_items(
         claim_from_job(job),
         remote_enabled=True,
         remote_principal=job.remote_principal,

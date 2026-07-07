@@ -93,7 +93,10 @@ CAUSES: dict[str, RemoteDelayCause] = {
     "budget_exceeded": RemoteDelayCause(
         code="budget_exceeded",
         label="Budget exceeded",
-        description="This principal has exhausted its remote budget.",
+        description=(
+            "This principal has exhausted its daily remote budget. Workers "
+            "retry automatically once the budget window resets."
+        ),
         next_action="increase_remote_budget",
         severity="warning",
         priority=50,

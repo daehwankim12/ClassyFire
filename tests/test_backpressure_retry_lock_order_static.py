@@ -4,7 +4,7 @@ from pathlib import Path
 def test_backpressure_retry_locks_items_before_job_to_match_fanout_order():
     """Guard against reintroducing the BatchJob -> BatchItem deadlock order."""
     source = Path("apps/batches/services.py").read_text()
-    start = source.index("def _retry_backpressured_remote_delayed_items")
+    start = source.index("def _retry_transiently_delayed_remote_items")
     end = source.index("class IngestLeaseLost", start)
     body = source[start:end]
 

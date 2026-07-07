@@ -60,10 +60,18 @@ PENDING_CLASSIFICATION
     └─▶ FOUND_LIVE_CACHE             (concurrent fill landed in cache)
 
 REMOTE_DELAYED
+    ├─▶ PENDING_CLASSIFICATION       (queue-capacity / budget park re-enqueued by the ingest sweep)
     ├─▶ COMPLETE_AFTER_WISHART       (remote classification succeeded)
     ├─▶ RESULT_KEY_MISMATCH          (returned key ≠ requested key)
     └─▶ INVALID_INPUT                (remote rejected the structure)
 ```
+
+A `REMOTE_DELAYED` row parked *before* its RemoteTask could be inserted (queue
+backpressure or daily-budget denial) is the durable retry record: each time the
+ingest worker reclaims the `REMOTE_PENDING` job it retries those rows in
+`row_order` chunks, stopping at the first budget denial or backpressure and
+resuming on a later reclaim. Remote-disabled and other `REMOTE_DELAYED` rows
+stay parked until user/operator action.
 
 Terminal states (`FOUND_*`, `COMPLETE_AFTER_WISHART`, `NEED_STRUCTURE`,
 `INVALID_INPUT`, `RESULT_KEY_MISMATCH`) are not left again within the same job.

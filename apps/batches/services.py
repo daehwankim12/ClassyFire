@@ -70,6 +70,7 @@ from apps.batches.ingest import (
 )
 from apps.batches.models import BatchItem, BatchJob
 from apps.batches.remote_delay import (
+    BUDGET_EXCEEDED_MESSAGE,
     REMOTE_DELAYED_DEFAULT_MESSAGE,
     REMOTE_DISABLED_MESSAGE,
 )
@@ -446,7 +447,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                         item.save(update_fields=["status", "message"])
                 except RemoteBudgetExceededError:
                     item.status = BatchItemStatus.REMOTE_DELAYED
-                    item.message = "Remote budget exceeded for this principal."
+                    item.message = BUDGET_EXCEEDED_MESSAGE
                     item.save(update_fields=["status", "message"])
                 except RemoteQueueBackpressure:
                     item.status = BatchItemStatus.REMOTE_DELAYED
@@ -625,7 +626,7 @@ def _process_item(
             item.message = message
             return status
         except RemoteBudgetExceededError:
-            item.message = "Remote budget exceeded for this principal."
+            item.message = BUDGET_EXCEEDED_MESSAGE
             return BatchItemStatus.REMOTE_DELAYED
         except RemoteQueueBackpressure:
             item.message = _REMOTE_QUEUE_BACKPRESSURE_MESSAGE
@@ -975,74 +976,103 @@ def _commit_prepared_chunk(
 _REMOTE_QUEUE_BACKPRESSURE_MESSAGE = "Remote queue is at capacity; retrying later."
 
 
-def _retry_backpressured_remote_delayed_items(
+_TRANSIENT_REMOTE_DELAY_MESSAGES = (
+    _REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+    BUDGET_EXCEEDED_MESSAGE,
+)
+
+
+def _retry_transiently_delayed_remote_items(
     claim: IngestJobClaim,
     *,
     remote_enabled: bool,
     remote_principal: str = "system",
     job_priority: int = 0,
 ) -> None:
-    """Retry durable enqueue for items delayed only by remote queue capacity.
+    """Retry durable enqueue for items delayed by queue capacity or budget.
 
-    Backpressure happens before a RemoteTask can be inserted, so the BatchItem is
-    the durable retry record.  Once a REMOTE_PENDING job is reclaimed by the
-    ingest worker, retry only rows carrying the capacity message; budget-denied,
-    remote-disabled, and other REMOTE_DELAYED rows remain user/action-gated.
+    Backpressure and budget denial both happen before a RemoteTask can be
+    inserted, so the BatchItem is the durable retry record for both. Once a
+    REMOTE_PENDING job is reclaimed by the ingest worker, retry rows carrying
+    the queue-capacity or budget-exceeded message; remote-disabled and other
+    REMOTE_DELAYED rows remain user/action-gated.
+
+    Rows are locked and processed in row_order chunks so a large parked job
+    never holds tens of thousands of row locks in one transaction. The sweep
+    stops at the first budget denial (every row in a job shares one principal,
+    so nothing later in the scan can succeed) or queue backpressure, and
+    resumes on a later reclaim once the daily window resets or capacity frees.
     """
     if not remote_enabled:
         return
 
-    with transaction.atomic():
-        # Lock retryable item rows before the parent job row. Remote fan-out
-        # updates matching BatchItem rows and then recomputes counters, which
-        # locks the BatchJob row; taking locks in that same item -> job order
-        # avoids a PostgreSQL ABBA deadlock for the same InChIKey.
-        items = list(
-            BatchItem.objects.select_for_update()
-            .filter(
-                job_id=claim.job_id,
-                status=BatchItemStatus.REMOTE_DELAYED,
-                message=_REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
-                inchikey__isnull=False,
-            )
-            .order_by("row_order")
-        )
-        _lock_owned_job(claim)
-        for item in items:
-            inchikey = cast(str, item.inchikey)
-            result = lookup_current_classification(inchikey)
-            if result is not None:
-                item.classification_snapshot = classification_lookup_snapshot(result)
-                _pin_resolved_classification(item, item.classification_snapshot)
-                item.status = BatchItemStatus.FOUND_LIVE_CACHE
-                item.message = None
-                item.save(update_fields=_ITEM_UPDATE_FIELDS)
-                continue
-            if inchikey in hard_negative_inchikeys([inchikey]):
-                item.status = BatchItemStatus.REMOTE_TIMED_OUT
-                item.message = NEGATIVE_HARD_FAILED_MESSAGE
-                item.save(update_fields=["status", "message"])
-                continue
-
-            try:
-                _get_or_create_remote_task(
-                    inchikey,
-                    item.compound,
-                    principal=remote_principal,
-                    priority=job_priority,
+    while True:
+        stop = False
+        with transaction.atomic():
+            # Lock retryable item rows before the parent job row. Remote fan-out
+            # updates matching BatchItem rows and then recomputes counters, which
+            # locks the BatchJob row; taking locks in that same item -> job order
+            # avoids a PostgreSQL ABBA deadlock for the same InChIKey.
+            items = list(
+                BatchItem.objects.select_for_update()
+                .filter(
+                    job_id=claim.job_id,
+                    status=BatchItemStatus.REMOTE_DELAYED,
+                    message__in=_TRANSIENT_REMOTE_DELAY_MESSAGES,
+                    inchikey__isnull=False,
                 )
-            except RemoteBudgetExceededError:
-                item.message = "Remote budget exceeded for this principal."
-                item.save(update_fields=["message"])
-            except RemoteQueueBackpressure:
-                # Capacity is still exhausted. Leave the item as the durable
-                # retry record for a later ingest-worker pass. Stop this pass so
-                # large delayed jobs do not scan thousands of rows while full.
-                break
-            else:
-                item.status = BatchItemStatus.PENDING_CLASSIFICATION
-                item.message = None
-                item.save(update_fields=["status", "message"])
+                .order_by("row_order")[:PROCESS_CHUNK_SIZE]
+            )
+            if not items:
+                return
+            _lock_owned_job(claim)
+            for item in items:
+                inchikey = cast(str, item.inchikey)
+                result = lookup_current_classification(inchikey)
+                if result is not None:
+                    item.classification_snapshot = classification_lookup_snapshot(
+                        result
+                    )
+                    _pin_resolved_classification(item, item.classification_snapshot)
+                    item.status = BatchItemStatus.FOUND_LIVE_CACHE
+                    item.message = None
+                    item.save(update_fields=_ITEM_UPDATE_FIELDS)
+                    continue
+                if inchikey in hard_negative_inchikeys([inchikey]):
+                    item.status = BatchItemStatus.REMOTE_TIMED_OUT
+                    item.message = NEGATIVE_HARD_FAILED_MESSAGE
+                    item.save(update_fields=["status", "message"])
+                    continue
+
+                try:
+                    _get_or_create_remote_task(
+                        inchikey,
+                        item.compound,
+                        principal=remote_principal,
+                        priority=job_priority,
+                    )
+                except RemoteBudgetExceededError:
+                    # The principal's daily budget is spent, so no later row can
+                    # enqueue this pass. Record the cause on this row and stop;
+                    # a later reclaim retries after the window resets or an
+                    # operator raises the budget.
+                    item.message = BUDGET_EXCEEDED_MESSAGE
+                    item.save(update_fields=["message"])
+                    stop = True
+                    break
+                except RemoteQueueBackpressure:
+                    # Capacity is still exhausted. Leave the item as the durable
+                    # retry record for a later ingest-worker pass. Stop this
+                    # pass so large delayed jobs do not scan thousands of rows
+                    # while full.
+                    stop = True
+                    break
+                else:
+                    item.status = BatchItemStatus.PENDING_CLASSIFICATION
+                    item.message = None
+                    item.save(update_fields=["status", "message"])
+        if stop:
+            return
 
 
 class IngestLeaseLost(Exception):  # noqa: N818 - mirrors remote LeaseLost contract
@@ -1277,7 +1307,7 @@ def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> 
             checkpoint_row_order=chunk[-1].row_order,
         )
 
-    _retry_backpressured_remote_delayed_items(
+    _retry_transiently_delayed_remote_items(
         claim,
         remote_enabled=job.remote_enabled,
         remote_principal=job.remote_principal,
