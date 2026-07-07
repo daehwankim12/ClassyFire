@@ -132,7 +132,7 @@ ALTER TABLE "remote_task"
 | `LOCKED` | Claimed by a worker (`lock_owner`/`locked_at` set), not yet executing. |
 | `RUNNING` | Worker is actively processing. |
 | `ENTITY_LOOKUP` | Doing a Wishart entity lookup phase. |
-| `SUBMIT_WAIT` | Waiting on the submit rate limiter before submitting. |
+| `SUBMIT_WAIT` | Entity miss confirmed but no submit token free; parked until the shared request bucket refills. Claimed directly (never re-routed through `READY`) so the worker resumes at the submit POST without repeating the entity GET. |
 | `SUBMITTED` | Query submitted upstream; awaiting a `remote_query` id/poll. |
 | `POLL_WAIT` | Waiting for the next poll window (`next_run_at`). |
 | `RETRY_WAIT` | Transient failure; backing off before retry (`attempt`++). |
@@ -145,7 +145,8 @@ ALTER TABLE "remote_task"
 READY ─▶ LOCKED ─▶ RUNNING
                      ├─▶ ENTITY_LOOKUP ─▶ SUBMIT_WAIT
                      └─▶ SUBMIT_WAIT
-SUBMIT_WAIT ─▶ SUBMITTED ─▶ POLL_WAIT ─▶ RUNNING        (poll due → resume)
+SUBMIT_WAIT ─▶ LOCKED ─▶ RUNNING                        (claimed directly when next_run_at elapses; resumes at the submit POST)
+SUBMITTED ─▶ POLL_WAIT ─▶ RUNNING                       (poll due → resume)
 RUNNING ─▶ DONE                                         (success / permanent failure)
 
 # failure / control edges (from any active processing state)

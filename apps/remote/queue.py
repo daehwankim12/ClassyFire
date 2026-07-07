@@ -211,9 +211,14 @@ def enqueue_task(
         return existing
 
 
-def _due_ready_tasks(now):
+def _due_claimable_tasks(now):
+    # SUBMIT_WAIT is claimed directly (never reactivated through READY) so the
+    # pre-claim state survives to the claim flip: it tells the worker the entity
+    # miss is already confirmed and the next call must be the submit POST.
     return (
-        RemoteTask.objects.filter(state=TaskState.READY)
+        RemoteTask.objects.filter(
+            state__in=[TaskState.READY, TaskState.SUBMIT_WAIT]
+        )
         .filter(Q(next_run_at__isnull=True) | Q(next_run_at__lte=now))
     )
 
@@ -239,7 +244,7 @@ def _claim_task_once(
     structure_required: bool,
     now,
 ) -> tuple[RemoteTask | None, bool]:
-    base_qs = _due_ready_tasks(now)
+    base_qs = _due_claimable_tasks(now)
     if exclude_ids:
         base_qs = base_qs.exclude(id__in=exclude_ids)
     if structure_required:
@@ -283,6 +288,10 @@ def _claim_task_once(
     if task is None:
         return None, True
 
+    # Preserve the pre-claim state through the LOCKED flip (transient, in-process
+    # only): a task claimed out of SUBMIT_WAIT already confirmed its entity miss
+    # and must go straight to the submit POST, not back through the entity GET.
+    claimed_from_submit_wait = task.state == TaskState.SUBMIT_WAIT
     # Issue a fresh fencing token + bump the monotonic lease version (F-07)
     # so any previous holder's late writes are rejected.
     task.state = TaskState.LOCKED
@@ -304,6 +313,7 @@ def _claim_task_once(
         last_claimed_at=now,
         claim_count=F("claim_count") + 1,
     )
+    task.claimed_from_submit_wait = claimed_from_submit_wait
     return task, False
 
 
@@ -313,10 +323,13 @@ def claim_task(
     exclude_ids: set[int] | None = None,
     structure_required: bool = False,
 ) -> RemoteTask | None:
-    """Atomically claim the next due READY task with FOR UPDATE SKIP LOCKED.
+    """Atomically claim the next due READY/SUBMIT_WAIT task (SKIP LOCKED).
 
     Must be called inside a transaction-managing caller; we open our own atomic
-    block so the row lock is held only for the claim flip.
+    block so the row lock is held only for the claim flip. Tasks claimed out of
+    SUBMIT_WAIT carry ``claimed_from_submit_wait=True`` (transient attribute on
+    the returned instance) so the worker skips the entity GET and goes straight
+    to the submit POST.
     """
     for _attempt in range(3):
         now = timezone.now()
@@ -503,6 +516,26 @@ def defer_task(task: RemoteTask, delay_seconds: float) -> None:
     transition(
         task,
         TaskState.DEFERRED,
+        next_run_at=next_run,
+        lock_owner=None,
+        locked_at=None,
+    )
+
+
+def park_submit_wait(task: RemoteTask, delay_seconds: float) -> None:
+    """Park a miss-confirmed task until the shared bucket can fund its POST.
+
+    The production limiter aliases entity GETs and submit POSTs to ONE
+    capacity-1 request bucket, so the GET that discovers a cache miss always
+    drains the token the same-tick submit would need. SUBMIT_WAIT preserves the
+    miss verdict across the wait: the task is claimed directly out of this state
+    (see :func:`claim_task`) and goes straight to the POST instead of burning
+    the refilled token on another GET.
+    """
+    next_run = timezone.now() + timedelta(seconds=max(delay_seconds, 0))
+    transition(
+        task,
+        TaskState.SUBMIT_WAIT,
         next_run_at=next_run,
         lock_owner=None,
         locked_at=None,

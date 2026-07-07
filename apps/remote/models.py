@@ -29,6 +29,11 @@ INCHIKEY_REGEX = r"^[A-Z]{14}-[A-Z]{10}-[A-Z]$"
 class RemoteTask(models.Model):
     """A unit of outstanding remote classification work for one InChIKey."""
 
+    # NOT a column: set by queue.claim_task on the returned instance when the
+    # task was claimed out of SUBMIT_WAIT, telling the worker the entity miss is
+    # already confirmed and processing must resume at the submit POST.
+    claimed_from_submit_wait: bool = False
+
     inchikey = models.CharField(max_length=27, help_text="Target InChIKey.")
     compound = models.ForeignKey(
         "compounds.CompoundStructure",

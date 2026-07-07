@@ -346,6 +346,13 @@ class RemoteWorker:
             QueryState.SUBMITTED, QueryState.POLLING
         ]).exists():
             self._poll_task(task, claim)
+        elif task.claimed_from_submit_wait and self._structure_for(task) is not None:
+            # Claimed out of SUBMIT_WAIT: the entity miss is already confirmed,
+            # so spend this wait's token on the POST — a second GET would drain
+            # the shared request bucket and starve the submit again. If the
+            # structure vanished meanwhile, fall through to the entity-first
+            # path, whose miss handling terminalizes as NEED_STRUCTURE.
+            self._submit_batch(task, claim)
         else:
             self._entity_first(task, claim)
 
@@ -864,10 +871,15 @@ class RemoteWorker:
         representative = members[0]
 
         # No existing intent → this is a genuine first/fresh submit. Only NOW
-        # draw a global submit token.
+        # draw a global submit token. On a miss, park as SUBMIT_WAIT — NOT
+        # DEFERRED — so the members resume at the POST: the production limiter
+        # shares ONE capacity-1 bucket between GETs and POSTs, and a deferred
+        # member would re-run its entity GET and drain the very token this
+        # submit is waiting for (starving POSTs forever).
         if not self.rate_limiter.submit.allow():
+            delay = _bucket_retry_delay_seconds(self.rate_limiter.submit)
             for member in members:
-                queue.defer_task(member, delay_seconds=5)
+                queue.park_submit_wait(member, delay_seconds=delay)
                 fanout.mark_items_delayed(member.inchikey)
             return
 
