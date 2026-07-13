@@ -9,15 +9,44 @@ duplicating — and possibly drifting from — the canonical behaviour.
 from __future__ import annotations
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 
-from apps.core.enums import EventCategory, ProviderControlState, SubmissionState
+from apps.core.enums import (
+    EventCategory,
+    ProviderControlState,
+    SubmissionState,
+    TaskState,
+)
 from apps.operations.models import SystemEvent
 from apps.remote.models import (
     RemoteProviderControl,
     RemoteSubmission,
     RemoteSubmissionMember,
+    RemoteTask,
 )
+
+
+def wake_submission_tasks(submission: RemoteSubmission) -> int:
+    """Wake tasks parked indefinitely for an operator-resolved submission."""
+    inchikeys = RemoteSubmissionMember.objects.filter(
+        submission=submission,
+        active=True,
+    ).values_list("inchikey", flat=True)
+    now = timezone.now()
+    return RemoteTask.objects.filter(
+        inchikey__in=inchikeys,
+        state=TaskState.DEFERRED,
+        next_run_at__isnull=True,
+    ).update(
+        state=TaskState.READY,
+        next_run_at=now,
+        lock_owner=None,
+        locked_at=None,
+        lease_token=None,
+        lease_version=F("lease_version") + 1,
+        updated_at=now,
+    )
 
 
 def reset_provider_auth(provider: str = "wishart", actor: str = "admin") -> SystemEvent:
@@ -59,6 +88,8 @@ def fail_unknown_submission(
             "only in-doubt UNKNOWN intents may be marked failed."
         )
     with transaction.atomic():
+        # Wake before releasing the active member rows that identify the tasks.
+        wake_submission_tasks(submission)
         submission.state = SubmissionState.FAILED
         submission.detail = (
             "operator verified provider did NOT accept "

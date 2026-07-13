@@ -30,7 +30,7 @@ from django.utils import timezone
 
 from apps.core.enums import QueryState, SubmissionState
 from apps.remote.models import RemoteQuery, RemoteSubmission
-from apps.remote.services import fail_unknown_submission
+from apps.remote.services import fail_unknown_submission, wake_submission_tasks
 
 
 class Command(BaseCommand):
@@ -129,6 +129,7 @@ class Command(BaseCommand):
                     "updated_at",
                 ]
             )
+            wake_submission_tasks(submission)
 
         self.stdout.write(
             self.style.SUCCESS(

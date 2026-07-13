@@ -522,6 +522,22 @@ def defer_task(task: RemoteTask, delay_seconds: float) -> None:
     )
 
 
+def park_for_operator(task: RemoteTask) -> None:
+    """Park without a timer until an operator explicitly resolves the blocker.
+
+    ``UNKNOWN_ACCEPTANCE`` cannot be retried safely because the provider may
+    already have accepted the POST. A null ``next_run_at`` keeps the task active
+    (and therefore keeps its dedup slot), but no timer wakes it automatically.
+    """
+    transition(
+        task,
+        TaskState.DEFERRED,
+        next_run_at=None,
+        lock_owner=None,
+        locked_at=None,
+    )
+
+
 def park_submit_wait(task: RemoteTask, delay_seconds: float) -> None:
     """Park a miss-confirmed task until the shared bucket can fund its POST.
 

@@ -454,7 +454,6 @@ class RemoteWorker:
             )
 
             def write_retryable(locked: RemoteTask) -> None:
-                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="RETRYABLE",
@@ -467,8 +466,15 @@ class RemoteWorker:
                     safe_headers=result.safe_headers,
                 )
                 if escalate_to_submit:
+                    # A key-specific entity 5xx is only a failed cache lookup.
+                    # The following submit decides shared-provider health.
+                    # Do not let this lookup stop unrelated queue work.
                     return
                 if terminalize_need_structure:
+                    # This task cannot submit without a structure, but the
+                    # provider did answer. Complete a possible HALF_OPEN probe
+                    # instead of globally blocking unrelated keys.
+                    self.circuit.record_success()
                     fanout.fan_out_result(
                         locked.inchikey, BatchItemStatus.NEED_STRUCTURE
                     )
@@ -476,6 +482,7 @@ class RemoteWorker:
                         locked, TaskState.DONE, lock_owner=None, locked_at=None
                     )
                     return
+                self.circuit.record_failure()
                 if _should_honor_retry_after(
                     retry_after=result.retry_after,
                     http_status=result.http_status,
@@ -491,13 +498,8 @@ class RemoteWorker:
 
             owned = self._with_owned_claim(claim, write_retryable)
             if owned and escalate_to_submit:
-                # Do NOT re-check the circuit here (the 404→submit path doesn't
-                # either): tick() already gated this task, and the 500 recorded
-                # above may itself have opened the circuit — a re-check would
-                # veto the escalation it just triggered, parking the tripping
-                # key in an endless probe → 500 → re-open → defer(300s) loop.
-                # The submit outcome drives the breaker: its success closes the
-                # circuit, its failure keeps it open.
+                # tick() already gated this task. The entity 500 is deliberately
+                # circuit-neutral; the submit outcome alone controls the breaker.
                 logger.warning(
                     "entity lookup returned HTTP %s for %s; "
                     "bypassing entity backoff with a structure submit",
@@ -944,7 +946,10 @@ class RemoteWorker:
             # (F-06). MUST NOT call _fail_submission() (which would free the key
             # and allow a duplicate POST). An operator resolves it out-of-band
             # via resolve_submission.
-            self.circuit.record_failure()
+            # Quarantine only this in-doubt payload. It must not open the shared
+            # circuit and stop unrelated work for 300 seconds. Completing a
+            # possible HALF_OPEN probe keeps the rest of the queue moving.
+            self.circuit.record_success()
             detail = (
                 "provider acceptance unknown after submit transport error; "
                 "automatic re-submit is blocked"
@@ -967,7 +972,7 @@ class RemoteWorker:
             submission.detail = detail
             submission.save(update_fields=["state", "detail", "updated_at"])
             for member in members:
-                queue.defer_task(member, delay_seconds=self.lease_seconds)
+                queue.park_for_operator(member)
                 fanout.mark_items_delayed(member.inchikey)
             return
         except RetryableProviderError as exc:
@@ -1173,7 +1178,7 @@ class RemoteWorker:
                 update_fields=["state", "remote_query_id", "detail", "updated_at"]
             )
             for member in members:
-                queue.defer_task(member, delay_seconds=self.lease_seconds)
+                queue.park_for_operator(member)
                 fanout.mark_items_delayed(member.inchikey)
             return
 
@@ -1240,6 +1245,14 @@ class RemoteWorker:
             self._park_members_poll_wait(members, poll_at)
             return
 
+        if submission.state == SubmissionState.UNKNOWN:
+            # No timer can resolve UNKNOWN or make a duplicate POST safe. Park
+            # this payload for explicit resolution and move to the next task.
+            for member in members:
+                queue.park_for_operator(member)
+                fanout.mark_items_delayed(member.inchikey)
+            return
+
         # PENDING in-doubt: NEVER re-POST while the key is held. Once the cap or
         # TTL elapses, PARK as UNKNOWN (still a live state → key STAYS held).
         attempts = submission.reconcile_attempts + 1
@@ -1295,7 +1308,10 @@ class RemoteWorker:
         # branches (PENDING below the cap, UNKNOWN at/above it), so no later tick
         # ever re-POSTs — UNKNOWN is cleared only by the operator command.
         for member in members:
-            queue.defer_task(member, delay_seconds=self.lease_seconds)
+            if submission.state == SubmissionState.UNKNOWN:
+                queue.park_for_operator(member)
+            else:
+                queue.defer_task(member, delay_seconds=self.lease_seconds)
             fanout.mark_items_delayed(member.inchikey)
 
     @staticmethod

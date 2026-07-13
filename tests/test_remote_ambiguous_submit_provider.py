@@ -9,6 +9,7 @@ from apps.core.enums import SubmissionState, TaskState
 from apps.remote.mock import MockProvider
 from apps.remote.models import RemoteSubmission, RemoteSubmissionMember, RemoteTask
 from apps.remote.provider import AmbiguousSubmissionError
+from apps.remote.services import fail_unknown_submission
 from apps.remote.wishart import WishartDirectProvider
 from apps.remote.worker import RemoteWorker
 
@@ -42,13 +43,19 @@ class NoSleepLimiter:
 
 
 class ClosedCircuit:
+    def __init__(self) -> None:
+        self.success_count = 0
+        self.failure_count = 0
+
     def allow(self) -> bool:
         return True
 
     def record_success(self) -> None:
+        self.success_count += 1
         self.last = "success"
 
     def record_failure(self) -> None:
+        self.failure_count += 1
         self.last = "failure"
 
 
@@ -65,7 +72,7 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
         canonical_smiles="CCO",
         original_input="CCO",
     )
-    RemoteTask.objects.create(
+    task = RemoteTask.objects.create(
         inchikey=compound.inchikey,
         compound=compound,
         state=TaskState.READY,
@@ -75,11 +82,12 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     transport = AcceptedThenReadErrorTransport()
     provider = WishartDirectProvider(base_url="https://wishart.invalid")
     provider._http_client = httpx.Client(transport=transport, base_url="https://wishart.invalid")
+    circuit = ClosedCircuit()
     worker = RemoteWorker(
         provider,
         worker_id="worker-a",
         rate_limiter=NoSleepLimiter(),
-        circuit=ClosedCircuit(),
+        circuit=circuit,
         lease_seconds=0.1,
     )
 
@@ -88,12 +96,22 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     submission = RemoteSubmission.objects.get()
     assert submission.state == SubmissionState.UNKNOWN
 
+    task.refresh_from_db()
+    assert task.state == TaskState.DEFERRED
+    assert task.next_run_at is None
+    assert circuit.failure_count == 0
+    assert circuit.success_count == 2  # entity miss + ambiguous submit
+
     for _ in range(5):
-        assert worker.tick() in {True, False}
+        assert worker.tick() is False
 
     assert transport.submit_count == 1
     submission.refresh_from_db()
     assert submission.state == SubmissionState.UNKNOWN
+    fail_unknown_submission(submission, actor="test")
+    task.refresh_from_db()
+    assert task.state == TaskState.READY
+    assert task.next_run_at is not None
 
 
 class AmbiguousSubmitProvider(MockProvider):

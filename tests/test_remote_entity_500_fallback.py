@@ -62,6 +62,7 @@ class _ClosedCircuit:
 class _OpeningCircuit:
     def __init__(self) -> None:
         self.open = False
+        self.failure_count = 0
 
     def allow(self) -> bool:
         return not self.open
@@ -70,6 +71,7 @@ class _OpeningCircuit:
         self.open = False
 
     def record_failure(self) -> None:
+        self.failure_count += 1
         self.open = True
 
 
@@ -213,15 +215,8 @@ def test_repeated_entity_500_with_retry_after_without_structure_marks_need_struc
     assert item.status == BatchItemStatus.NEED_STRUCTURE
 
 
-def test_entity_500_that_opens_circuit_still_escalates_to_submit():
-    """The 500 that trips the breaker must not veto its own escalation.
-
-    In production a burst of per-key 500s opened the circuit; the tripping key
-    then won every HALF_OPEN probe, its 500 re-opened the circuit, and the
-    escalate branch's circuit re-check deferred it for lease_seconds (300s) —
-    an endless 5-minute loop with the submit bypass never running. The submit
-    outcome, not the definitive per-key entity 500, must drive the breaker.
-    """
+def test_entity_500_is_circuit_neutral_and_submit_500_counts_once():
+    """The entity 500 consumes no breaker budget; the submit 500 counts once."""
     task = _claimed_task(with_compound=True, attempt=2)
     provider = _provider_returning(500)
     circuit = _OpeningCircuit()
@@ -230,6 +225,7 @@ def test_entity_500_that_opens_circuit_still_escalates_to_submit():
 
     assert provider.submit_calls == 1
     assert circuit.open
+    assert circuit.failure_count == 1  # submit 500 only; entity 500 is neutral
 
 
 def test_exhausted_entity_500_escalates_to_submit_after_circuit_opens():
