@@ -53,8 +53,10 @@ def test_global_queue_depth_is_race_safe(settings):
 
 @pytest.mark.django_db(transaction=True)
 def test_backpressured_batch_item_is_retried_by_ingest_worker(settings):
+    from django.utils import timezone
+
     from apps.batches.ingest import parse_text_input
-    from apps.batches.models import BatchItem
+    from apps.batches.models import BatchItem, BatchJob
     from apps.batches.services import create_job, run_pending_jobs
     from apps.core.enums import BatchItemStatus, BatchProcessingState
 
@@ -74,6 +76,10 @@ def test_backpressured_batch_item_is_retried_by_ingest_worker(settings):
 
     blocker.state = TaskState.DONE
     blocker.save(update_fields=["state"])
+
+    # Parking on backpressure gates the job's next claim on retry_not_before
+    # (a short interval); elapse it so this test covers the retry, not the pacing.
+    BatchJob.objects.filter(pk=job.pk).update(retry_not_before=timezone.now())
 
     assert run_pending_jobs("worker-1", max_jobs=1) == 1
     item.refresh_from_db()

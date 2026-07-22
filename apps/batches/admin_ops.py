@@ -11,13 +11,14 @@ import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Max
 
 from apps.batches.models import BatchItem, BatchJob, ExportArtifact
+from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
 from apps.core.enums import ACTIVE_TASK_STATES, BatchItemStatus, EventCategory, TaskState
 from apps.operations.models import SystemEvent
 from apps.remote.models import RemoteTask
@@ -57,6 +58,7 @@ class JobAdminOperationResult:
     items_requeued: int = 0
     items_deferred: int = 0
     items_skipped_not_timed_out: int = 0
+    items_skipped_not_budget_delayed: int = 0
     items_skipped_budget: int = 0
     items_skipped_backpressure: int = 0
 
@@ -142,6 +144,12 @@ def _bulk_defer_timed_out_items(
 
 
 def _release_jobs_for_remote_retry(job_ids: Iterable[object]) -> None:
+    """Make jobs immediately claimable again after an operator requeue.
+
+    Clearing ``retry_not_before`` matters as much as clearing the claim: a job
+    parked on a budget/capacity denial carries a retry gate, and an operator who
+    just requeued its rows means "now", not "when the gate elapses".
+    """
     ids = list(job_ids)
     if not ids:
         return
@@ -149,6 +157,7 @@ def _release_jobs_for_remote_retry(job_ids: Iterable[object]) -> None:
         claimed_by=None,
         claimed_at=None,
         processing_error=None,
+        retry_not_before=None,
     )
 
 
@@ -637,6 +646,189 @@ def requeue_timed_out_items(
             "items_requeued": result.items_requeued,
             "items_deferred": result.items_deferred,
             "items_skipped_not_timed_out": result.items_skipped_not_timed_out,
+            "items_skipped_budget": result.items_skipped_budget,
+            "items_skipped_backpressure": result.items_skipped_backpressure,
+            "job_ids": _job_id_strings(affected_job_ids),
+        },
+    )
+    return result
+
+
+def _bulk_defer_budget_delayed_items(
+    item_ids: Sequence[object],
+) -> tuple[int, int, set[uuid.UUID]]:
+    """Hand a large budget-delayed requeue to the ingest worker.
+
+    The rows are already the worker's durable retry record; all a big selection
+    needs is to make their jobs claimable NOW instead of at the parked gate
+    (next budget window). Collect the affected jobs across all chunks first, then
+    clear their claim + gate ONCE at the end so a job released by an early chunk
+    cannot be re-claimed by a worker and have that fresh claim clobbered by a
+    later chunk's release (mirrors the timed-out bulk path's transform-then-
+    release ordering). No task is enqueued synchronously; the worker re-probes.
+
+    Returns ``(deferred, skipped_not_budget_delayed, affected_job_ids)``.
+    """
+    deferred = 0
+    skipped_not_budget_delayed = 0
+    affected_job_ids: set[uuid.UUID] = set()
+
+    for chunk_ids in _chunks(item_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
+        existing = BatchItem.objects.filter(pk__in=chunk_ids).count()
+        rows = list(
+            BatchItem.objects.filter(
+                pk__in=chunk_ids,
+                status=BatchItemStatus.REMOTE_DELAYED,
+                message=BUDGET_EXCEEDED_MESSAGE,
+                inchikey__isnull=False,
+            )
+            .exclude(inchikey="")
+            .values_list("pk", "job_id")
+        )
+        deferred += len(rows)
+        skipped_not_budget_delayed += existing - len(rows)
+        affected_job_ids.update(job_id for _pk, job_id in rows)
+
+    _release_jobs_for_remote_retry(affected_job_ids)
+    return deferred, skipped_not_budget_delayed, affected_job_ids
+
+
+def requeue_budget_delayed_items(
+    item_ids: Iterable[object],
+    *,
+    actor: str,
+) -> JobAdminOperationResult:
+    """Re-queue REMOTE_DELAYED items parked by the daily remote budget.
+
+    The ingest worker already drains these on its own once ``retry_not_before``
+    (the next budget window) elapses. This is the operator's "now" button for
+    when the budget was just raised and waiting out that gate is not acceptable.
+
+    Bounded like :func:`requeue_timed_out_items`: selections over
+    ``REQUEUE_TIMED_OUT_INLINE_LIMIT`` are handed to the worker (claim + gate
+    cleared) rather than enqueued synchronously in the admin request. Smaller
+    selections enqueue inline for immediate feedback; rows still denied by the
+    budget stay REMOTE_DELAYED and are counted (never silently dropped), and on
+    the first queue-capacity denial the remaining rows are deferred rather than
+    re-probed one by one. Every touched job is released (claim + gate cleared) so
+    whatever this pass could not enqueue is retried promptly by the worker.
+    """
+    # Imported lazily to avoid an import cycle (services imports batches models).
+    from apps.batches.services import (
+        _get_or_create_remote_task,
+        _initial_status_for_remote_task,
+        recompute_job_counters,
+    )
+    from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
+    from apps.remote.queue import RemoteQueueBackpressure
+
+    selected_ids = list(item_ids)
+
+    if len(selected_ids) > REQUEUE_TIMED_OUT_INLINE_LIMIT:
+        deferred, skipped_not_budget_delayed, affected_job_ids = (
+            _bulk_defer_budget_delayed_items(selected_ids)
+        )
+        for job_id in affected_job_ids:
+            recompute_job_counters(job_id)
+        result = JobAdminOperationResult(
+            items_deferred=deferred,
+            items_skipped_not_budget_delayed=skipped_not_budget_delayed,
+        )
+        _audit(
+            "admin_requeue_budget_delayed",
+            {
+                "actor": actor,
+                "items_deferred": result.items_deferred,
+                "items_skipped_not_budget_delayed": result.items_skipped_not_budget_delayed,
+                "job_ids": _job_id_strings(affected_job_ids),
+            },
+        )
+        return result
+
+    requeued = 0
+    skipped_not_budget_delayed = 0
+    skipped_budget = 0
+    skipped_backpressure = 0
+    affected_job_ids = set()
+    budget_exhausted_principals: set[str] = set()
+
+    for chunk_ids in _chunks(selected_ids, REQUEUE_TIMED_OUT_CHUNK_SIZE):
+        with transaction.atomic():
+            # Lock only BatchItem rows; compound is nullable and joins with LEFT OUTER.
+            items = list(
+                BatchItem.objects.select_for_update(of=("self",))
+                .select_related("job", "compound")
+                .filter(pk__in=chunk_ids)
+            )
+            retryable_items = [
+                item
+                for item in items
+                if item.status == BatchItemStatus.REMOTE_DELAYED
+                and item.message == BUDGET_EXCEEDED_MESSAGE
+                and item.inchikey
+            ]
+            skipped_not_budget_delayed += len(items) - len(retryable_items)
+            # Release every touched job regardless of per-row outcome: a still-
+            # budget-denied row re-parks on the next worker pass, but a row now
+            # blocked only by backpressure must not stay behind the old (next-
+            # midnight) budget gate.
+            chunk_affected_job_ids = {item.job_id for item in retryable_items}
+
+            for index, item in enumerate(retryable_items):
+                principal = normalize_principal(item.job.remote_principal)
+                # Every row in a job shares one principal, so once it is denied no
+                # later row of that principal can succeed: stop spending probes.
+                if principal in budget_exhausted_principals:
+                    skipped_budget += 1
+                    continue
+                try:
+                    task = _get_or_create_remote_task(
+                        cast(str, item.inchikey),
+                        item.compound,
+                        principal=item.job.remote_principal,
+                        priority=item.job.priority,
+                    )
+                except RemoteBudgetExceededError:
+                    budget_exhausted_principals.add(principal)
+                    skipped_budget += 1
+                    continue
+                except RemoteQueueBackpressure:
+                    # Capacity is a GLOBAL condition: no remaining row can enqueue
+                    # this pass either. Re-label this row + the rest queue-capacity
+                    # so their delay-cause UI reflects the CURRENT blocker instead
+                    # of the stale budget message, then stop probing; the released
+                    # jobs' next worker pass retries them (and re-labels any that
+                    # turn out to be still budget-blocked).
+                    remaining = retryable_items[index:]
+                    BatchItem.objects.filter(
+                        pk__in=[row.pk for row in remaining],
+                        status=BatchItemStatus.REMOTE_DELAYED,
+                    ).update(message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE)
+                    skipped_backpressure += len(remaining)
+                    break
+                status, message = _initial_status_for_remote_task(task)
+                item.status = status
+                item.message = message
+                item.save(update_fields=["status", "message"])
+                requeued += 1
+
+            _release_jobs_for_remote_retry(chunk_affected_job_ids)
+            for job_id in chunk_affected_job_ids:
+                recompute_job_counters(job_id)
+        affected_job_ids.update(chunk_affected_job_ids)
+
+    result = JobAdminOperationResult(
+        items_requeued=requeued,
+        items_skipped_not_budget_delayed=skipped_not_budget_delayed,
+        items_skipped_budget=skipped_budget,
+        items_skipped_backpressure=skipped_backpressure,
+    )
+    _audit(
+        "admin_requeue_budget_delayed",
+        {
+            "actor": actor,
+            "items_requeued": result.items_requeued,
+            "items_skipped_not_budget_delayed": result.items_skipped_not_budget_delayed,
             "items_skipped_budget": result.items_skipped_budget,
             "items_skipped_backpressure": result.items_skipped_backpressure,
             "job_ids": _job_id_strings(affected_job_ids),

@@ -265,6 +265,15 @@ INGEST_DEFER_HEAVY_PROCESSING: bool = env_bool("INGEST_DEFER_HEAVY_PROCESSING", 
 # lets a crashed worker's job resume while an actively-leased job is protected
 # from theft. Every processing write is fenced to the claim owner+version.
 INGEST_CLAIM_LEASE_SECONDS: int = env_int("INGEST_CLAIM_LEASE_SECONDS", 900)
+# How long a job parked on queue BACKPRESSURE waits before a worker may
+# re-claim it and re-probe its REMOTE_DELAYED rows. Deliberately SEPARATE from
+# the claim lease above: the lease is crash detection, this is the retry
+# cadence, and tying the two would make raising the lease for big jobs silently
+# slow retries down. A spent DAILY budget uses a different gate (the next budget
+# window start) rather than this interval, since it does not refill until then.
+# Floored to >= 1s at use time so a zero/negative value cannot hot-loop the
+# worker.
+REMOTE_DELAY_RETRY_SECONDS: int = env_int("REMOTE_DELAY_RETRY_SECONDS", 60)
 JOB_CREATE_RATE_LIMIT_PER_MINUTE: int = env_int("JOB_CREATE_RATE_LIMIT_PER_MINUTE", 30)
 JOB_CREATE_DAILY_ROW_CAP: int = env_int("JOB_CREATE_DAILY_ROW_CAP", 100_000)
 ACTIVE_JOB_CAP: int = env_int("ACTIVE_JOB_CAP", 20)

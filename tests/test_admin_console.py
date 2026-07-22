@@ -815,6 +815,321 @@ def test_requeue_skips_over_budget_items(settings):
     assert not RemoteTask.objects.filter(inchikey=IK3).exists()
 
 
+def test_requeue_budget_delayed_drains_rows_and_releases_the_retry_gate(settings):
+    from apps.batches.admin_ops import requeue_budget_delayed_items
+    from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
+
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 10
+    # A job the worker parked on a budget denial: claim released, retry gated.
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=1,
+        remote_pending_count=1,
+        retry_not_before=timezone.now() + timezone.timedelta(seconds=600),
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message=BUDGET_EXCEEDED_MESSAGE,
+    )
+
+    result = requeue_budget_delayed_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 1
+    assert result.items_skipped_budget == 0
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert RemoteTask.objects.filter(
+        inchikey=IK1, state__in=[s.value for s in TaskState.active_states()]
+    ).exists()
+    # The operator meant "now": the gate must not keep the job parked.
+    job.refresh_from_db()
+    assert job.retry_not_before is None
+    assert job.claimed_by is None
+    event = SystemEvent.objects.filter(
+        event_type="admin_requeue_budget_delayed"
+    ).latest("created_at")
+    assert event.payload["items_requeued"] == 1
+    assert event.category == "SECURITY"
+
+
+def test_requeue_budget_delayed_counts_still_over_budget_rows(settings):
+    from apps.batches.admin_ops import requeue_budget_delayed_items
+    from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
+
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 0  # operator retried too early
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=1,
+        remote_pending_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message=BUDGET_EXCEEDED_MESSAGE,
+    )
+
+    result = requeue_budget_delayed_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_skipped_budget == 1
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.message == BUDGET_EXCEEDED_MESSAGE
+    assert not RemoteTask.objects.filter(inchikey=IK1).exists()
+
+
+def test_requeue_budget_delayed_skips_action_gated_rows(settings):
+    from apps.batches.admin_ops import requeue_budget_delayed_items
+    from apps.batches.remote_delay import REMOTE_DISABLED_MESSAGE
+
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 10
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=1,
+        remote_pending_count=1,
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK2,
+        inchikey=IK2,
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message=REMOTE_DISABLED_MESSAGE,
+    )
+
+    result = requeue_budget_delayed_items([item.pk], actor="tester")
+
+    assert result.items_requeued == 0
+    assert result.items_skipped_not_budget_delayed == 1
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.REMOTE_DELAYED
+    assert item.message == REMOTE_DISABLED_MESSAGE
+    assert not RemoteTask.objects.filter(inchikey=IK2).exists()
+
+
+def test_requeue_budget_delayed_defers_remaining_on_first_backpressure(settings):
+    from apps.batches.admin_ops import (
+        REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+        requeue_budget_delayed_items,
+    )
+    from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
+
+    # Budget available, but the queue is full: every enqueue hits backpressure.
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 10
+    settings.REMOTE_MAX_QUEUE_DEPTH = 1
+    RemoteTask.objects.create(inchikey=IK1, state=TaskState.READY)
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=2,
+        remote_pending_count=2,
+        retry_not_before=timezone.now() + timezone.timedelta(seconds=600),
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=key,
+            inchikey=key,
+            status=BatchItemStatus.REMOTE_DELAYED,
+            message=BUDGET_EXCEEDED_MESSAGE,
+        )
+        for index, key in enumerate((IK2, IK3))
+    ]
+
+    result = requeue_budget_delayed_items([i.pk for i in items], actor="tester")
+
+    # First backpressure stops probing; both rows counted, none re-queued.
+    assert result.items_requeued == 0
+    assert result.items_skipped_backpressure == 2
+    # The blocker is now queue capacity, so the rows are re-labeled to match —
+    # otherwise the delay-cause UI would keep classifying them as budget_exceeded
+    # while the gate uses the short backpressure interval.
+    for item in items:
+        item.refresh_from_db()
+        assert item.status == BatchItemStatus.REMOTE_DELAYED
+        assert item.message == REMOTE_QUEUE_BACKPRESSURE_MESSAGE
+    assert BUDGET_EXCEEDED_MESSAGE not in {item.message for item in items}
+    assert not RemoteTask.objects.filter(inchikey__in=[IK2, IK3]).exists()
+    # The job's gate is cleared so the worker retries once the queue drains,
+    # rather than the rows waiting behind the old next-midnight budget gate.
+    job.refresh_from_db()
+    assert job.retry_not_before is None
+
+
+def test_requeue_budget_delayed_bulk_defers_large_selection_to_worker(settings):
+    """Over the inline limit: hand the work to the ingest worker (clear the
+    gate) instead of enqueuing thousands of tasks inside one admin request."""
+    from apps.batches import admin_ops
+    from apps.batches.admin_ops import requeue_budget_delayed_items
+    from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
+
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 10
+    limit = admin_ops.REQUEUE_TIMED_OUT_INLINE_LIMIT
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=limit + 1,
+        remote_pending_count=limit + 1,
+        retry_not_before=timezone.now() + timezone.timedelta(seconds=600),
+    )
+    # Unique keys matching the batch_item_inchikey_format constraint
+    # (^[A-Z]{14}-[A-Z]{10}-[A-Z]$): vary the last two letters of block 1.
+    def _key(index: int) -> str:
+        suffix = chr(ord("A") + index // 26) + chr(ord("A") + index % 26)
+        return f"AAAAAAAAAAAA{suffix}-BBBBBBBBBB-N"
+
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=_key(index),
+            inchikey=_key(index),
+            status=BatchItemStatus.REMOTE_DELAYED,
+            message=BUDGET_EXCEEDED_MESSAGE,
+        )
+        for index in range(limit + 1)
+    ]
+    # A selected row that is NOT budget-delayed must be counted, not silently
+    # dropped, even on the bulk path.
+    non_target = BatchItem.objects.create(
+        job=job,
+        row_order=limit + 1,
+        original_input="ZZZZZZZZZZZZZZ-BBBBBBBBBB-N",
+        inchikey="ZZZZZZZZZZZZZZ-BBBBBBBBBB-N",
+        status=BatchItemStatus.FOUND_LIVE_CACHE,
+    )
+
+    result = requeue_budget_delayed_items(
+        [i.pk for i in items] + [non_target.pk], actor="tester"
+    )
+
+    assert result.items_deferred == limit + 1
+    assert result.items_skipped_not_budget_delayed == 1
+    assert result.items_requeued == 0
+    # No synchronous enqueue happened; the worker owns the actual re-probe.
+    assert RemoteTask.objects.count() == 0
+    for item in items:
+        item.refresh_from_db()
+        assert item.status == BatchItemStatus.REMOTE_DELAYED
+    # Gate cleared so the worker claims it now, not at the next budget window.
+    job.refresh_from_db()
+    assert job.retry_not_before is None
+    event = SystemEvent.objects.filter(
+        event_type="admin_requeue_budget_delayed"
+    ).latest("created_at")
+    assert event.payload["items_deferred"] == limit + 1
+    assert event.payload["items_skipped_not_budget_delayed"] == 1
+
+
+def test_bulk_defer_releases_jobs_once_after_all_chunks(monkeypatch):
+    """Releasing a job per chunk lets a worker claim it after chunk 1 and then
+    have that claim clobbered by chunk 2. Collect all jobs, release once."""
+    from apps.batches import admin_ops
+    from apps.batches.admin_ops import _bulk_defer_budget_delayed_items
+    from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
+
+    # Force one job's items to span multiple chunks.
+    monkeypatch.setattr(admin_ops, "REQUEUE_TIMED_OUT_CHUNK_SIZE", 2)
+    release_calls: list[set] = []
+    real_release = admin_ops._release_jobs_for_remote_retry
+
+    def spy_release(job_ids):
+        ids = set(job_ids)
+        release_calls.append(ids)
+        real_release(ids)
+
+    monkeypatch.setattr(admin_ops, "_release_jobs_for_remote_retry", spy_release)
+
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=5,
+        remote_pending_count=5,
+        retry_not_before=timezone.now() + timezone.timedelta(seconds=600),
+    )
+    items = [
+        BatchItem.objects.create(
+            job=job,
+            row_order=index,
+            original_input=f"AAAAAAAAAAAA{chr(65 + index)}Z-BBBBBBBBBB-N",
+            inchikey=f"AAAAAAAAAAAA{chr(65 + index)}Z-BBBBBBBBBB-N",
+            status=BatchItemStatus.REMOTE_DELAYED,
+            message=BUDGET_EXCEEDED_MESSAGE,
+        )
+        for index in range(5)
+    ]
+
+    deferred, skipped, affected = _bulk_defer_budget_delayed_items(
+        [i.pk for i in items]
+    )
+
+    assert deferred == 5
+    assert skipped == 0
+    # 5 items / chunk size 2 = 3 chunks, but the release must happen exactly once
+    # (after all chunks), covering the single affected job.
+    assert len(release_calls) == 1
+    assert release_calls[0] == {job.pk}
+    assert affected == {job.pk}
+    job.refresh_from_db()
+    assert job.retry_not_before is None
+    assert job.claimed_by is None
+
+
+def test_batchitem_admin_retry_budget_delayed_action(admin_client, settings):
+    from apps.batches.remote_delay import BUDGET_EXCEEDED_MESSAGE
+
+    settings.REMOTE_DAILY_BUDGET_PER_PRINCIPAL = 10
+    job = BatchJob.objects.create(
+        secret_hash="x",
+        status=BatchJobStatus.IN_PROGRESS,
+        processing_state=BatchProcessingState.REMOTE_PENDING,
+        total_count=1,
+        remote_pending_count=1,
+        retry_not_before=timezone.now() + timezone.timedelta(seconds=600),
+    )
+    item = BatchItem.objects.create(
+        job=job,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.REMOTE_DELAYED,
+        message=BUDGET_EXCEEDED_MESSAGE,
+    )
+    url = reverse("admin:batches_batchitem_changelist")
+
+    response = admin_client.post(
+        url,
+        {"action": "retry_budget_delayed", "_selected_action": [str(item.pk)]},
+    )
+
+    assert response.status_code == 302
+    item.refresh_from_db()
+    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    assert RemoteTask.objects.filter(
+        inchikey=IK1, state__in=[s.value for s in TaskState.active_states()]
+    ).exists()
+    assert SystemEvent.objects.filter(
+        event_type="admin_requeue_budget_delayed"
+    ).exists()
+
+
 def test_requeue_parks_backpressure_items_and_audits(settings):
     from apps.batches.admin_ops import requeue_timed_out_items
 

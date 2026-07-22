@@ -107,6 +107,17 @@ class BatchJob(models.Model):
         db_default=0,
         help_text="Monotonic lease version; bumped on every (re)claim.",
     )
+    # Earliest time a worker may claim this job again. Set when the worker parks
+    # a job whose remaining remote work is blocked by a TRANSIENT cause (daily
+    # budget spent, queue at capacity): the claim is released immediately so any
+    # worker can resume it, and this gate paces the retry instead. Without it a
+    # released job would be re-claimed on the very next loop iteration and spin
+    # on the same denial. Null means "claimable now".
+    retry_not_before = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Earliest time the ingest worker may re-claim this job.",
+    )
 
     # --- Spooled raw-upload artifact (H-04) ---
     # When an upload is spooled to a durable artifact in-request, parsing is

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from django.conf import settings
 from django.db import connection, transaction
@@ -35,6 +35,23 @@ def _daily_window_start():
     now = timezone.localtime(timezone.now())
     return timezone.make_aware(
         datetime.combine(now.date(), time.min),
+        timezone.get_current_timezone(),
+    )
+
+
+def next_daily_budget_window_start() -> datetime:
+    """Start of the NEXT daily budget window.
+
+    ``reserve_remote_budget`` counts ledger units since ``_daily_window_start``
+    (local midnight), so a principal's spent budget effectively refills at the
+    next local midnight. Callers that must wait out an exhausted daily budget
+    gate their retry on this instant rather than probing on a fixed short
+    interval until the window rolls over. Recomputed from ``now`` each call so it
+    tracks DST changes rather than assuming a fixed 24-hour offset.
+    """
+    now = timezone.localtime(timezone.now())
+    return timezone.make_aware(
+        datetime.combine(now.date() + timedelta(days=1), time.min),
         timezone.get_current_timezone(),
     )
 

@@ -53,7 +53,7 @@ import secrets
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -93,7 +93,11 @@ from apps.core.enums import (
 )
 from apps.core.security import MAX_STRUCTURE_LEN, RowTooLongError, check_structure_length
 from apps.remote import queue as remote_queue
-from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
+from apps.remote.budget import (
+    RemoteBudgetExceededError,
+    next_daily_budget_window_start,
+    normalize_principal,
+)
 from apps.remote.models import RemoteTask
 from apps.remote.negative_cache import (
     NEGATIVE_HARD_FAILED_MESSAGE,
@@ -981,6 +985,18 @@ _TRANSIENT_REMOTE_DELAY_MESSAGES = (
     BUDGET_EXCEEDED_MESSAGE,
 )
 
+# Why the ingest sweep stopped, so the caller can pick a cause-appropriate retry
+# gate: a spent DAILY budget only refills at the next window boundary, whereas
+# queue capacity frees continuously and wants a short interval.
+_PARK_CAUSE_BUDGET = "budget"
+_PARK_CAUSE_BACKPRESSURE = "backpressure"
+
+# Floor on the backpressure retry interval. A zero/negative
+# REMOTE_DELAY_RETRY_SECONDS would set the gate to "now", making the released
+# job instantly re-claimable and turning the process_jobs loop into a hot spin
+# on the same denial; clamp so a misconfiguration can never do that.
+_MIN_REMOTE_DELAY_RETRY_SECONDS = 1
+
 
 def _retry_transiently_delayed_remote_items(
     claim: IngestJobClaim,
@@ -988,7 +1004,7 @@ def _retry_transiently_delayed_remote_items(
     remote_enabled: bool,
     remote_principal: str = "system",
     job_priority: int = 0,
-) -> None:
+) -> str | None:
     """Retry durable enqueue for items delayed by queue capacity or budget.
 
     Backpressure and budget denial both happen before a RemoteTask can be
@@ -1000,14 +1016,18 @@ def _retry_transiently_delayed_remote_items(
     Rows are locked and processed in row_order chunks so a large parked job
     never holds tens of thousands of row locks in one transaction. The sweep
     stops at the first budget denial (every row in a job shares one principal,
-    so nothing later in the scan can succeed) or queue backpressure, and
-    resumes on a later reclaim once the daily window resets or capacity frees.
+    so nothing later in the scan can succeed) or queue backpressure.
+
+    Returns the stop cause (``_PARK_CAUSE_BUDGET`` / ``_PARK_CAUSE_BACKPRESSURE``)
+    when it stopped on such a denial and rows are still delayed, or ``None`` when
+    everything drained. The caller uses the cause to pick a cause-appropriate
+    retry gate instead of leaving the job claimed.
     """
     if not remote_enabled:
-        return
+        return None
 
     while True:
-        stop = False
+        stop_cause: str | None = None
         with transaction.atomic():
             # Lock retryable item rows before the parent job row. Remote fan-out
             # updates matching BatchItem rows and then recomputes counters, which
@@ -1024,9 +1044,9 @@ def _retry_transiently_delayed_remote_items(
                 .order_by("row_order")[:PROCESS_CHUNK_SIZE]
             )
             if not items:
-                return
+                return None
             _lock_owned_job(claim)
-            for item in items:
+            for index, item in enumerate(items):
                 inchikey = cast(str, item.inchikey)
                 result = lookup_current_classification(inchikey)
                 if result is not None:
@@ -1054,25 +1074,33 @@ def _retry_transiently_delayed_remote_items(
                 except RemoteBudgetExceededError:
                     # The principal's daily budget is spent, so no later row can
                     # enqueue this pass. Record the cause on this row and stop;
-                    # a later reclaim retries after the window resets or an
-                    # operator raises the budget.
+                    # the caller parks the job until the budget window resets
+                    # (or an operator raises the budget and requeues it).
                     item.message = BUDGET_EXCEEDED_MESSAGE
                     item.save(update_fields=["message"])
-                    stop = True
+                    stop_cause = _PARK_CAUSE_BUDGET
                     break
                 except RemoteQueueBackpressure:
-                    # Capacity is still exhausted. Leave the item as the durable
-                    # retry record for a later ingest-worker pass. Stop this
-                    # pass so large delayed jobs do not scan thousands of rows
-                    # while full.
-                    stop = True
+                    # Capacity is a GLOBAL condition: neither this row nor any
+                    # later row in the chunk can enqueue this pass. Re-label them
+                    # queue-capacity (they may have arrived carrying the budget
+                    # message) so the delay-cause UI reflects the CURRENT blocker
+                    # and the gate/label agree; a row that is truly still
+                    # budget-blocked is re-probed and re-labeled on the next pass.
+                    # Then stop so large delayed jobs do not scan thousands of
+                    # rows while full.
+                    BatchItem.objects.filter(
+                        pk__in=[row.pk for row in items[index:]],
+                        status=BatchItemStatus.REMOTE_DELAYED,
+                    ).update(message=_REMOTE_QUEUE_BACKPRESSURE_MESSAGE)
+                    stop_cause = _PARK_CAUSE_BACKPRESSURE
                     break
                 else:
                     item.status = BatchItemStatus.PENDING_CLASSIFICATION
                     item.message = None
                     item.save(update_fields=["status", "message"])
-        if stop:
-            return
+        if stop_cause:
+            return stop_cause
 
 
 class IngestLeaseLost(Exception):  # noqa: N818 - mirrors remote LeaseLost contract
@@ -1307,15 +1335,58 @@ def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> 
             checkpoint_row_order=chunk[-1].row_order,
         )
 
-    _retry_transiently_delayed_remote_items(
+    park_cause = _retry_transiently_delayed_remote_items(
         claim,
         remote_enabled=job.remote_enabled,
         remote_principal=job.remote_principal,
         job_priority=job.priority,
     )
     recompute_job_counters(job.pk)
+    if park_cause is not None:
+        _park_job_for_delayed_retry(claim, park_cause)
     # Refresh in-memory
     job.refresh_from_db()
+
+
+def _delayed_retry_gate(cause: str) -> datetime:
+    """When a job parked on *cause* should next become claimable.
+
+    A spent daily budget only refills when the budget window rolls over, so
+    probing it on a short interval until then just burns advisory locks and
+    transactions every minute for hours; gate budget parks on the next window
+    start instead. Queue capacity frees continuously, so backpressure parks use
+    the short (floored) retry interval.
+    """
+    if cause == _PARK_CAUSE_BUDGET:
+        return next_daily_budget_window_start()
+    interval = max(
+        _MIN_REMOTE_DELAY_RETRY_SECONDS,
+        int(getattr(settings, "REMOTE_DELAY_RETRY_SECONDS", 60)),
+    )
+    return timezone.now() + timedelta(seconds=interval)
+
+
+def _park_job_for_delayed_retry(claim: IngestJobClaim, cause: str) -> None:
+    """Release the claim on a job whose remote work is transiently blocked.
+
+    The job keeps a claimable processing_state (REMOTE_PENDING) but its rows
+    cannot enqueue until the daily budget window resets or queue capacity frees.
+    Holding the claim would hide it from every worker until the crash-detection
+    lease went stale, making the retry cadence an accident of
+    INGEST_CLAIM_LEASE_SECONDS. Release the claim instead and gate the next
+    attempt on ``retry_not_before`` (see :func:`_delayed_retry_gate`), so the
+    retry cadence is its own cause-specific knob and a released job cannot be
+    re-claimed on the very next worker loop iteration.
+
+    Fenced to the claim owner+version: a worker that already lost its lease must
+    not clear the new owner's claim.
+    """
+    _fenced_claim_update(
+        claim,
+        claimed_by=None,
+        claimed_at=None,
+        retry_not_before=_delayed_retry_gate(cause),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1331,17 +1402,21 @@ def claim_job_for_processing(worker_id: str) -> BatchJob | None:
     fresh lease so any-language worker can drive the same column. Returns the
     claimed job, or None when nothing needs work.
     """
-    stale_before = timezone.now() - timedelta(
+    now = timezone.now()
+    stale_before = now - timedelta(
         seconds=getattr(settings, "INGEST_CLAIM_LEASE_SECONDS", 900)
     )
     with transaction.atomic():
         # Claim only never-claimed jobs (claimed_by is null) or jobs whose lease
         # has gone stale (claimed_at older than the TTL). An actively-leased job
         # is excluded, so a job being driven by another worker cannot be stolen.
+        # Jobs parked on a transient remote denial carry a retry_not_before gate
+        # and stay invisible until it elapses (see _park_job_for_delayed_retry).
         job = (
             BatchJob.objects.select_for_update(skip_locked=True)
             .filter(processing_state__in=CLAIMABLE_PROCESSING_STATES)
             .filter(Q(claimed_by__isnull=True) | Q(claimed_at__lt=stale_before))
+            .filter(Q(retry_not_before__isnull=True) | Q(retry_not_before__lte=now))
             .order_by("-priority", "created_at", "id")
             .first()
         )
@@ -1351,12 +1426,16 @@ def claim_job_for_processing(worker_id: str) -> BatchJob | None:
         job.claimed_by = worker_id
         job.claimed_at = timezone.now()
         job.claim_lease_version = job.claim_lease_version + 1
+        # The gate has been honored; clear it so a job that parks again gets a
+        # fresh interval and a job that drains leaves no stale gate behind.
+        job.retry_not_before = None
         job.save(
             update_fields=[
                 "processing_state",
                 "claimed_by",
                 "claimed_at",
                 "claim_lease_version",
+                "retry_not_before",
             ]
         )
         return job

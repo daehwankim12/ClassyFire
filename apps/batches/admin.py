@@ -18,6 +18,7 @@ from django.utils.html import format_html
 from apps.batches.admin_ops import (
     cancel_and_delete_jobs,
     delete_jobs_with_artifacts,
+    requeue_budget_delayed_items,
     requeue_timed_out_items,
     set_job_priority,
 )
@@ -241,7 +242,7 @@ class BatchItemAdmin(
     list_filter = ("status", "detected_type")
     search_fields = ("inchikey", "external_id")
     list_select_related = ("job",)
-    actions = ("retry_timed_out",)
+    actions = ("retry_timed_out", "retry_budget_delayed")
 
     @admin.action(
         description="Retry timed-out remote items (re-queue)",
@@ -262,6 +263,29 @@ class BatchItemAdmin(
                 f"skipped {result.items_skipped_not_timed_out} not-timed-out and "
                 f"{result.items_skipped_budget} over-budget and "
                 f"{result.items_skipped_backpressure} at-capacity."
+            ),
+        )
+
+    @admin.action(
+        description="Retry budget-delayed remote items now (re-queue)",
+        permissions=("operate",),
+    )
+    def retry_budget_delayed(
+        self, request: HttpRequest, queryset: QuerySet[BatchItem]
+    ) -> None:
+        result = requeue_budget_delayed_items(
+            queryset.values_list("pk", flat=True),
+            actor=request.user.get_username(),
+        )
+        self.message_user(
+            request,
+            (
+                f"Re-queued {result.items_requeued} item(s); "
+                f"deferred {result.items_deferred} for worker retry; "
+                f"skipped {result.items_skipped_not_budget_delayed} not-budget-delayed "
+                f"and {result.items_skipped_budget} still-over-budget and "
+                f"{result.items_skipped_backpressure} at-capacity. "
+                "Affected jobs were released for an immediate worker pass."
             ),
         )
 

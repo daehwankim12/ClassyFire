@@ -69,9 +69,47 @@ REMOTE_DELAYED
 A `REMOTE_DELAYED` row parked *before* its RemoteTask could be inserted (queue
 backpressure or daily-budget denial) is the durable retry record: each time the
 ingest worker reclaims the `REMOTE_PENDING` job it retries those rows in
-`row_order` chunks, stopping at the first budget denial or backpressure and
-resuming on a later reclaim. Remote-disabled and other `REMOTE_DELAYED` rows
-stay parked until user/operator action.
+`row_order` chunks, stopping at the first budget denial or backpressure.
+Remote-disabled and other `REMOTE_DELAYED` rows stay parked until user/operator
+action.
+
+A worker that stops on such a denial **releases its claim** (`claimed_by`,
+`claimed_at` back to null) and stamps a `retry_not_before` gate;
+`claim_job_for_processing` skips jobs whose gate has not elapsed and clears it on
+claim. The release is what makes the retry happen at all — a job that stayed
+claimed would be invisible to every worker until its crash-detection lease went
+stale, so the retry cadence would silently be `INGEST_CLAIM_LEASE_SECONDS`
+(15 min). The gate is what keeps the release from spinning: `run_pending_jobs`
+(and the `process_jobs` loop) claim until nothing is claimable, so an ungated
+released job would be re-claimed immediately and hot-loop on the same denial.
+Lease TTL is crash detection; `retry_not_before` is the retry cadence; they are
+deliberately separate knobs.
+
+The gate is **cause-specific**, because the two denials clear on different
+timescales:
+
+- **Queue backpressure** frees continuously, so the gate is a short interval,
+  `now + REMOTE_DELAY_RETRY_SECONDS`. That interval is floored to ≥ 1s at use
+  time, so a zero/negative misconfiguration can never set the gate to "now" and
+  hot-loop the worker.
+- **Daily-budget denial** does not clear until the budget window rolls over, so
+  the gate is the *next daily window start* (local midnight, when
+  `reserve_remote_budget` resets). Probing every minute until then would just
+  burn advisory locks and transactions for hours.
+
+Because the gate is cause-specific, the row's `message` must match: a row that
+arrived carrying the budget message but now hits backpressure (budget freed,
+queue full) is **re-labeled** to the queue-capacity message — capacity is global,
+so the whole remaining chunk is re-labeled — so `_classify_item`'s delay-cause UI
+reflects the current blocker and agrees with the short gate. A row that is really
+still budget-blocked is re-probed and re-labeled back on its next pass.
+
+Operators who raise the budget mid-day do not have to wait out the window: the
+admin action *Retry budget-delayed remote items now* (`requeue_budget_delayed_items`)
+re-enqueues the rows and clears both the claim and the gate. Like the timed-out
+requeue, it is bounded — selections over the inline limit are handed to the
+worker (gate cleared) instead of enqueuing every row synchronously in the admin
+request, and it stops probing at the first queue-capacity denial.
 
 Terminal states (`FOUND_*`, `COMPLETE_AFTER_WISHART`, `NEED_STRUCTURE`,
 `INVALID_INPUT`, `RESULT_KEY_MISMATCH`) are not left again within the same job.
