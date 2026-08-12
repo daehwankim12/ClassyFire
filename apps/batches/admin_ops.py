@@ -302,7 +302,7 @@ def recompute_remote_priorities_for_inchikeys(
 
     Returns ``(updated, skipped_leased)``.
     """
-    keys = {key for key in inchikeys if key}
+    keys = sorted({key for key in inchikeys if key})
     if not keys:
         return 0, 0
 
@@ -442,9 +442,13 @@ def set_job_priority(
         jobs_updated = BatchJob.objects.filter(pk__in=existing_ids).update(
             priority=priority
         )
-        remote_updated, remote_skipped_leased = recompute_remote_priorities_for_inchikeys(
-            affected_inchikeys
-        )
+
+    # Reprioritizing a large job can touch tens of thousands of RemoteTask rows.
+    # Keep that out of the BatchJob update transaction so admin actions do not
+    # hold job locks while competing with workers that already hold task locks.
+    remote_updated, remote_skipped_leased = recompute_remote_priorities_for_inchikeys(
+        affected_inchikeys
+    )
 
     result = JobAdminOperationResult(
         jobs_updated=jobs_updated,

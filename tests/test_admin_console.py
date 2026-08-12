@@ -500,6 +500,40 @@ def test_set_job_priority_recomputes_remote_task_priority():
     assert task.priority == other.priority
 
 
+def test_set_job_priority_recomputes_remote_tasks_outside_job_transaction(monkeypatch):
+    from django.db import transaction
+
+    from apps.batches import admin_ops
+
+    selected = BatchJob.objects.create(secret_hash="x", priority=100)
+    BatchItem.objects.create(
+        job=selected,
+        row_order=0,
+        original_input=IK1,
+        inchikey=IK1,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    seen: dict[str, object] = {}
+
+    def fake_recompute(inchikeys):
+        seen["inchikeys"] = set(inchikeys)
+        seen["in_atomic_block"] = transaction.get_connection().in_atomic_block
+        return 0, 0
+
+    monkeypatch.setattr(
+        admin_ops,
+        "recompute_remote_priorities_for_inchikeys",
+        fake_recompute,
+    )
+
+    result = admin_ops.set_job_priority([selected.pk], priority=0, actor="tester")
+
+    selected.refresh_from_db()
+    assert selected.priority == 0
+    assert result.jobs_updated == 1
+    assert seen == {"inchikeys": {IK1}, "in_atomic_block": False}
+
+
 def test_batchjob_admin_priority_actions(admin_client):
     job = BatchJob.objects.create(secret_hash="x", priority=0)
     url = reverse("admin:batches_batchjob_changelist")
