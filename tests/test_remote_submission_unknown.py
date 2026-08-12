@@ -20,7 +20,6 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from apps.core.enums import QueryState, SubmissionState, TaskState
-from apps.remote.circuit import CircuitBreaker
 from apps.remote.models import RemoteQuery, RemoteSubmission, RemoteTask
 from apps.remote.provider import EntityLookupResult, EntityLookupStatus
 from apps.remote.rate_limit import RateLimiter
@@ -46,7 +45,6 @@ def _worker(provider) -> RemoteWorker:
         provider,
         worker_id="w1",
         rate_limiter=RateLimiter(1000, 1000),
-        circuit=CircuitBreaker(failure_threshold=1000),
     )
 
 

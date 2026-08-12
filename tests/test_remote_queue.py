@@ -1,10 +1,10 @@
-"""Tests for the remote queue, worker, retry/backoff, circuit, and fan-out.
+"""Tests for the remote queue, worker, task-local retry/backoff, and fan-out.
 
 All tests run against the REAL Postgres DB using the deterministic MockProvider
 (no network). They exercise the FOR UPDATE SKIP LOCKED claim, lock TTL recovery,
 per-InChIKey dedupe, entity-first flow, /queries submit + poll, result-key
 mismatch guard, fan-out to all waiting items, Retry-After precedence, backoff
-schedule, circuit-breaker behaviour, and REMOTE_ENABLED=false.
+schedule, provider-local failure isolation, and REMOTE_ENABLED=false.
 """
 from __future__ import annotations
 
@@ -29,15 +29,9 @@ from apps.core.enums import (
     TaskState,
 )
 from apps.remote import queue
-from apps.remote.circuit import (
-    CircuitBreaker,
-    CircuitState,
-    DbCircuitBreaker,
-)
 from apps.remote.mock import MockProvider, build_query_response, build_raw
 from apps.remote.models import (
     RemoteAttempt,
-    RemoteCircuit,
     RemoteQuery,
     RemoteQueryItem,
     RemoteRateBucket,
@@ -94,7 +88,6 @@ def _worker(provider, **kw) -> RemoteWorker:
         provider,
         worker_id=kw.pop("worker_id", "w-test"),
         rate_limiter=kw.pop("rate_limiter", RateLimiter(1000, 1000)),
-        circuit=kw.pop("circuit", CircuitBreaker(failure_threshold=1000)),
         **kw,
     )
 
@@ -1142,61 +1135,59 @@ def test_attempts_exhausted_defers_never_discards():
     assert task.state in list(TaskState.active_states())
 
 
-# ---------------------------------------------------------------------------
-# circuit breaker
-# ---------------------------------------------------------------------------
+def test_retryable_failure_does_not_block_unrelated_task():
+    """A key-specific provider failure must never become a global gate."""
+    queue.enqueue_task(IK_A)
+    provider = MockProvider(
+        entities={IK_B: build_raw(IK_B)},
+        entity_retryable_for={IK_A},
+    )
+    worker = _worker(provider)
+
+    assert worker.tick() is True
+    first = RemoteTask.objects.get(inchikey=IK_A)
+    assert first.state == TaskState.RETRY_WAIT
+
+    queue.enqueue_task(IK_B)
+    assert worker.tick() is True
+    second = RemoteTask.objects.get(inchikey=IK_B)
+    assert second.state == TaskState.DONE
+    assert provider.entity_calls == [IK_A, IK_B]
 
 
-def test_circuit_opens_after_consecutive_failures():
-    breaker = CircuitBreaker(failure_threshold=3, reset_timeout=999)
-    for _ in range(3):
-        queue.enqueue_task(IK_A)  # ensure a task exists each tick
-        provider = MockProvider(entity_retryable_for={IK_A})
-        worker = _worker(provider, circuit=breaker)
-        # reset the task to READY so it can be claimed each iteration
-        RemoteTask.objects.filter(inchikey=IK_A).update(
-            state=TaskState.READY, next_run_at=None
-        )
-        worker.tick()
-    assert breaker.state == CircuitState.OPEN
+def test_rate_limit_defer_reactivates_without_global_latch():
+    """A token miss parks only this task and cannot latch later work off."""
 
+    class DenyOnceBucket:
+        def __init__(self) -> None:
+            self.calls = 0
 
-def test_circuit_open_defers_task_local_lookup_survives():
-    # Open circuit: remote calls are skipped, but the local lookup service still
-    # works and the queue keeps the task (DEFERRED, not lost).
-    breaker = CircuitBreaker(failure_threshold=1, reset_timeout=999)
-    breaker.record_failure()  # trip it
-    assert breaker.state == CircuitState.OPEN
+        def allow(self) -> bool:
+            self.calls += 1
+            return self.calls > 1
+
+        def penalize(self, retry_after: float | None) -> None:
+            pass
+
+    class Limiter:
+        def __init__(self) -> None:
+            self.entity = DenyOnceBucket()
+            self.submit = RateLimiter(1000, 1000).submit
 
     queue.enqueue_task(IK_A)
     provider = MockProvider(entities={IK_A: build_raw(IK_A)})
-    worker = _worker(provider, circuit=breaker)
-    worker.tick()
+    worker = _worker(provider, rate_limiter=Limiter())
 
+    assert worker.tick() is True
     task = RemoteTask.objects.get(inchikey=IK_A)
     assert task.state == TaskState.DEFERRED
-    # No remote call was made.
     assert provider.entity_calls == []
 
-    # Local lookup service still returns seeded data (NFR-P05).
-    from apps.classifications.result_writer import write_live_result
-    from apps.classifications.services import lookup_current_classification
-    from apps.remote.mock import parse_wishart_payload
-
-    write_live_result(
-        IK_B, parse_wishart_payload(build_raw(IK_B)),
-        source_type=SourceType.WISHART_LIVE_ENTITY,
-    )
-    assert lookup_current_classification(IK_B) is not None
-
-
-def test_circuit_half_open_recovers_on_success():
-    breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0)
-    breaker.record_failure()
-    # reset_timeout=0 -> immediately HALF_OPEN.
-    assert breaker.state == CircuitState.HALF_OPEN
-    breaker.record_success()
-    assert breaker.state == CircuitState.CLOSED
+    RemoteTask.objects.filter(pk=task.pk).update(next_run_at=timezone.now())
+    assert worker.tick() is True
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    assert provider.entity_calls == [IK_A]
 
 
 # ---------------------------------------------------------------------------
@@ -1259,44 +1250,6 @@ def test_retry_transitions_pending_to_remote_delayed(settings):
         f"Waiting item must be REMOTE_DELAYED after retry, got {item.status}"
     )
     assert item.message == "Wishart returned a retryable error; retrying later."
-
-
-def test_circuit_open_defer_transitions_pending_to_remote_delayed(settings):
-    """When the circuit is open, the task is deferred; waiting items must
-    transition from PENDING_CLASSIFICATION to REMOTE_DELAYED."""
-    from apps.remote.circuit import CircuitBreaker
-
-    settings.REMOTE_ENABLED = True
-    inchikey = "CIRCUITKEYAAAA-UHFFFAOYSA-N"
-    RemoteTask.objects.filter(inchikey=inchikey).delete()
-    breaker = CircuitBreaker(failure_threshold=1, reset_timeout=999)
-    breaker.record_failure()  # trip the circuit open
-
-    job = _job()
-    item = _item(job, inchikey, 0)  # starts PENDING_CLASSIFICATION
-    assert item.status == BatchItemStatus.PENDING_CLASSIFICATION
-
-    task = RemoteTask.objects.create(
-        inchikey=inchikey,
-        priority=1_000_000,
-        attempt=0,
-    )
-    task = _claim_specific_task(task)
-    provider = MockProvider(entities={inchikey: build_raw(inchikey)})
-    worker = _worker(provider, circuit=breaker)
-    worker.process(task, claim=queue.claim_from_task(task))
-
-    task = RemoteTask.objects.get(inchikey=inchikey)
-    assert task.state == TaskState.DEFERRED, (
-        "Task must be DEFERRED when circuit is open"
-    )
-    item.refresh_from_db()
-    assert item.status == BatchItemStatus.REMOTE_DELAYED, (
-        f"Waiting item must be REMOTE_DELAYED after circuit-open defer, got {item.status}"
-    )
-    assert item.message == (
-        "Wishart calls are paused by the circuit breaker; retrying after cooldown."
-    )
 
 
 def test_subsequent_success_after_remote_delayed_completes_item():
@@ -1785,77 +1738,6 @@ def test_db_bucket_penalize_parks_until_deadline():
     assert row.blocked_until is not None
     delta = (row.blocked_until - timezone.now()).total_seconds()
     assert 590 < delta < 610
-
-
-# ---------------------------------------------------------------------------
-# F-08: shared DB-backed circuit breaker + single half-open probe
-# ---------------------------------------------------------------------------
-
-
-def test_db_circuit_shared_opens_after_threshold():
-    breaker = DbCircuitBreaker(failure_threshold=3, reset_timeout=999)
-    for _ in range(3):
-        breaker.record_failure()
-    assert breaker.state == CircuitState.OPEN
-    row = RemoteCircuit.objects.get()
-    assert row.state == CircuitState.OPEN
-    assert row.consecutive_failures >= 3
-
-
-def test_db_circuit_half_open_single_probe():
-    # ACCEPTANCE (F-08): only ONE half-open probe is issued when the circuit is
-    # OPEN -> HALF_OPEN. Two breakers (two processes) share one row; exactly one
-    # wins the probe (allow() True), the other still sees OPEN.
-    a = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
-    b = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
-    a.record_failure()  # OPEN; reset_timeout=0 -> immediately eligible
-
-    winners = [a.allow(), b.allow()]
-    assert winners.count(True) == 1, f"exactly one probe must win, got {winners}"
-    # The winner is HALF_OPEN; a success closes the shared circuit.
-    a.record_success()
-    assert DbCircuitBreaker().state == CircuitState.CLOSED
-
-
-def test_db_circuit_state_reports_open_until_probe_won():
-    # MINOR-2: state reports the TRUE persisted state — OPEN until a probe is
-    # actually claimed via allow(), not merely because cooldown elapsed.
-    breaker = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
-    breaker.record_failure()  # OPEN (cooldown already elapsed, reset_timeout=0)
-    assert breaker.state == CircuitState.OPEN, "no probe claimed yet -> OPEN"
-    assert breaker.cooldown_elapsed() is True
-    assert breaker.allow() is True  # this worker wins + claims the probe
-    assert breaker.state == CircuitState.HALF_OPEN  # now truly half-open
-
-
-def test_db_circuit_half_open_failure_reopens():
-    breaker = DbCircuitBreaker(failure_threshold=1, reset_timeout=0)
-    breaker.record_failure()  # OPEN
-    assert breaker.allow() is True  # claim the probe -> HALF_OPEN
-    assert breaker.state == CircuitState.HALF_OPEN
-    breaker.record_failure()  # probe fails -> re-OPEN
-    row = RemoteCircuit.objects.get()
-    assert row.state == CircuitState.OPEN
-    # MINOR-3: consecutive_failures is set consistently (>= threshold) on reopen.
-    assert row.consecutive_failures >= breaker.failure_threshold
-
-
-def test_worker_uses_db_circuit_and_defers_when_open():
-    # The worker's default DB circuit gates remote calls: an OPEN shared circuit
-    # defers the task and makes no remote call.
-    DbCircuitBreaker(failure_threshold=1, reset_timeout=999).record_failure()
-    queue.enqueue_task(IK_A)
-    provider = MockProvider(entities={IK_A: build_raw(IK_A)})
-    # Use the DB circuit (default) + a permissive DB rate limiter.
-    worker = RemoteWorker(
-        provider,
-        worker_id="w-db",
-        rate_limiter=DbRateLimiter(entity_per_min=1000, submit_per_min=1000),
-    )
-    worker.tick()
-    task = RemoteTask.objects.get(inchikey=IK_A)
-    assert task.state == TaskState.DEFERRED
-    assert provider.entity_calls == []
 
 
 # ---------------------------------------------------------------------------

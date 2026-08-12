@@ -42,23 +42,6 @@ class NoSleepLimiter:
         self.submit = self.Bucket()
 
 
-class ClosedCircuit:
-    def __init__(self) -> None:
-        self.success_count = 0
-        self.failure_count = 0
-
-    def allow(self) -> bool:
-        return True
-
-    def record_success(self) -> None:
-        self.success_count += 1
-        self.last = "success"
-
-    def record_failure(self) -> None:
-        self.failure_count += 1
-        self.last = "failure"
-
-
 @pytest.mark.django_db(transaction=True)
 def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings):
     settings.REMOTE_ENABLED = True
@@ -82,12 +65,10 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     transport = AcceptedThenReadErrorTransport()
     provider = WishartDirectProvider(base_url="https://wishart.invalid")
     provider._http_client = httpx.Client(transport=transport, base_url="https://wishart.invalid")
-    circuit = ClosedCircuit()
     worker = RemoteWorker(
         provider,
         worker_id="worker-a",
         rate_limiter=NoSleepLimiter(),
-        circuit=circuit,
         lease_seconds=0.1,
     )
 
@@ -99,9 +80,6 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     task.refresh_from_db()
     assert task.state == TaskState.DEFERRED
     assert task.next_run_at is None
-    assert circuit.failure_count == 0
-    assert circuit.success_count == 2  # entity miss + ambiguous submit
-
     for _ in range(5):
         assert worker.tick() is False
 
@@ -161,7 +139,6 @@ def test_ambiguous_submission_member_cannot_repost_in_different_batch(settings):
         provider,
         worker_id="regroup-worker",
         rate_limiter=NoSleepLimiter(),
-        circuit=ClosedCircuit(),
         lease_seconds=0.1,
     )
     worker.tick()
@@ -227,7 +204,6 @@ def _build_worker(transport: httpx.BaseTransport) -> RemoteWorker:
         provider,
         worker_id="worker-a",
         rate_limiter=NoSleepLimiter(),
-        circuit=ClosedCircuit(),
         lease_seconds=0.1,
     )
 

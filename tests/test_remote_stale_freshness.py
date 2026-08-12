@@ -21,7 +21,6 @@ from apps.classifications.models import ClassificationResult, ClassyfireLive
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, ResultKind, SourceType, TaskState
 from apps.remote import queue
-from apps.remote.circuit import CircuitBreaker
 from apps.remote.mock import MockProvider, build_raw, parse_wishart_payload
 from apps.remote.models import RemoteQuery, RemoteTask
 from apps.remote.rate_limit import RateLimiter
@@ -43,7 +42,6 @@ class _RemoteResultHarness:
             MockProvider(),
             worker_id="w-apply",
             rate_limiter=RateLimiter(1000, 1000),
-            circuit=CircuitBreaker(failure_threshold=1000),
         )
 
     def apply_query_result(self, query: RemoteQuery, inchikey: str, **labels) -> None:
@@ -163,7 +161,6 @@ def test_true_send_order_drives_freshness_when_responses_complete_out_of_order(
         OutOfOrderSubmitProvider(),
         worker_id="freshness-worker",
         rate_limiter=RateLimiter(1000, 1000),
-        circuit=CircuitBreaker(failure_threshold=1000),
     )
 
     # Send order: older THEN newer.

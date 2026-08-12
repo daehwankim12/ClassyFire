@@ -100,7 +100,7 @@ The stats page at `/stats/` provides a live overview of:
 
 - Unique InChIKey count in the live cache
 - Remote task queue depth (pending, running, deferred)
-- Circuit breaker state (CLOSED / OPEN / HALF_OPEN)
+- Shared provider rate-limit state and retry backlog
 - Last successful remote call timestamp
 - Database size
 - Backup status
@@ -228,7 +228,7 @@ The stats page provides real-time operational metrics:
 | Unique InChIKeys (live) | Compounds with a live Wishart classification. |
 | Cache hit rate | Fraction of job items resolved from the live cache. |
 | Remote queue | Pending / running / deferred task counts. |
-| Circuit state | CLOSED (healthy), OPEN (outage), HALF_OPEN (recovering). |
+| Provider rate limits | Shared entity/submit token availability and 429 block windows. |
 | DB size | PostgreSQL database size in MB. |
 | Backup status | Timestamp of the last successful backup. |
 
@@ -238,8 +238,8 @@ For automation, emit a machine-readable Gate 3 metrics snapshot:
 docker compose exec web python manage.py emit_metrics_snapshot --json
 ```
 
-The JSON includes remote queue state counts and due-work lag, provider circuit
-and rate-bucket state, remote attempt classifications, mismatch event counts,
+The JSON includes remote queue state counts and due-work lag, provider
+rate-bucket state, remote attempt classifications, mismatch event counts,
 export artifact totals, and disk usage.  The command uses aggregate queries only
 and is safe to run from monitoring jobs.
 
@@ -327,7 +327,7 @@ docker compose exec web python manage.py admin_resume_remote
 
 1. Check worker logs: `docker compose logs worker`
 2. Inspect queue depth on `/stats/`
-3. If circuit is OPEN: wait for recovery or use **Retry deferred** admin action
+3. Inspect recent remote attempts for 429, 5xx, auth, or protocol failures
 4. Restart worker: `docker compose restart worker`
 
 ### Database connection errors
@@ -338,9 +338,11 @@ docker compose exec web python manage.py admin_resume_remote
 
 ### Remote API unreachable
 
-The circuit breaker will open after repeated failures.  Local lookups continue
-normally.  Tasks are deferred and will be retried when the circuit recovers or
-when **Retry deferred** is triggered manually.
+Local lookups continue normally. HTTP 429 responses pause the shared provider
+bucket for the advertised `Retry-After`; 5xx responses back off only the task
+that received them, so a bad entity key cannot stop unrelated work. Auth
+failures remain globally blocked until the operator fixes credentials and runs
+the provider-auth reset action.
 
 ### Disk full
 

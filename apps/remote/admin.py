@@ -27,7 +27,6 @@ from apps.operations.models import SystemEvent
 from apps.remote.models import (
     RemoteAttempt,
     RemoteBudgetLedger,
-    RemoteCircuit,
     RemoteNegativeCache,
     RemotePrincipalState,
     RemoteProviderControl,
@@ -255,18 +254,6 @@ class RemoteAttemptAdmin(ReadOnlyModelAdmin):
     list_filter = ("operation", "classification", "provider")
     search_fields = ("request_inchikey", "returned_inchikey", "remote_query_id")
     list_select_related = ("query", "task")
-
-
-@admin.register(RemoteCircuit)
-class RemoteCircuitAdmin(ReadOnlyModelAdmin):
-    list_display = (
-        "provider",
-        "state",
-        "consecutive_failures",
-        "opened_at",
-        "updated_at",
-    )
-    list_filter = ("state",)
 
 
 @admin.register(RemoteNegativeCache)

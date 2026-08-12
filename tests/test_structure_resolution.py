@@ -1,7 +1,8 @@
 """Tests for NEED_STRUCTURE auto-resolution from public key-free structure DBs.
 
 The provider HTTP chokepoint (structure_providers._request) is patched; rate
-buckets + circuit breakers + RDKit verification (normalize_row) run for real.
+buckets + provider-local failure isolation + RDKit verification (normalize_row)
+run for real.
 """
 from __future__ import annotations
 

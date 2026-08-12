@@ -9,28 +9,23 @@ from django.db.models import OuterRef, Subquery
 from apps.batches.models import BatchItem, BatchJob
 from apps.core.enums import (
     BatchItemStatus,
-    CircuitState,
     ProviderControlState,
     TaskState,
 )
 from apps.remote.models import (
     RemoteAttempt,
-    RemoteCircuit,
     RemoteProviderControl,
     RemoteTask,
 )
 
 REMOTE_DELAYED_DEFAULT_MESSAGE = (
-    "Waiting on remote retry, circuit recovery, or operator action."
+    "Waiting on remote retry or operator action."
 )
 
 QUEUE_CAPACITY_MESSAGE = "Remote queue is at capacity; retrying later."
 BUDGET_EXCEEDED_MESSAGE = "Remote budget exceeded for this principal."
 REMOTE_DISABLED_MESSAGE = "Structure provided; remote classification disabled."
 RETRYABLE_REMOTE_MESSAGE = "Wishart returned a retryable error; retrying later."
-CIRCUIT_OPEN_MESSAGE = (
-    "Wishart calls are paused by the circuit breaker; retrying after cooldown."
-)
 AUTH_BLOCKED_MESSAGE = (
     "Wishart authentication is blocked; operator action is required."
 )
@@ -65,14 +60,6 @@ CAUSES: dict[str, RemoteDelayCause] = {
         next_action="fix_wishart_auth",
         severity="error",
         priority=10,
-    ),
-    "circuit_open": RemoteDelayCause(
-        code="circuit_open",
-        label="Circuit open",
-        description="Remote calls are paused until the cooldown allows a probe.",
-        next_action="wait_for_wishart_recovery",
-        severity="warning",
-        priority=20,
     ),
     "queue_capacity": RemoteDelayCause(
         code="queue_capacity",
@@ -141,11 +128,6 @@ def build_remote_delayed_breakdown(job: BatchJob) -> list[dict[str, Any]]:
         provider="wishart",
         state=ProviderControlState.AUTH_BLOCKED,
     ).exists()
-    wishart_circuit_open = RemoteCircuit.objects.filter(
-        provider="wishart",
-        state=CircuitState.OPEN,
-    ).exists()
-
     grouped: dict[str, dict[str, Any]] = {}
     for item in delayed_items:
         inchikey = item.inchikey
@@ -154,7 +136,6 @@ def build_remote_delayed_breakdown(job: BatchJob) -> list[dict[str, Any]]:
             active_task=active_tasks.get(inchikey) if inchikey else None,
             latest_attempt=latest_attempts.get(inchikey) if inchikey else None,
             wishart_auth_blocked=wishart_auth_blocked,
-            wishart_circuit_open=wishart_circuit_open,
         )
         cause = CAUSES[code]
         entry = grouped.setdefault(
@@ -219,7 +200,6 @@ def _classify_item(
     active_task: RemoteTask | None,
     latest_attempt: RemoteAttempt | None,
     wishart_auth_blocked: bool,
-    wishart_circuit_open: bool,
 ) -> str:
     message = (item.message or "").lower()
     if QUEUE_CAPACITY_MESSAGE.lower() in message:
@@ -231,8 +211,6 @@ def _classify_item(
 
     if wishart_auth_blocked or _attempt_is_auth_failure(latest_attempt):
         return "wishart_auth_blocked"
-    if wishart_circuit_open and active_task is not None:
-        return "circuit_open"
     if _attempt_is_retryable(latest_attempt) or (
         active_task is not None and active_task.state in _WISHART_RETRY_STATES
     ):

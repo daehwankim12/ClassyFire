@@ -464,16 +464,6 @@ def restore_round_trip():
             "ON CONFLICT DO NOTHING;",
         )
 
-        # remote_circuits: one circuit breaker row (state/consecutive_failures/updated_at
-        # have no DB defaults despite Django Python-level defaults)
-        _psql(
-            SRC_DB,
-            "INSERT INTO remote_circuits "
-            "(provider, state, consecutive_failures, updated_at) "
-            "VALUES ('wishart', 'CLOSED', 0, NOW()) "
-            "ON CONFLICT DO NOTHING;",
-        )
-
         # ── Dump SRC ────────────────────────────────────────────────────────
         with tempfile.NamedTemporaryFile(
             suffix=".dump", prefix="cf_integrity_", delete=False
@@ -560,7 +550,6 @@ def _row_count(db: str, table: str) -> int:
     "remote_submissions",
     "remote_attempts",
     "remote_rate_buckets",
-    "remote_circuits",
 ])
 def test_row_count_matches_src(restore_round_trip, table):
     """Row count in DST must equal SRC for all tables.

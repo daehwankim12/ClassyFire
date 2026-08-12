@@ -19,7 +19,6 @@ from django.utils import timezone
 from apps.batches.models import BatchItem, BatchJob
 from apps.core.enums import BatchItemStatus, QueryState, TaskState
 from apps.remote import queue
-from apps.remote.circuit import CircuitBreaker
 from apps.remote.mock import MockProvider
 from apps.remote.models import (
     RemoteQuery,
@@ -66,7 +65,6 @@ def _production_worker(provider, settings) -> RemoteWorker:
         provider,
         worker_id="w-test",
         rate_limiter=DbRateLimiter.from_settings(),
-        circuit=CircuitBreaker(failure_threshold=1000),
     )
 
 

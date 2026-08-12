@@ -40,7 +40,6 @@ from apps.core.enums import (
     TaskState,
 )
 from apps.remote import queue
-from apps.remote.circuit import CircuitBreaker
 from apps.remote.mock import build_query_response, build_raw
 from apps.remote.models import (
     RemoteAttempt,
@@ -165,7 +164,6 @@ class _RemoteOutcomeHarness:
             provider,
             worker_id="w-provenance",
             rate_limiter=RateLimiter(1000, 1000),
-            circuit=CircuitBreaker(failure_threshold=1000),
         )
 
     def _seed_task(

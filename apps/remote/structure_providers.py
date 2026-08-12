@@ -8,7 +8,7 @@ VERIFY it re-hashes to the same InChIKey (RDKit, via normalize_row), and feed it
 back into the normal calculation path
 (apps.batches.services.submit_structure_for_item).
 
-Provider chain (ordered, all key-free), each rate-limited + circuit-guarded.
+Provider chain (ordered, all key-free), each rate-limited independently.
 Both endpoints below were confirmed against the live services:
   * pubchem — PUG REST: GET /compound/inchikey/{ik}/property/InChI/JSON
               → ``PropertyTable.Properties[0].InChI``
@@ -25,10 +25,9 @@ Politeness / rate limits (the design point):
     to 1 (smooth pacing, no spike) at a conservative per-provider rate well under
     each service's known limits — PubChem documents 5 req/s & 400 req/min, so
     60/min (~1/s) is gentle; CACTUS publishes no limit (small NIH service) → 30/min.
-  * A MISS (HTTP 404 / not indexed) is NOT a failure: the service answered, just
-    had no data, so the per-provider circuit stays closed. Only transport errors,
-    5xx, or 429 trip the circuit, so a flaky / throttling service is skipped — not
-    hammered.
+  * A MISS (HTTP 404 / not indexed) is a definitive provider-local result.
+    Transport errors, 5xx, and 429 skip that provider for this sweep; the shared
+    smooth token bucket prevents retry storms without a global liveness gate.
   * A bounded response read (1 MB) defends against unexpectedly large bodies.
 """
 from __future__ import annotations
@@ -42,7 +41,6 @@ from django.conf import settings
 from django.core.cache import cache
 
 from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_modulo_flag
-from apps.remote.circuit import DbCircuitBreaker
 from apps.remote.rate_limit import DbTokenBucket
 
 logger = logging.getLogger(__name__)
@@ -62,7 +60,7 @@ class ResolvedStructure:
 
 
 class _TransientError(Exception):
-    """A transport / 5xx / 429 failure that should trip the provider circuit."""
+    """A transport / 5xx / 429 failure that skips one provider for this sweep."""
 
 
 def _timeout() -> float:
@@ -139,7 +137,7 @@ def _cactus_fetch(inchikey: str) -> str | None:
 
 
 # name → raw fetcher (returns a structure string, None on a clean miss, or raises
-# _TransientError on a failure that should trip the provider circuit).
+# _TransientError on a transient provider failure).
 _FETCHERS = {
     "pubchem": _pubchem_fetch,
     "cactus": _cactus_fetch,
@@ -173,17 +171,16 @@ def _key_matches(requested: str, computed: str | None) -> bool:
 
 
 def _fetch(provider: str, inchikey: str) -> tuple[str, str | None]:
-    """One rate-limited, circuit-guarded fetch from a single provider.
+    """One rate-limited fetch from a single provider.
 
     Returns ``(outcome, structure)`` where outcome is:
       * ``"hit"``  — a structure string was returned (``structure`` set),
       * ``"miss"`` — the provider answered definitively with no usable data,
-      * ``"skip"`` — rate limited / circuit open / transport failure (NOT a
+      * ``"skip"`` — rate limited / transport failure (NOT a
                      definitive answer; the key may still resolve later).
 
-    The rate bucket is checked BEFORE the circuit so a rate-limit skip never
-    burns a half-open circuit probe. Only failures (not clean misses) trip the
-    circuit.
+    The shared smooth rate bucket bounds retries across processes. A transient
+    failure skips only this provider and this sweep; it never blocks later keys.
     """
     rate = _PROVIDER_RATE_PER_MIN.get(provider, _DEFAULT_RATE_PER_MIN)
     bucket = DbTokenBucket(
@@ -191,18 +188,13 @@ def _fetch(provider: str, inchikey: str) -> tuple[str, str | None]:
     )
     if not bucket.allow():
         return ("skip", None)  # rate limited → retry next sweep
-    circuit = DbCircuitBreaker.from_settings(provider=f"structure:{provider}")
-    if not circuit.allow():
-        return ("skip", None)  # circuit open → skip without calling out
     try:
         structure = _FETCHERS[provider](inchikey)
     except _TransientError as exc:
-        circuit.record_failure()
         logger.warning(
             "structure resolve provider %s failed for %s: %s", provider, inchikey, exc
         )
         return ("skip", None)
-    circuit.record_success()  # answered (hit OR clean miss) → circuit healthy
     return ("hit", structure) if structure else ("miss", None)
 
 
@@ -216,7 +208,7 @@ def resolve_structure(inchikey: str) -> ResolvedStructure | None:
     move on to the next provider. submit_structure_for_item re-checks this too.
 
     Negative caching: a key that EVERY provider definitively missed (none merely
-    skipped for rate/circuit reasons) is cached for ``STRUCTURE_RESOLVE_MISS_TTL_
+    skipped for rate/transport reasons) is cached for ``STRUCTURE_RESOLVE_MISS_TTL_
     SECONDS`` so a truly-novel compound — absent from every public DB — is not
     re-queried on every sweep. A rate-limited/transport skip is NOT cached, so a
     key only temporarily un-fetchable is retried promptly.
@@ -253,7 +245,7 @@ def resolve_structure(inchikey: str) -> ResolvedStructure | None:
             norm.inchikey,
         )
     # No usable structure. Only negative-cache a DEFINITIVE all-provider miss so
-    # transient (rate/circuit/transport) skips are retried, not suppressed.
+    # transient (rate/transport) skips are retried, not suppressed.
     if not any_skipped:
         ttl = int(getattr(settings, "STRUCTURE_RESOLVE_MISS_TTL_SECONDS", 21600))
         if ttl > 0:

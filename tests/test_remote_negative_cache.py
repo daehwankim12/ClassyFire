@@ -131,17 +131,6 @@ class _AllowAllLimiter:
         self.submit = self._Bucket()
 
 
-class _ClosedCircuit:
-    def allow(self) -> bool:
-        return True
-
-    def record_success(self) -> None:
-        pass
-
-    def record_failure(self) -> None:
-        pass
-
-
 def _claimed_structure_task() -> RemoteTask:
     compound = CompoundStructure.objects.create(
         original_input=SMILES,
@@ -176,7 +165,6 @@ def test_worker_submit_failure_hard_fails_on_third_negative_count():
         SubmitFailProvider(),
         worker_id=str(task.lock_owner),
         rate_limiter=_AllowAllLimiter(),
-        circuit=_ClosedCircuit(),
     )
 
     worker._submit_batch(task, queue.claim_from_task(task))
@@ -209,7 +197,6 @@ def test_worker_wishart_success_resolves_negative_cache():
         object(),
         worker_id=str(task.lock_owner),
         rate_limiter=_AllowAllLimiter(),
-        circuit=_ClosedCircuit(),
     )
 
     worker.apply_fenced_result_for_test(task, norm, remote_query_id="negative-cleanup")

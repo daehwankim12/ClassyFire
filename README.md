@@ -165,13 +165,14 @@ When the Wishart ClassyFire API is unreachable:
 
 - **Local cache lookups continue normally.** Compounds already in the live cache
   are served instantly.
-- **The circuit breaker opens** after repeated consecutive failures, preventing
-  further outbound calls until the API recovers.
-- **Pending remote tasks are deferred** — they are not lost.  When the circuit
-  closes (or an admin clicks **Retry deferred** in `/admin/`), deferred tasks
-  are retried automatically.
+- **HTTP 429 responses pace all workers** through one shared provider bucket and
+  honor the server's `Retry-After` value.
+- **5xx responses stay task-local** so a Wishart entity endpoint failure for one
+  InChIKey cannot stop healthy requests for other keys or the query endpoint.
+- **Pending remote tasks are retained** and retried with per-task backoff; an
+  admin can also use **Retry deferred** in `/admin/` for explicitly parked work.
 
-Monitor circuit state on the `/stats/` page.
+Monitor queue lag, provider attempts, and shared rate buckets on `/stats/`.
 
 ---
 
@@ -196,9 +197,9 @@ docker compose up -d --build web worker
 
 | Symptom | First step |
 |---|---|
-| Worker not processing tasks | `docker compose logs worker`; check circuit state on `/stats/` |
+| Worker not processing tasks | `docker compose logs worker`; inspect queue lag and provider attempts on `/stats/` |
 | Database connection errors | `docker compose ps db`; check `POSTGRES_*` vars in `.env` |
-| Remote API unreachable | Circuit breaker will self-heal; use **Retry deferred** if needed |
+| Remote API unreachable | Inspect 429/5xx/auth attempts; task-local retries recover automatically |
 | Disk full / upload rejected | `df -h /`; prune old backups and run `docker compose run --rm cleanup`; check disk guard threshold |
 | Missing classifications | Check NEED_STRUCTURE items; provide structures via the UI or API |
 

@@ -16,7 +16,6 @@ from django.db import transaction
 from apps.batches.models import BatchItem
 from apps.batches.remote_delay import (
     AUTH_BLOCKED_MESSAGE,
-    CIRCUIT_OPEN_MESSAGE,
     PROTOCOL_RETRY_MESSAGE,
     RETRYABLE_REMOTE_MESSAGE,
 )
@@ -38,8 +37,8 @@ FOUND_STATUSES = (
 def mark_items_delayed(inchikey: str, *, message: str | None = None) -> list[uuid.UUID]:
     """Transition all PENDING_CLASSIFICATION items for *inchikey* to REMOTE_DELAYED.
 
-    Called by the worker after parking a task for retry/defer (schedule_retry or
-    the circuit-open defer path) so that the user-facing REMOTE_DELAYED status —
+    Called by the worker after parking a task for retry/defer so that the
+    user-facing REMOTE_DELAYED status —
     spec §6.2: "Wishart 장애로 자동 재시도 대기" — is immediately visible rather
     than staying as PENDING_CLASSIFICATION until the task eventually resolves.
 
@@ -74,10 +73,9 @@ def mark_items_delayed(inchikey: str, *, message: str | None = None) -> list[uui
 
 
 def _delay_message_for(inchikey: str) -> str | None:
-    from apps.core.enums import CircuitState, ProviderControlState, TaskState
+    from apps.core.enums import ProviderControlState, TaskState
     from apps.remote.models import (
         RemoteAttempt,
-        RemoteCircuit,
         RemoteProviderControl,
         RemoteTask,
     )
@@ -95,11 +93,6 @@ def _delay_message_for(inchikey: str) -> str | None:
         and latest_attempt.classification == "AUTH_FAILURE"
     ):
         return AUTH_BLOCKED_MESSAGE
-    if RemoteCircuit.objects.filter(
-        provider="wishart",
-        state=CircuitState.OPEN,
-    ).exists():
-        return CIRCUIT_OPEN_MESSAGE
     if latest_attempt is not None:
         if latest_attempt.classification == "RETRYABLE":
             return RETRYABLE_REMOTE_MESSAGE

@@ -63,7 +63,7 @@ def _remote_queue_metrics(now) -> dict[str, Any]:
 
 
 def _provider_metrics(now) -> dict[str, Any]:
-    from apps.remote.models import RemoteAttempt, RemoteCircuit, RemoteRateBucket
+    from apps.remote.models import RemoteAttempt, RemoteRateBucket
 
     attempts = {
         row["classification"]: int(row["count"])
@@ -72,14 +72,6 @@ def _provider_metrics(now) -> dict[str, Any]:
             .annotate(count=Count("pk"))
             .order_by()
         )
-    }
-    circuits = {
-        circuit.provider: {
-            "state": circuit.state,
-            "consecutive_failures": circuit.consecutive_failures,
-            "opened_at": circuit.opened_at.isoformat() if circuit.opened_at else None,
-        }
-        for circuit in RemoteCircuit.objects.all()
     }
     buckets = {}
     for bucket in RemoteRateBucket.objects.all():
@@ -94,7 +86,6 @@ def _provider_metrics(now) -> dict[str, Any]:
 
     return {
         "attempts_by_classification": attempts,
-        "circuits": circuits,
         "rate_buckets": buckets,
     }
 

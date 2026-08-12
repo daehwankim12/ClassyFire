@@ -78,7 +78,7 @@ The results page shows a table with one row per input compound:
 | FOUND_WISHART_ENTITY | Classified from a Wishart entity lookup. |
 | PENDING_CLASSIFICATION | Queued for remote classification (check back later). |
 | NEED_STRUCTURE | An InChIKey was submitted without a structure; see below. |
-| REMOTE_DELAYED | Remote call deferred (circuit open or retry scheduled). |
+| REMOTE_DELAYED | Remote call deferred by rate limiting, retry, quota, or operator control. |
 | INVALID_INPUT | Could not parse the input as a valid chemical identifier. |
 
 ### Filtering and searching

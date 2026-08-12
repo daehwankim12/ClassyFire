@@ -15,7 +15,6 @@ from django.utils import timezone
 from apps.core.enums import (
     ACTIVE_TASK_STATES,
     LIVE_SUBMISSION_STATES,
-    CircuitState,
     ProviderControlState,
     QueryState,
     RemoteQueryItemApplyState,
@@ -429,39 +428,6 @@ class RemoteRateBucket(models.Model):
 
     def __str__(self) -> str:
         return f"bucket:{self.provider}:{self.bucket} ({self.tokens:.2f})"
-
-
-class RemoteCircuit(models.Model):
-    """Shared DB-backed circuit breaker state (F-08).
-
-    One row per provider; all workers share it. ``state`` is CLOSED/OPEN/
-    HALF_OPEN. Consecutive failures (``consecutive_failures``) past the threshold
-    OPEN the circuit. After ``reset_timeout`` a single worker wins the HALF_OPEN
-    probe via a conditional UPDATE (``WHERE state='OPEN' AND opened_at <= cutoff``
-    flipping to HALF_OPEN), so only one probe is issued — no thundering herd.
-    """
-
-    provider = models.CharField(max_length=32, default="wishart", unique=True)
-    state = models.CharField(
-        max_length=16,
-        choices=CircuitState.choices,
-        default=CircuitState.CLOSED,
-    )
-    consecutive_failures = models.IntegerField(default=0)
-    opened_at = models.DateTimeField(null=True, blank=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "remote_circuits"
-        constraints = [
-            models.CheckConstraint(
-                name="remote_circuit_failures_nonneg",
-                condition=Q(consecutive_failures__gte=0),
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"circuit:{self.provider} ({self.state})"
 
 
 class RemoteAttempt(models.Model):

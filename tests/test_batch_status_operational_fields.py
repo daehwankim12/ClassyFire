@@ -23,13 +23,11 @@ from apps.batches.services import create_job, create_job_records
 from apps.core.enums import (
     BatchItemStatus,
     BatchProcessingState,
-    CircuitState,
     ProviderControlState,
     TaskState,
 )
 from apps.remote.models import (
     RemoteAttempt,
-    RemoteCircuit,
     RemoteProviderControl,
     RemoteTask,
 )
@@ -141,7 +139,7 @@ def test_status_api_remote_delayed_breakdown_distinguishes_wishart_outage(client
 
 
 @pytest.mark.django_db(transaction=True)
-def test_status_api_remote_delayed_breakdown_distinguishes_circuit_and_auth(client):
+def test_status_api_remote_delayed_breakdown_prioritizes_auth_block(client):
     job, plaintext_secret, _item = _delayed_job_with_item(inchikey=IK_A)
     BatchItem.objects.create(
         job=job,
@@ -160,12 +158,6 @@ def test_status_api_remote_delayed_breakdown_distinguishes_circuit_and_auth(clie
         state=TaskState.DEFERRED,
         next_run_at=timezone.now(),
     )
-    RemoteCircuit.objects.create(
-        provider="wishart",
-        state=CircuitState.OPEN,
-        consecutive_failures=5,
-        opened_at=timezone.now(),
-    )
     RemoteProviderControl.objects.create(
         provider="wishart",
         state=ProviderControlState.AUTH_BLOCKED,
@@ -180,7 +172,6 @@ def test_status_api_remote_delayed_breakdown_distinguishes_circuit_and_auth(clie
     breakdown = _breakdown_by_code(payload)
     assert breakdown["wishart_auth_blocked"]["count"] == 2
     assert breakdown["wishart_auth_blocked"]["label"] == "Wishart auth blocked"
-    assert "circuit_open" not in breakdown
     assert payload["next_action"] == "fix_wishart_auth"
 
 

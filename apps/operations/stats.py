@@ -24,7 +24,6 @@ class WishartStats:
     success_count: int
     timeout_count: int
     server_error_count: int
-    circuit_state: str
     last_success_at: str | None
 
 
@@ -95,22 +94,6 @@ def _wishart_stats() -> WishartStats:
         category="REMOTE", event_type="wishart_5xx"
     ).count()
 
-    circuit_event = (
-        SystemEvent.objects.filter(
-            category="REMOTE", event_type__in=["circuit_open", "circuit_closed", "circuit_half_open"]
-        )
-        .order_by("-created_at")
-        .first()
-    )
-    circuit_state = "closed"
-    if circuit_event:
-        mapping = {
-            "circuit_open": "open",
-            "circuit_closed": "closed",
-            "circuit_half_open": "half_open",
-        }
-        circuit_state = mapping.get(circuit_event.event_type, "closed")
-
     last_success = (
         SystemEvent.objects.filter(category="REMOTE", event_type="wishart_success")
         .order_by("-created_at")
@@ -122,7 +105,6 @@ def _wishart_stats() -> WishartStats:
         success_count=success,
         timeout_count=timeout,
         server_error_count=server_err,
-        circuit_state=circuit_state,
         last_success_at=last_success.isoformat() if last_success else None,
     )
 

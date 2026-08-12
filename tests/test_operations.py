@@ -150,7 +150,7 @@ def test_stats_done_tasks_not_counted_as_pending():
 
 
 # ---------------------------------------------------------------------------
-# Stats: Wishart success / timeout / 5xx + circuit state
+# Stats: Wishart success / timeout / 5xx
 # ---------------------------------------------------------------------------
 
 
@@ -182,35 +182,6 @@ def test_stats_wishart_5xx_count():
     _system_event("REMOTE", "wishart_5xx")
     after = collect_stats("/").wishart.server_error_count
     assert after == before + 3
-
-
-def test_stats_wishart_circuit_state_open():
-    from apps.operations.stats import collect_stats
-
-    _system_event("REMOTE", "circuit_closed")
-    _system_event("REMOTE", "circuit_open")
-    stats = collect_stats("/")
-    assert stats.wishart.circuit_state == "open"
-
-
-def test_stats_wishart_circuit_state_closed():
-    from apps.operations.stats import collect_stats
-
-    _system_event("REMOTE", "circuit_open")
-    _system_event("REMOTE", "circuit_closed")
-    stats = collect_stats("/")
-    assert stats.wishart.circuit_state == "closed"
-
-
-def test_stats_wishart_circuit_state_default_closed_when_no_event():
-    from apps.operations.stats import collect_stats
-
-    SystemEvent.objects.filter(
-        category="REMOTE",
-        event_type__in=["circuit_open", "circuit_closed", "circuit_half_open"],
-    ).delete()
-    stats = collect_stats("/")
-    assert stats.wishart.circuit_state == "closed"
 
 
 def test_stats_wishart_last_success_at_none_when_no_event():

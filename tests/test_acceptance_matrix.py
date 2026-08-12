@@ -125,14 +125,14 @@ EVIDENCE: dict[str, Evidence] = {
         ],
     },
     # ------------------------------------------------------------------
-    # T-09: Remote failure backoff/circuit breaker
+    # T-09: Remote failure backoff without globally blocking unrelated keys
     # ------------------------------------------------------------------
     "T-09": {
         "kind": "automated",
         "file": "test_remote_queue.py",
         "tests": [
             "test_retryable_error_schedules_retry_with_backoff",
-            "test_circuit_opens_after_consecutive_failures",
+            "test_retryable_failure_does_not_block_unrelated_task",
         ],
     },
     # ------------------------------------------------------------------
@@ -241,7 +241,7 @@ EVIDENCE: dict[str, Evidence] = {
         "kind": "automated",
         "file": "test_remote_queue.py",
         "tests": [
-            "test_circuit_open_defers_task_local_lookup_survives",
+            "test_retryable_failure_does_not_block_unrelated_task",
         ],
     },
 }

@@ -41,7 +41,6 @@ from apps.operations.models import AuditSignature, SystemEvent
 from apps.remote.models import (
     RemoteAttempt,
     RemoteBudgetLedger,
-    RemoteCircuit,
     RemoteNegativeCache,
     RemotePrincipalState,
     RemoteProviderControl,
@@ -61,7 +60,7 @@ pytestmark = pytest.mark.django_db(transaction=True)
 REGISTERED_MODELS = [
     BatchJob, BatchItem, BatchQuotaEvent, ExportArtifact,
     RemoteTask, RemoteQuery, RemoteQueryItem, RemoteSubmission,
-    RemoteSubmissionMember, RemoteAttempt, RemoteCircuit, RemoteRateBucket,
+    RemoteSubmissionMember, RemoteAttempt, RemoteRateBucket,
     RemoteProviderControl, RemoteBudgetLedger, RemotePrincipalState,
     RemoteQueueControl, RemoteNegativeCache,
     ClassificationResult, ClassyfireLive, ClassificationHistory,

@@ -511,7 +511,7 @@ def retry_after_override(task: RemoteTask, retry_after: float) -> None:
 
 
 def defer_task(task: RemoteTask, delay_seconds: float) -> None:
-    """Park a task as DEFERRED (circuit open / quota) without counting a retry."""
+    """Park a task as DEFERRED (quota/operator wait) without counting a retry."""
     next_run = timezone.now() + timedelta(seconds=max(delay_seconds, 0))
     transition(
         task,

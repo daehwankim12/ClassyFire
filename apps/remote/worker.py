@@ -10,16 +10,16 @@ flow against the swappable :class:`~apps.remote.provider.Provider`:
      record a RemoteQuery, park the task in POLL_WAIT.
    * MISS, no structure → fan-out waiting items to NEED_STRUCTURE + DONE.
    * PERMANENT_ERROR → fan-out waiting items to INVALID_INPUT + DONE.
-   * RETRYABLE_ERROR → backoff (honour Retry-After) and circuit-record.
+   * RETRYABLE_ERROR → per-task backoff (honour Retry-After for 429).
 2. For SUBMITTED/POLL_WAIT tasks resumed at their poll window, ``poll_query``:
    * RUNNING  → re-park POLL_WAIT.
    * COMPLETE → parse + result-key validate + write + fan-out + DONE.
    * RETRYABLE_ERROR → backoff.
 
-The circuit breaker gates *remote* calls only: when OPEN, the worker parks the
-task as DEFERRED and returns — local lookups + queue accumulation keep working
-(NFR-P05). When ``REMOTE_ENABLED`` is false the worker never makes remote calls
-at all; tasks simply accumulate / stay parked.
+When ``REMOTE_ENABLED`` is false the worker never makes remote calls at all;
+tasks simply accumulate / stay parked. Provider failures never create a global
+gate: Wishart returns key- and endpoint-specific 5xx responses even while other
+requests succeed, so each task owns its retry state independently.
 """
 from __future__ import annotations
 
@@ -36,7 +36,6 @@ from django.conf import settings
 from django.db import DataError, IntegrityError, transaction
 from django.utils import timezone
 
-from apps.batches.remote_delay import CIRCUIT_OPEN_MESSAGE
 from apps.classifications.classyfire_web_csv import (
     ClassyfireWebCsvImportError,
     import_classyfire_web_csv_artifact,
@@ -55,7 +54,6 @@ from apps.core.enums import (
     TaskState,
 )
 from apps.remote import fanout, queue
-from apps.remote.circuit import DbCircuitBreaker
 from apps.remote.models import (
     RemoteAttempt,
     RemoteProviderControl,
@@ -123,9 +121,7 @@ def _should_penalize_entity_retry_after(
 def _should_escalate_entity_retry_to_submit(
     *,
     has_structure: bool,
-    retry_after: float | None,
     http_status: int | None,
-    attempt: int = 0,
 ) -> bool:
     """Whether a retryable entity response should bypass entity backoff."""
     return (
@@ -138,9 +134,7 @@ def _should_escalate_entity_retry_to_submit(
 def _should_terminalize_entity_retry_as_need_structure(
     *,
     has_structure: bool,
-    retry_after: float | None,
     http_status: int | None,
-    attempt: int = 0,
 ) -> bool:
     """Whether a retryable entity response is blocked only by missing structure."""
     return (
@@ -150,7 +144,7 @@ def _should_terminalize_entity_retry_as_need_structure(
     )
 
 
-# Provider namespace for the outbox/circuit/rate-bucket rows. Single provider
+# Provider namespace for the outbox and rate-bucket rows. Single provider
 # today; kept explicit so the idempotency key and shared state are namespaced.
 PROVIDER = "wishart"
 
@@ -178,13 +172,6 @@ class RateLimiterLike(Protocol):
     entity: _Bucket
     submit: _Bucket
 
-
-class CircuitLike(Protocol):
-    """Duck-typed breaker: DB-backed (prod) or in-process (tests)."""
-
-    def allow(self) -> bool: ...
-    def record_success(self) -> None: ...
-    def record_failure(self) -> None: ...
 
 # Default lock lease: how long a claimed task may be held before the recovery
 # sweep reclaims it. Derived from the remote timeout with generous headroom.
@@ -252,16 +239,14 @@ class RemoteWorker:
         *,
         worker_id: str | None = None,
         rate_limiter: RateLimiterLike | None = None,
-        circuit: CircuitLike | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
     ) -> None:
         self.provider = provider
         self.worker_id = worker_id or make_worker_id()
-        # Default to the SHARED, DB-backed limiter + circuit (F-08) so N worker
-        # processes respect ONE global rate and ONE breaker. Tests may inject the
-        # in-process variants for determinism.
+        # The shared DB-backed limiter lets N worker processes respect one
+        # upstream request rate. Failures remain task-local: a global gate can
+        # mistake Wishart's key-specific 500s for a provider outage.
         self.rate_limiter = rate_limiter or DbRateLimiter.from_settings()
-        self.circuit = circuit or DbCircuitBreaker.from_settings()
         self.lease_seconds = lease_seconds
 
     # -- top-level steps ---------------------------------------------------
@@ -319,16 +304,6 @@ class RemoteWorker:
             ).exists():
                 fanout.mark_items_delayed(task.inchikey)
             return
-        if not self.circuit.allow():
-            # Circuit open: skip remote calls, park as DEFERRED. Local lookups +
-            # queue accumulation continue elsewhere (NFR-P05).
-            queue.defer_task(task, delay_seconds=self.lease_seconds)
-            fanout.mark_items_delayed(
-                task.inchikey,
-                message=CIRCUIT_OPEN_MESSAGE,
-            )
-            return
-
         try:
             queue.transition(task, TaskState.RUNNING)
         except LeaseLost:
@@ -405,7 +380,6 @@ class RemoteWorker:
             auth_exc = exc
 
             def write_auth_raised(locked: RemoteTask) -> None:
-                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="AUTH_FAILURE",
@@ -440,16 +414,12 @@ class RemoteWorker:
             structure = self._structure_for(task)
             escalate_to_submit = _should_escalate_entity_retry_to_submit(
                 has_structure=structure is not None,
-                retry_after=result.retry_after,
                 http_status=result.http_status,
-                attempt=task.attempt,
             )
             terminalize_need_structure = (
                 _should_terminalize_entity_retry_as_need_structure(
                     has_structure=structure is not None,
-                    retry_after=result.retry_after,
                     http_status=result.http_status,
-                    attempt=task.attempt,
                 )
             )
 
@@ -467,14 +437,12 @@ class RemoteWorker:
                 )
                 if escalate_to_submit:
                     # A key-specific entity 5xx is only a failed cache lookup.
-                    # The following submit decides shared-provider health.
                     # Do not let this lookup stop unrelated queue work.
                     return
                 if terminalize_need_structure:
                     # This task cannot submit without a structure, but the
-                    # provider did answer. Complete a possible HALF_OPEN probe
-                    # instead of globally blocking unrelated keys.
-                    self.circuit.record_success()
+                    # provider did answer. This item needs a structure before it
+                    # can use the independent query endpoint.
                     fanout.fan_out_result(
                         locked.inchikey, BatchItemStatus.NEED_STRUCTURE
                     )
@@ -482,11 +450,11 @@ class RemoteWorker:
                         locked, TaskState.DONE, lock_owner=None, locked_at=None
                     )
                     return
-                self.circuit.record_failure()
                 if _should_honor_retry_after(
                     retry_after=result.retry_after,
                     http_status=result.http_status,
                 ):
+                    assert result.retry_after is not None
                     if _should_penalize_entity_retry_after(
                         retry_after=result.retry_after,
                         http_status=result.http_status,
@@ -498,8 +466,8 @@ class RemoteWorker:
 
             owned = self._with_owned_claim(claim, write_retryable)
             if owned and escalate_to_submit:
-                # tick() already gated this task. The entity 500 is deliberately
-                # circuit-neutral; the submit outcome alone controls the breaker.
+                # Entity and query endpoints fail independently in Wishart, so a
+                # key-specific entity 500 goes straight to structure submission.
                 logger.warning(
                     "entity lookup returned HTTP %s for %s; "
                     "bypassing entity backoff with a structure submit",
@@ -521,7 +489,6 @@ class RemoteWorker:
         if result.status == EntityLookupStatus.AUTH_FAILURE:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
             def write_auth(locked: RemoteTask) -> None:
-                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="AUTH_FAILURE",
@@ -547,12 +514,9 @@ class RemoteWorker:
 
         if result.status == EntityLookupStatus.PERMANENT_ERROR:
             # A definite non-404 4xx (bad key / 400 / 422) is a terminal input
-            # failure, not provider instability: do not submit a calculation, do
-            # not burn retry attempts, and do not trip the shared circuit breaker.
+            # failure, not provider instability: do not submit a calculation and
+            # do not burn retry attempts.
             def write_permanent(locked: RemoteTask) -> None:
-                # The provider responded definitively, so a HALF_OPEN probe must
-                # complete successfully even though this specific input is invalid.
-                self.circuit.record_success()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="PERMANENT",
@@ -581,7 +545,6 @@ class RemoteWorker:
             # input failures above, keep treating these as provider failures that
             # may be resolved by an upstream fix or deploy rollback.
             def write_protocol_error(locked: RemoteTask) -> None:
-                self.circuit.record_failure()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="PROTOCOL_ERROR",
@@ -608,7 +571,6 @@ class RemoteWorker:
             norm = self.provider.parse_result(result.raw_json)
 
             def write_found(locked: RemoteTask) -> None:
-                self.circuit.record_success()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification="FOUND",
@@ -650,7 +612,6 @@ class RemoteWorker:
             structure = self._structure_for(task)
 
             def write_miss(locked: RemoteTask) -> None:
-                self.circuit.record_success()
                 self._record_attempt(
                     RemoteAttempt.OPERATION_ENTITY,
                     classification=str(result.status),
@@ -675,10 +636,9 @@ class RemoteWorker:
                 self._submit_batch(task, claim)
             return
 
-        # Unexpected/unmapped status with circuit success recorded: surface it as a
-        # protocol error rather than silently submitting or dropping the task.
+        # Surface an unexpected status as a protocol error rather than silently
+        # submitting or dropping the task.
         def write_unexpected(locked: RemoteTask) -> None:
-            self.circuit.record_success()
             self._record_attempt(
                 RemoteAttempt.OPERATION_ENTITY,
                 classification="PROTOCOL_ERROR",
@@ -946,10 +906,7 @@ class RemoteWorker:
             # (F-06). MUST NOT call _fail_submission() (which would free the key
             # and allow a duplicate POST). An operator resolves it out-of-band
             # via resolve_submission.
-            # Quarantine only this in-doubt payload. It must not open the shared
-            # circuit and stop unrelated work for 300 seconds. Completing a
-            # possible HALF_OPEN probe keeps the rest of the queue moving.
-            self.circuit.record_success()
+            # Quarantine only this in-doubt payload. Unrelated work keeps moving.
             detail = (
                 "provider acceptance unknown after submit transport error; "
                 "automatic re-submit is blocked"
@@ -976,7 +933,6 @@ class RemoteWorker:
                 fanout.mark_items_delayed(member.inchikey)
             return
         except RetryableProviderError as exc:
-            self.circuit.record_failure()
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
                 classification="RETRYABLE",
@@ -1013,6 +969,7 @@ class RemoteWorker:
                     )
                     queue.finish_task(member)
                 elif honor_retry_after:
+                    assert retry_after is not None
                     queue.retry_after_override(member, retry_after)
                 else:
                     queue.schedule_retry(member)
@@ -1021,7 +978,6 @@ class RemoteWorker:
             return
         except AuthProviderError as exc:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
-            self.circuit.record_failure()
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
                 classification="AUTH_FAILURE",
@@ -1045,7 +1001,6 @@ class RemoteWorker:
             return
         except ProtocolProviderError as exc:
             # Unmapped status: never treat as success; surface + defer (F-10).
-            self.circuit.record_failure()
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
                 classification="PROTOCOL_ERROR",
@@ -1079,7 +1034,6 @@ class RemoteWorker:
                     fanout.mark_items_delayed(member.inchikey)
             return
         except NonRetryableProviderError as exc:
-            self.circuit.record_success()
             self._record_attempt(
                 RemoteAttempt.OPERATION_SUBMIT,
                 classification="PERMANENT",
@@ -1100,7 +1054,6 @@ class RemoteWorker:
                 queue.finish_task(member)
             return
 
-        self.circuit.record_success()
         # --- success: DURABLE-FIRST ordering (IMPORTANT-2) -------------------
         # Step 1: persist the already-POSTed remote_query_id durably — create the
         # RemoteQuery, flip the submission to SUBMITTED, link query items, and
@@ -1526,10 +1479,8 @@ class RemoteWorker:
                     members=members,
                     detail=poll.detail or f"HTTP {poll.http_status}",
                 ):
-                    self.circuit.record_success()
                     return
 
-            self.circuit.record_failure()
             try:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
@@ -1574,7 +1525,6 @@ class RemoteWorker:
 
         if poll.status == PollStatus.AUTH_FAILURE:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
-            self.circuit.record_failure()
             try:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
@@ -1611,7 +1561,6 @@ class RemoteWorker:
             # before retrying the task; otherwise legacy oversized submissions
             # (or unexpected multipage responses) keep holding R-01 reservations
             # and the capped retry batch is filtered out forever.
-            self.circuit.record_failure()
             try:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
@@ -1655,8 +1604,6 @@ class RemoteWorker:
             ).exists():
                 fanout.mark_items_delayed(task.inchikey)
             return
-
-        self.circuit.record_success()
 
         if poll.status == PollStatus.RUNNING:
             try:
@@ -1817,7 +1764,6 @@ class RemoteWorker:
             logger.error(
                 "remote query malformed for %s: %s", query.remote_query_id, exc
             )
-            self.circuit.record_failure()
             for member in members:
                 # A malformed response is unusable for EVERY member: retry each
                 # without a terminal apply state so the query is not completed on

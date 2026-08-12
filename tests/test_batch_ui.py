@@ -161,7 +161,7 @@ def test_job_detail_explains_remote_delayed_wishart_outage():
     assert "Remote delayed details" in content
     assert "Wishart outage / retrying" in content
     assert "Workers will retry automatically" in content
-    assert "Waiting on remote retry, circuit recovery, or operator action." in content
+    assert "Waiting on remote retry or operator action." in content
 
 
 # ---------------------------------------------------------------------------

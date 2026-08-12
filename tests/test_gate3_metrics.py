@@ -18,7 +18,6 @@ def test_metrics_snapshot_reports_queue_lag_provider_and_artifacts(tmp_path, set
     from apps.core.enums import ResultKind, SourceType, TaskState
     from apps.remote.models import (
         RemoteAttempt,
-        RemoteCircuit,
         RemoteRateBucket,
         RemoteTask,
     )
@@ -38,12 +37,6 @@ def test_metrics_snapshot_reports_queue_lag_provider_and_artifacts(tmp_path, set
         tokens=2,
         refill_rate_per_sec=1,
         blocked_until=now + timedelta(seconds=10),
-    )
-    RemoteCircuit.objects.create(
-        provider="wishart",
-        state="OPEN",
-        consecutive_failures=4,
-        opened_at=now,
     )
     RemoteAttempt.objects.create(
         provider="wishart",
@@ -84,7 +77,7 @@ def test_metrics_snapshot_reports_queue_lag_provider_and_artifacts(tmp_path, set
     assert payload["remote_queue"]["by_state"]["RETRY_WAIT"] == 1
     assert payload["remote_queue"]["due_count"] == 1
     assert payload["remote_queue"]["max_due_lag_seconds"] >= 30
-    assert payload["provider"]["circuits"]["wishart"]["state"] == "OPEN"
+    assert "circuits" not in payload["provider"]
     assert payload["provider"]["rate_buckets"]["wishart:entity"]["blocked"] is True
     assert payload["provider"]["attempts_by_classification"]["RETRYABLE"] == 1
     assert payload["classification"]["mismatch_count"] == 1

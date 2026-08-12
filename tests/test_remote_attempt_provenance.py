@@ -21,7 +21,6 @@ from apps.batches.models import BatchItem, BatchJob
 from apps.classifications.models import ClassificationResult, ClassyfireLive
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, ResultKind, TaskState
-from apps.remote.circuit import CircuitBreaker
 from apps.remote.contract import ProviderContractError, validate_entity_lookup_payload
 from apps.remote.mock import MockProvider, build_raw
 from apps.remote.models import RemoteAttempt, RemoteSubmission, RemoteTask
@@ -190,7 +189,6 @@ class _MismatchScenario:
             provider,
             worker_id="w-mismatch",
             rate_limiter=RateLimiter(1000, 1000),
-            circuit=CircuitBreaker(failure_threshold=1000),
         )
         worker.tick()
         return self.requested, returned_key

@@ -27,7 +27,6 @@ from apps.core.enums import (
     TaskState,
 )
 from apps.remote import queue
-from apps.remote.circuit import CircuitBreaker
 from apps.remote.mock import MockProvider, build_query_response, build_raw
 from apps.remote.models import RemoteQuery, RemoteQueryItem, RemoteTask
 from apps.remote.rate_limit import RateLimiter
@@ -94,7 +93,6 @@ class _QueryCompleteHarness:
             self.provider,
             worker_id=worker_id,
             rate_limiter=RateLimiter(1000, 1000),
-            circuit=CircuitBreaker(failure_threshold=1000),
         )
 
     def poll_as(self, worker_id: str, task: RemoteTask) -> None:
@@ -109,7 +107,8 @@ class _QueryCompleteHarness:
 
 
 @pytest.fixture
-def query_complete_harness():
+def query_complete_harness(settings):
+    settings.REMOTE_BATCH_SIZE = 2
     return _QueryCompleteHarness()
 
 

@@ -182,7 +182,7 @@ ALTER TABLE "remote_task"
 | `SUBMITTED` | Query submitted upstream; awaiting a `remote_query` id/poll. |
 | `POLL_WAIT` | Waiting for the next poll window (`next_run_at`). |
 | `RETRY_WAIT` | Transient failure; backing off before retry (`attempt`++). |
-| `DEFERRED` | Parked (e.g. circuit open / quota exhausted); still dedup-holding. |
+| `DEFERRED` | Parked by an explicit control or exhausted quota; still dedup-holding. |
 | `DONE` | Terminal: work finished (success or permanent failure). |
 
 ### Allowed transitions
@@ -198,7 +198,7 @@ RUNNING ─▶ DONE                                         (success / permanent
 # failure / control edges (from any active processing state)
 RUNNING|ENTITY_LOOKUP|SUBMIT_WAIT|SUBMITTED|POLL_WAIT ─▶ RETRY_WAIT
 RETRY_WAIT ─▶ READY                                     (when next_run_at elapses)
-* (any active) ─▶ DEFERRED                              (circuit open / quota)
+* (any active) ─▶ DEFERRED                              (operator control / quota)
 DEFERRED ─▶ READY                                       (when next_run_at elapses)
 LOCKED|RUNNING ─▶ READY                                 (lease expired / unlock; lock cleared)
 ```
@@ -536,40 +536,18 @@ keeps the reservation held, mirroring the idempotency key.
 
 ---
 
-## 7. `remote_circuits` — shared circuit breaker (`CircuitState`, F-08)
-
-Enum: `CircuitState`. Column: `remote_circuits.state` (one row per `provider`).
-Shared across ALL workers so N processes obey ONE breaker.
-
-| State | Meaning |
-| --- | --- |
-| `CLOSED` | Healthy; remote calls allowed. |
-| `OPEN` | Tripped after `consecutive_failures >= threshold`; calls skipped (tasks DEFERRED). Stays OPEN (the observable `state`) until a worker actually claims the probe — cool-down elapsing alone does not report HALF_OPEN. |
-| `HALF_OPEN` | A SINGLE probe is in flight (one worker won the conditional flip). |
-
-```
-CLOSED ─failures≥threshold─▶ OPEN
-OPEN   ─cooldown elapsed (one worker wins probe)─▶ HALF_OPEN
-HALF_OPEN ─probe success─▶ CLOSED
-          ─probe failure─▶ OPEN
-```
-
-Single-probe protocol (no thundering herd): the OPEN→HALF_OPEN promotion is a
-CONDITIONAL `UPDATE ... WHERE state='OPEN' AND opened_at <= now()-reset` flipping
-exactly one row to `HALF_OPEN`. The winning worker probes; every other worker
-sees `HALF_OPEN` and defers.
-
----
-
-## 8. `remote_rate_buckets` — shared global token bucket (F-08)
+## 7. `remote_rate_buckets` — shared global token bucket (F-08)
 
 One row per `(provider, bucket)` (`entity`, `submit`). Tokens are drawn
 ATOMICALLY under a row lock (`SELECT ... FOR UPDATE`, lazily refill from
 `refill_rate_per_sec * elapsed` capped at `capacity`, then decrement iff
 `tokens >= 1`), so N workers across processes respect ONE global rate. A server
 `Retry-After` parks the bucket via `blocked_until` with absolute precedence.
+Only HTTP 429 responses penalize the shared bucket. A 5xx response is isolated
+to the task and endpoint that received it, because Wishart can return persistent
+key-specific entity 500s while unrelated entity and query requests remain healthy.
 
-## 9. `remote_attempts` — per-attempt audit log (F-10)
+## 8. `remote_attempts` — per-attempt audit log (F-10)
 
 Append-only. One row per remote attempt (`operation` ∈ `ENTITY/SUBMIT/POLL`)
 records the explicit HTTP `classification` (`FOUND`/`SUCCESS`/`RUNNING`/

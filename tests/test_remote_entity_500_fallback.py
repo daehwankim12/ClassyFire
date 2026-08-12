@@ -1,12 +1,11 @@
-"""Persistent entity 500 escalates to a structure submit after confirmation.
+"""An entity 500 escalates to a structure submit without a global provider gate.
 
 Wishart returns HTTP 500 (server fault) for some specific keys — every entity
-GET for that key may fail repeatedly. The worker confirms that the entity
-endpoint is persistently bad for the key, then escalates a task that HAS a
-structure to a fresh calculation submit (a different endpoint, /queries.json,
-which can succeed where /entities 500s). Rate-limit 429s still retry, but entity
-5xx failures ignore Retry-After so they cannot keep the queue in 5-minute waits
-forever. Structureless tasks move to NEED_STRUCTURE instead of blocking the
+GET for that key may fail repeatedly while other keys remain healthy. A task
+that HAS a structure therefore proceeds to a fresh calculation submit (a
+different endpoint, /queries.json, which can succeed where /entities 500s).
+Rate-limit 429s still pace the provider globally, while an entity 5xx remains
+task-local. Structureless tasks move to NEED_STRUCTURE instead of blocking the
 remote queue on entity backoff.
 
 Style mirrors test_remote_side_effect_fencing: drive ``worker._entity_first``
@@ -46,33 +45,6 @@ class _AllowAllLimiter:
     def __init__(self) -> None:
         self.entity = self._Bucket()
         self.submit = self._Bucket()
-
-
-class _ClosedCircuit:
-    def allow(self) -> bool:
-        return True
-
-    def record_success(self) -> None:
-        pass
-
-    def record_failure(self) -> None:
-        pass
-
-
-class _OpeningCircuit:
-    def __init__(self) -> None:
-        self.open = False
-        self.failure_count = 0
-
-    def allow(self) -> bool:
-        return not self.open
-
-    def record_success(self) -> None:
-        self.open = False
-
-    def record_failure(self) -> None:
-        self.failure_count += 1
-        self.open = True
 
 
 def _provider_returning(status_code: int, *, headers: dict[str, str] | None = None):
@@ -126,13 +98,12 @@ def _claimed_task(*, with_compound: bool, attempt: int) -> RemoteTask:
     return task
 
 
-def _run_entity_first(task: RemoteTask, provider, circuit=None, limiter=None) -> None:
+def _run_entity_first(task: RemoteTask, provider, limiter=None) -> None:
     claim = queue.claim_from_task(task)
     worker = RemoteWorker(
         provider,
         worker_id=str(task.lock_owner),
         rate_limiter=limiter or _AllowAllLimiter(),
-        circuit=circuit or _ClosedCircuit(),
     )
     worker._entity_first(task, claim)
 
@@ -215,23 +186,10 @@ def test_repeated_entity_500_with_retry_after_without_structure_marks_need_struc
     assert item.status == BatchItemStatus.NEED_STRUCTURE
 
 
-def test_entity_500_is_circuit_neutral_and_submit_500_counts_once():
-    """The entity 500 consumes no breaker budget; the submit 500 counts once."""
-    task = _claimed_task(with_compound=True, attempt=2)
-    provider = _provider_returning(500)
-    circuit = _OpeningCircuit()
-
-    _run_entity_first(task, provider, circuit=circuit)
-
-    assert provider.submit_calls == 1
-    assert circuit.open
-    assert circuit.failure_count == 1  # submit 500 only; entity 500 is neutral
-
-
-def test_exhausted_entity_500_escalates_to_submit_after_circuit_opens():
+def test_exhausted_entity_500_still_escalates_to_submit():
     task = _claimed_task(with_compound=True, attempt=queue.MAX_ATTEMPTS - 1)
     provider = _provider_returning(500)
 
-    _run_entity_first(task, provider, circuit=_OpeningCircuit())
+    _run_entity_first(task, provider)
 
     assert provider.submit_calls == 1

@@ -120,18 +120,18 @@ worker can claim it.
 
 ---
 
-## T-09 Remote Failure Backoff/Circuit Breaker
+## T-09 Remote Failure Backoff and Isolation
 
 **Status:** Automated  
 **File:** `tests/test_remote_queue.py`  
 **Tests:**
 - `test_retryable_error_schedules_retry_with_backoff`
-- `test_circuit_opens_after_consecutive_failures`
+- `test_retryable_failure_does_not_block_unrelated_task`
 
 Verifies that:
 1. A retryable remote error schedules a retry with exponential backoff.
-2. Repeated consecutive failures open the circuit breaker, deferring subsequent
-   tasks without making remote calls.
+2. A retryable failure for one InChIKey does not block a healthy request for an
+   unrelated InChIKey.
 
 ---
 
@@ -349,8 +349,8 @@ correctness was verified with `python -c "import yaml; yaml.safe_load(...)"`.
 **Status:** Automated  
 **File:** `tests/test_remote_queue.py`  
 **Tests:**
-- `test_circuit_open_defers_task_local_lookup_survives`
+- `test_retryable_failure_does_not_block_unrelated_task`
 
-Opens the circuit breaker (simulating a remote outage).  Verifies that:
-1. The remote task is deferred (no remote calls made).
-2. The local lookup service still resolves cached compounds correctly.
+Simulates a key-specific remote failure and verifies that the failed task is
+retained for retry while unrelated remote work continues normally. Local cache
+lookups are independent of the remote worker and remain available.

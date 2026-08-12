@@ -828,24 +828,7 @@ class TestProdSettings:
 
 
 # ===========================================================================
-# 6. Base settings -- circuit breaker settings present
-# ===========================================================================
-
-
-class TestBaseSettingsCircuit:
-    def test_remote_circuit_threshold_present(self, settings: object) -> None:
-        assert hasattr(settings, "REMOTE_CIRCUIT_THRESHOLD")
-        assert isinstance(settings.REMOTE_CIRCUIT_THRESHOLD, int)  # type: ignore[union-attr]
-        assert settings.REMOTE_CIRCUIT_THRESHOLD > 0  # type: ignore[union-attr]
-
-    def test_remote_circuit_reset_seconds_present(self, settings: object) -> None:
-        assert hasattr(settings, "REMOTE_CIRCUIT_RESET_SECONDS")
-        assert isinstance(settings.REMOTE_CIRCUIT_RESET_SECONDS, int)  # type: ignore[union-attr]
-        assert settings.REMOTE_CIRCUIT_RESET_SECONDS > 0  # type: ignore[union-attr]
-
-
-# ===========================================================================
-# 7. Docker Compose port exposure
+# 6. Docker Compose port exposure
 # ===========================================================================
 
 

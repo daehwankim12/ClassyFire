@@ -297,11 +297,4 @@ EXPORT_ORPHAN_GRACE_SECONDS: int = env_int("EXPORT_ORPHAN_GRACE_SECONDS", 3600)
 
 SECURE_REFERRER_POLICY = "strict-origin"
 
-# ---------------------------------------------------------------------------
-# Circuit breaker (Task 9 remote worker — read via getattr for backwards compat)
-# ---------------------------------------------------------------------------
-
-REMOTE_CIRCUIT_THRESHOLD: int = env_int("REMOTE_CIRCUIT_THRESHOLD", 5)
-REMOTE_CIRCUIT_RESET_SECONDS: int = env_int("REMOTE_CIRCUIT_RESET_SECONDS", 300)
-
 AUDIT_SIGNING_KEY: str = env_str("AUDIT_SIGNING_KEY", "")

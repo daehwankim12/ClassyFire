@@ -52,17 +52,6 @@ class AllowAllLimiter:
         self.submit = self.Bucket()
 
 
-class ClosedCircuit:
-    def allow(self) -> bool:
-        return True
-
-    def record_success(self) -> None:
-        self.last = "success"
-
-    def record_failure(self) -> None:
-        self.last = "failure"
-
-
 @pytest.mark.django_db(transaction=True)
 def test_stale_poll_worker_cannot_borrow_fresh_lease(settings):
     settings.REMOTE_POLL_MIN_SECONDS = 1
@@ -92,7 +81,6 @@ def test_stale_poll_worker_cannot_borrow_fresh_lease(settings):
         CompletePollProvider(),
         worker_id="stale-worker",
         rate_limiter=AllowAllLimiter(),
-        circuit=ClosedCircuit(),
         lease_seconds=0.1,
     )
     stale_claimed_task = RemoteTask.objects.get(pk=task.pk)

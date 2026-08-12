@@ -300,25 +300,6 @@ class RemoteQueryItemApplyState(models.TextChoices):
     FAILED = "FAILED", "Failed"
 
 
-class CircuitState(models.TextChoices):
-    """remote_circuits breaker lifecycle (F-08 DB-backed circuit breaker).
-
-    State lives in Postgres (one row per provider) so N workers across processes
-    share ONE breaker. Consecutive failures open the circuit; after a cool-down
-    a single worker wins the HALF_OPEN probe via a conditional UPDATE (no
-    thundering herd). See docs/state-machines.md §6.
-
-    CLOSED ──failures>=threshold──> OPEN
-    OPEN   ──cooldown elapsed (one probe wins)──> HALF_OPEN
-    HALF_OPEN ──probe success──> CLOSED
-              ──probe failure──> OPEN
-    """
-
-    CLOSED = "CLOSED", "Closed"
-    OPEN = "OPEN", "Open"
-    HALF_OPEN = "HALF_OPEN", "Half open"
-
-
 class ProviderControlState(models.TextChoices):
     """Operator-controlled remote-provider gate (one row per provider).
 

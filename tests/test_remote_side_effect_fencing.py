@@ -16,11 +16,9 @@ from apps.classifications.models import ClassificationResult
 from apps.compounds.models import CompoundStructure
 from apps.core.enums import BatchItemStatus, TaskState
 from apps.remote import queue
-from apps.remote.circuit import DbCircuitBreaker
 from apps.remote.mock import MockProvider, build_raw, parse_wishart_payload, parse_wishart_results
 from apps.remote.models import (
     RemoteAttempt,
-    RemoteCircuit,
     RemoteQuery,
     RemoteSubmission,
     RemoteTask,
@@ -112,17 +110,6 @@ class _AllowAllLimiter:
         self.submit = self._Bucket()
 
 
-class _ClosedCircuit:
-    def allow(self) -> bool:
-        return True
-
-    def record_success(self) -> None:
-        pass
-
-    def record_failure(self) -> None:
-        pass
-
-
 class LeaseStealingEntityProvider:
     """An entity provider whose ``lookup_entity`` steals the caller's lease.
 
@@ -199,7 +186,6 @@ def test_stale_entity_worker_has_zero_side_effects_for_every_provider_outcome(
         provider,
         worker_id=str(task.lock_owner),
         rate_limiter=_AllowAllLimiter(),
-        circuit=_ClosedCircuit(),
     )
 
     worker._entity_first(task, claim)
@@ -209,28 +195,3 @@ def test_stale_entity_worker_has_zero_side_effects_for_every_provider_outcome(
     assert RemoteQuery.objects.count() == 0
     task.refresh_from_db()
     assert task.lock_owner == "fresh-worker"
-
-
-@pytest.mark.parametrize(
-    "status",
-    [
-        EntityLookupStatus.FOUND,
-        EntityLookupStatus.RETRYABLE_ERROR,
-    ],
-)
-def test_stale_entity_worker_does_not_mutate_db_circuit(
-    status, remote_task_with_structure
-):
-    task = remote_task_with_structure
-    claim = queue.claim_from_task(task)
-    provider = LeaseStealingEntityProvider(task=task, status=status)
-    worker = RemoteWorker(
-        provider,
-        worker_id=str(task.lock_owner),
-        rate_limiter=_AllowAllLimiter(),
-        circuit=DbCircuitBreaker(failure_threshold=1),
-    )
-
-    worker._entity_first(task, claim)
-
-    assert RemoteCircuit.objects.count() == 0

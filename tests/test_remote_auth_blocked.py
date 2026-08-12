@@ -41,17 +41,6 @@ class AllowLimiter:
         self.submit = self.Bucket()
 
 
-class ClosedCircuit:
-    def allow(self) -> bool:
-        return True
-
-    def record_success(self) -> None:
-        self.last = "success"
-
-    def record_failure(self) -> None:
-        self.last = "failure"
-
-
 @pytest.mark.django_db(transaction=True)
 def test_auth_failure_blocks_provider_until_operator_reset(settings):
     compound = CompoundStructure.objects.create(
@@ -70,7 +59,6 @@ def test_auth_failure_blocks_provider_until_operator_reset(settings):
         provider,
         worker_id="worker-a",
         rate_limiter=AllowLimiter(),
-        circuit=ClosedCircuit(),
         lease_seconds=0.1,
     )
 
