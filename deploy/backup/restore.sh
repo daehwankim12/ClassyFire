@@ -6,7 +6,7 @@
 #   POSTGRES_HOST=<host> POSTGRES_PORT=<port> POSTGRES_USER=<user> \
 #   POSTGRES_DB=<target_db> PGPASSWORD=<password> \
 #   BACKUP_DIR=/backups MANIFEST_FILE=classyfire_<TS>.manifest.json \
-#     sh /restore.sh
+#     sh deploy/backup/restore.sh
 #
 # Environment variables:
 #   POSTGRES_HOST     — DB host (default: db)
@@ -25,6 +25,10 @@
 #   RESTORE_SOURCE_ARTIFACT_DIR — If set, restore the source_artifacts archive
 #                                to this directory. If not set, source artifacts
 #                                restore is skipped.
+#   RESTORE_*_ARCHIVE_ROOT — Expected top-level directory for each artifact
+#                            archive. Defaults match backup.sh's standard paths.
+#   RESTORE_ARCHIVE_MAX_MEMBERS / RESTORE_ARCHIVE_MAX_EXPANDED_BYTES /
+#   RESTORE_ARCHIVE_MAX_COMPRESSION_RATIO — Positive safe-extraction limits.
 #   RESTORE_DROP_DB   — Set to "1" to DROP + CREATE the target DB before
 #                       restore.  Default "0" (restore with --clean
 #                       --if-exists without dropping).
@@ -54,6 +58,23 @@ POSTGRES_USER="${POSTGRES_USER:-classyfire}"
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
 RESTORE_DROP_DB="${RESTORE_DROP_DB:-0}"
 RESTORE_UPLOAD_DIR="${RESTORE_UPLOAD_DIR:-}"
+RESTORE_MEDIA_ARCHIVE_ROOT="${RESTORE_MEDIA_ARCHIVE_ROOT:-media}"
+RESTORE_EXPORT_ARCHIVE_ROOT="${RESTORE_EXPORT_ARCHIVE_ROOT:-export_files}"
+RESTORE_SOURCE_ARTIFACT_ARCHIVE_ROOT="${RESTORE_SOURCE_ARTIFACT_ARCHIVE_ROOT:-source_artifacts}"
+RESTORE_UPLOAD_ARCHIVE_ROOT="${RESTORE_UPLOAD_ARCHIVE_ROOT:-uploads}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+RESTORE_SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+RESTORE_PROJECT_ROOT=$(dirname "$(dirname "${RESTORE_SCRIPT_DIR}")")
+
+_safe_extract_archive() {
+  _archive_path="$1"
+  _destination="$2"
+  _expected_root="$3"
+  PYTHONPATH="${RESTORE_PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${PYTHON_BIN}" -m apps.operations.archive_restore \
+      "${_archive_path}" "${_destination}" "${_expected_root}"
+}
 
 # ── Validate required variables ────────────────────────────────────────────
 if [ -z "${POSTGRES_DB:-}" ]; then
@@ -121,6 +142,18 @@ if [ "${RESTORE_DROP_DB}" = "1" ]; then
     -c "CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\";"
 fi
 
+# ── Preflight: artifact extractor must be runnable before touching the DB ──
+# Artifact archives are restored by a Python extractor. Check it can run
+# BEFORE pg_restore, so a missing interpreter/module cannot leave the database
+# restored without its artifacts.
+if [ -n "${RESTORE_MEDIA_DIR:-}${RESTORE_EXPORT_DIR:-}${RESTORE_SOURCE_ARTIFACT_DIR:-}${RESTORE_UPLOAD_DIR:-}" ]; then
+  if ! PYTHONPATH="${RESTORE_PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${PYTHON_BIN}" -c "import apps.operations.archive_restore" 2>/dev/null; then
+    echo "[restore] ERROR: cannot run artifact extractor (${PYTHON_BIN} -m apps.operations.archive_restore from ${RESTORE_PROJECT_ROOT}); set PYTHON_BIN or run restore inside the web image" >&2
+    exit 1
+  fi
+fi
+
 # ── Restore DB dump ────────────────────────────────────────────────────────
 echo "[restore] Restoring ${DUMP_FILE} into database: ${POSTGRES_DB}"
 pg_restore \
@@ -157,10 +190,8 @@ if [ -n "${RESTORE_MEDIA_DIR:-}" ] && [ -n "${MEDIA_FILE:-}" ] && [ "${MEDIA_FIL
       echo "[restore] WARNING: no media_checksum in manifest — extracting without verification" >&2
     fi
     echo "[restore] Restoring media archive: ${MEDIA_FILE} -> ${RESTORE_MEDIA_DIR}"
-    mkdir -p "${RESTORE_MEDIA_DIR}"
-    # Restore into the *parent* of RESTORE_MEDIA_DIR so the archive's
-    # top-level directory ('media') is unpacked correctly.
-    tar -xzf "${MEDIA_PATH}" -C "$(dirname "${RESTORE_MEDIA_DIR}")"
+    _safe_extract_archive \
+      "${MEDIA_PATH}" "${RESTORE_MEDIA_DIR}" "${RESTORE_MEDIA_ARCHIVE_ROOT}"
     echo "[restore] Media restore complete."
   else
     echo "[restore] WARNING: media archive not found: ${MEDIA_PATH}" >&2
@@ -190,8 +221,8 @@ if [ -n "${RESTORE_EXPORT_DIR:-}" ] && [ -n "${EXPORTS_FILE:-}" ] && [ "${EXPORT
       echo "[restore] WARNING: no exports checksum in manifest — extracting without verification" >&2
     fi
     echo "[restore] Restoring exports archive: ${EXPORTS_FILE} -> ${RESTORE_EXPORT_DIR}"
-    mkdir -p "${RESTORE_EXPORT_DIR}"
-    tar -xzf "${EXPORTS_PATH}" -C "$(dirname "${RESTORE_EXPORT_DIR}")"
+    _safe_extract_archive \
+      "${EXPORTS_PATH}" "${RESTORE_EXPORT_DIR}" "${RESTORE_EXPORT_ARCHIVE_ROOT}"
     echo "[restore] Exports restore complete."
   else
     echo "[restore] WARNING: exports archive not found: ${EXPORTS_PATH}" >&2
@@ -221,8 +252,9 @@ if [ -n "${RESTORE_SOURCE_ARTIFACT_DIR:-}" ] && [ -n "${SOURCE_ARTIFACTS_FILE:-}
       echo "[restore] WARNING: no source_artifacts checksum in manifest — extracting without verification" >&2
     fi
     echo "[restore] Restoring source_artifacts archive: ${SOURCE_ARTIFACTS_FILE} -> ${RESTORE_SOURCE_ARTIFACT_DIR}"
-    mkdir -p "${RESTORE_SOURCE_ARTIFACT_DIR}"
-    tar -xzf "${SOURCE_ARTIFACTS_PATH}" -C "$(dirname "${RESTORE_SOURCE_ARTIFACT_DIR}")"
+    _safe_extract_archive \
+      "${SOURCE_ARTIFACTS_PATH}" "${RESTORE_SOURCE_ARTIFACT_DIR}" \
+      "${RESTORE_SOURCE_ARTIFACT_ARCHIVE_ROOT}"
     echo "[restore] Source artifacts restore complete."
   else
     echo "[restore] WARNING: source artifacts archive not found: ${SOURCE_ARTIFACTS_PATH}" >&2
@@ -262,8 +294,8 @@ if [ -n "${UPLOADS_FILE:-}" ] && [ "${UPLOADS_FILE}" != "null" ]; then
     fi
     echo "[restore] Uploads checksum OK: ${ACTUAL_UPLOADS_CHECKSUM}"
     echo "[restore] Restoring uploads archive: ${UPLOADS_FILE} -> ${RESTORE_UPLOAD_DIR}"
-    mkdir -p "${RESTORE_UPLOAD_DIR}"
-    tar -xzf "${UPLOADS_PATH}" -C "$(dirname "${RESTORE_UPLOAD_DIR}")"
+    _safe_extract_archive \
+      "${UPLOADS_PATH}" "${RESTORE_UPLOAD_DIR}" "${RESTORE_UPLOAD_ARCHIVE_ROOT}"
     echo "[restore] Uploads restore complete."
   fi
 else

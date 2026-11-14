@@ -269,18 +269,15 @@ def test_restore_sh_extracts_artifact_archives() -> None:
             )
 
             # ── Verify the actual files were extracted ─────────────────────
-            # The archive was built from export_dir (named 'export_files'),
-            # tar extracted it as parent(restore_export_dir)/export_files/
-            extracted_export = restore_export_dir.parent / export_dir.name / "my_export.csv"
+            # The validated archive root is stripped into the configured target.
+            extracted_export = restore_export_dir / "my_export.csv"
             assert extracted_export.exists(), (
                 f"Sentinel export file not found at {extracted_export} after restore.\n"
                 f"restore.sh may have silently skipped the archive.\n"
                 f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
             )
 
-            extracted_source = (
-                restore_source_dir.parent / source_artifact_dir.name / "source_data.json"
-            )
+            extracted_source = restore_source_dir / "source_data.json"
             assert extracted_source.exists(), (
                 f"Sentinel source artifact not found at {extracted_source} after restore.\n"
                 f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"

@@ -299,6 +299,7 @@ BACKUP_DIR="${BACKUP_DIR}" \
   POSTGRES_USER="${DB_USER}" \
   RESTORE_DROP_DB="0" \
   RESTORE_MEDIA_DIR="${RESTORE_UPLOAD_DIR}" \
+  RESTORE_MEDIA_ARCHIVE_ROOT="$(basename "${UPLOAD_DIR}")" \
   RESTORE_EXPORT_DIR="${RESTORE_EXPORT_DIR}" \
   RESTORE_SOURCE_ARTIFACT_DIR="${RESTORE_SOURCE_DIR}" \
   RESTORE_UPLOAD_DIR="${RESTORE_UPLOAD_DIR}" \
@@ -367,11 +368,10 @@ fi
 STORED_KEY=$(_psql_restore "SELECT storage_key FROM source_artifacts WHERE name='smoke_official.json';")
 STORED_KEY="${STORED_KEY// /}"
 if [ -n "${STORED_KEY}" ]; then
-  # The restored source artifact file should exist in RESTORE_SOURCE_DIR
-  # (tar extracts into parent directory preserving dir name)
+  # The restored source artifact file should exist in RESTORE_SOURCE_DIR.
   RESTORE_SA_FILE="${RESTORE_SOURCE_DIR}/${STORED_KEY}"
   if [ ! -f "${RESTORE_SA_FILE}" ]; then
-    # Tar restores as parent/source_artifacts/key — scan for it
+    # Retain the recursive lookup for nested source-artifact storage keys.
     RESTORE_SA_FILE=$(find "${RESTORE_SOURCE_DIR}" -name "${STORED_KEY}" 2>/dev/null | head -1 || true)
   fi
   if [ -n "${RESTORE_SA_FILE}" ] && [ -f "${RESTORE_SA_FILE}" ]; then
@@ -395,7 +395,7 @@ POSTGRES_DB="${RESTORE_DB}" \
 
 # Verify the export file itself was restored and contains expected bytes.
 EXPORT_FILE_NAME="smoke-export-token.csv"
-# Tar extracts into parent(RESTORE_EXPORT_DIR)/export_files/...
+# Safe extraction strips the validated archive root into RESTORE_EXPORT_DIR.
 RESTORED_EXPORT=$(find "${RESTORE_EXPORT_DIR}" -name "${EXPORT_FILE_NAME}" 2>/dev/null | head -1 || true)
 if [ -n "${RESTORED_EXPORT}" ] && [ -f "${RESTORED_EXPORT}" ]; then
   if grep -q "${SMOKE_INCHIKEY}" "${RESTORED_EXPORT}"; then
