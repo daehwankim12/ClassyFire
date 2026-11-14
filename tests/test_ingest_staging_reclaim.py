@@ -67,6 +67,9 @@ def test_stale_staging_worker_cannot_commit_rows_or_quota(settings, tmp_path):
 
     live.refresh_from_db()
     assert live.processing_state == BatchProcessingState.PARSING
+    assert live.upload_artifact_path is None
+    assert live.upload_size_bytes is None
+    assert not (tmp_path / "uploads" / spooled.relative_path).exists()
 
     # Idempotent resume: re-entering the live worker stages nothing extra.
     stage_spooled_upload(live)

@@ -197,12 +197,15 @@ def _delete_file_if_exists(path: Path) -> int:
     return 1
 
 
-def _unlink_artifacts(artifacts: _CollectedArtifacts) -> tuple[int, int]:
+def _unlink_upload_artifacts(artifacts: _CollectedArtifacts) -> int:
     from apps.batches.ingest import unlink_upload_artifact
 
-    upload_deleted = sum(
+    return sum(
         1 for relative_path in artifacts.upload_paths if unlink_upload_artifact(relative_path)
     )
+
+
+def _unlink_export_artifacts(artifacts: _CollectedArtifacts) -> int:
     export_deleted = 0
     export_dir = Path(getattr(settings, "EXPORT_DIR", ""))
     for ref in artifacts.export_refs:
@@ -211,7 +214,7 @@ def _unlink_artifacts(artifacts: _CollectedArtifacts) -> tuple[int, int]:
             export_deleted += _delete_file_if_exists(
                 export_dir / f"{ref.token}.meta.json"
             )
-    return upload_deleted, export_deleted
+    return export_deleted
 
 
 def _audit(event_type: str, payload: dict[str, Any]) -> None:
@@ -239,9 +242,13 @@ def delete_jobs_with_artifacts(
         )
         artifacts = _collect_artifacts(existing_ids)
         export_artifact_count = len(artifacts.export_refs)
+        # Upload files are removed before their owning rows release retained-byte
+        # reservations. An unlink error aborts the transaction and keeps them
+        # accounted for; missing files are already safe to release.
+        upload_deleted = _unlink_upload_artifacts(artifacts)
         BatchJob.objects.filter(pk__in=existing_ids).delete()
 
-    upload_deleted, export_files_deleted = _unlink_artifacts(artifacts)
+    export_files_deleted = _unlink_export_artifacts(artifacts)
     result = JobAdminOperationResult(
         jobs_deleted=len(existing_ids),
         upload_artifacts_deleted=upload_deleted,
@@ -350,6 +357,7 @@ def cancel_and_delete_jobs(
         )
         artifacts = _collect_artifacts(existing_ids)
         export_artifact_count = len(artifacts.export_refs)
+        upload_deleted = _unlink_upload_artifacts(artifacts)
         wanted_inchikeys = _waiting_inchikeys_for_jobs(existing_ids)
         # Lock the deletable unleased tasks for the wanted keys FIRST, then
         # re-check sharing as late as possible — immediately before the delete
@@ -399,7 +407,7 @@ def cancel_and_delete_jobs(
             recompute_remote_priorities_for_inchikeys(shared_inchikeys)
         )
 
-    upload_deleted, export_files_deleted = _unlink_artifacts(artifacts)
+    export_files_deleted = _unlink_export_artifacts(artifacts)
     result = JobAdminOperationResult(
         jobs_deleted=len(existing_ids),
         upload_artifacts_deleted=upload_deleted,

@@ -114,7 +114,8 @@ def spool_upload_file(upload: object, *, max_bytes: int | None = None) -> Spoole
     """
     root = validate_upload_root(getattr(settings, "UPLOAD_ARTIFACT_DIR", ""))
     root.mkdir(parents=True, exist_ok=True)
-    max_bytes = max_bytes or settings.MAX_UPLOAD_MB * 1024 * 1024
+    if max_bytes is None:
+        max_bytes = settings.MAX_UPLOAD_MB * 1024 * 1024
     name = getattr(upload, "name", "upload.bin") or "upload.bin"
     suffix = Path(name).suffix.lower()
     stem = uuid.uuid4().hex

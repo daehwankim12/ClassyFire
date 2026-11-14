@@ -48,6 +48,15 @@ class CleanupResult:
     # upload_artifacts_deleted counts FINAL spooled upload artifacts unlinked
     # because their owning job was pruned by retention (R-07).
     upload_artifacts_deleted: int = 0
+    # upload_artifacts_released counts raw uploads of staged/terminal jobs
+    # released (file removed, byte reservation cleared) ahead of retention.
+    upload_artifacts_released: int = 0
+    # upload_orphans_deleted counts final-name upload files with no BatchJob
+    # row, older than the upload-temp grace window.
+    upload_orphans_deleted: int = 0
+    # jobs_kept_for_unlink_failure counts expired jobs NOT deleted this run
+    # because their raw upload could not be removed (retried next run).
+    jobs_kept_for_unlink_failure: int = 0
 
 
 _EXPORT_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -283,6 +292,68 @@ def _cleanup_stale_upload_temps() -> int:
         return 0
 
 
+def _release_unneeded_upload_artifacts() -> int:
+    from apps.batches.services import release_unneeded_upload_artifacts
+
+    try:
+        return release_unneeded_upload_artifacts()
+    except ValueError:
+        logger.warning("Skipping upload artifact release: invalid UPLOAD_ARTIFACT_DIR")
+        return 0
+
+
+def _cleanup_orphan_upload_artifacts() -> int:
+    """Remove final-name upload files that no BatchJob references.
+
+    Such files (a crash between spool and commit, a restore, a manual copy) are
+    otherwise charged against the global retained-byte cap forever. Only files
+    older than the upload-temp grace window are touched, so a spool whose job
+    row has not committed yet is never removed.
+    """
+    import time
+
+    from apps.batches.ingest import validate_upload_root
+    from apps.batches.models import BatchJob
+
+    try:
+        root = validate_upload_root(getattr(settings, "UPLOAD_ARTIFACT_DIR", ""))
+    except ValueError:
+        logger.warning("Skipping upload orphan cleanup: invalid UPLOAD_ARTIFACT_DIR")
+        return 0
+    if not root.exists():
+        return 0
+    grace = int(getattr(settings, "UPLOAD_TEMP_GRACE_SECONDS", 86400))
+    cutoff = time.time() - grace
+    candidates: dict[str, Path] = {}
+    for path in root.iterdir():
+        try:
+            if (
+                path.is_file()
+                and not path.is_symlink()
+                and not path.name.endswith(".tmp")
+                and path.stat().st_mtime <= cutoff
+            ):
+                candidates[path.name] = path
+        except FileNotFoundError:
+            continue
+    if not candidates:
+        return 0
+    referenced = set(
+        BatchJob.objects.filter(upload_artifact_path__in=list(candidates))
+        .values_list("upload_artifact_path", flat=True)
+    )
+    removed = 0
+    for name, path in candidates.items():
+        if name in referenced:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            logger.warning("could not remove orphan upload artifact %s", path, exc_info=True)
+    return removed
+
+
 def cleanup_expired(actor: str = "system") -> CleanupResult:
     """Run all retention cleanup tasks and log a SystemEvent."""
     from apps.batches.models import BatchJob
@@ -314,14 +385,22 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
         | Q(completed_at__isnull=True, created_at__lt=job_cutoff)
     )
     # Collect linked FINAL upload artifact paths BEFORE deleting the rows — once
-    # the jobs are gone the relative paths are unrecoverable. Unlink each after
-    # the rows are deleted so a retention prune does not orphan the spool (R-07).
+    # the jobs are gone the relative paths are unrecoverable. Unlink each before
+    # deleting its byte reservation so an I/O failure cannot undercount storage.
     from apps.batches.ingest import unlink_upload_artifact
 
+    # Release raw uploads that staged/terminal jobs no longer need first, so
+    # their bytes stop counting against the quotas well before job retention.
+    upload_artifacts_released = _release_unneeded_upload_artifacts()
+
+    # Materialise the expired job ids once: re-evaluating the lazy queryset at
+    # delete time could pick up rows whose artifacts were never unlinked.
+    expired_job_ids = list(delete_qs.values_list("pk", flat=True))
     upload_paths = list(
-        delete_qs.exclude(upload_artifact_path__isnull=True)
+        BatchJob.objects.filter(pk__in=expired_job_ids)
+        .exclude(upload_artifact_path__isnull=True)
         .exclude(upload_artifact_path="")
-        .values_list("upload_artifact_path", flat=True)
+        .values_list("pk", "upload_artifact_path")
     )
 
     # ExportArtifact rows cascade when their owning BatchJob is deleted.  Collect
@@ -332,7 +411,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
     from apps.batches.models import ExportArtifact
 
     expiring_artifacts = list(
-        ExportArtifact.objects.filter(job__in=delete_qs).only("path", "token")
+        ExportArtifact.objects.filter(job_id__in=expired_job_ids).only("path", "token")
     )
     cascaded_export_files_deleted = 0
     for artifact in expiring_artifacts:
@@ -342,11 +421,25 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
                 exports.EXPORT_DIR / f"{artifact.token}.meta.json"
             )
 
-    jobs_deleted, _ = delete_qs.delete()
     upload_artifacts_deleted = 0
-    for relative_path in upload_paths:
-        if unlink_upload_artifact(relative_path):
-            upload_artifacts_deleted += 1
+    unlink_failed_job_ids: set = set()
+    for job_id, relative_path in upload_paths:
+        try:
+            if unlink_upload_artifact(relative_path):
+                upload_artifacts_deleted += 1
+        except OSError:
+            # Keep this job (and its byte reservation) for the next run instead
+            # of aborting retention, export and orphan cleanup for everyone.
+            logger.warning(
+                "could not remove upload artifact for expired job %s; keeping it",
+                job_id,
+                exc_info=True,
+            )
+            unlink_failed_job_ids.add(job_id)
+    deletable_job_ids = [
+        job_id for job_id in expired_job_ids if job_id not in unlink_failed_job_ids
+    ]
+    jobs_deleted, _ = BatchJob.objects.filter(pk__in=deletable_job_ids).delete()
 
     exports_deleted, export_files_deleted = _cleanup_expired_exports(now, export_days)
     exports_deleted += len(expiring_artifacts)
@@ -357,6 +450,7 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
 
     # Remove stale *.tmp partials from crashed upload-spool writes (H-04).
     upload_temps_deleted = _cleanup_stale_upload_temps()
+    upload_orphans_deleted = _cleanup_orphan_upload_artifacts()
 
     result = CleanupResult(
         jobs_secrets_wiped=secrets_wiped,
@@ -366,6 +460,9 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
         export_orphans_deleted=export_orphans_deleted,
         upload_temps_deleted=upload_temps_deleted,
         upload_artifacts_deleted=upload_artifacts_deleted,
+        upload_artifacts_released=upload_artifacts_released,
+        upload_orphans_deleted=upload_orphans_deleted,
+        jobs_kept_for_unlink_failure=len(unlink_failed_job_ids),
     )
 
     SystemEvent.objects.create(
@@ -380,6 +477,9 @@ def cleanup_expired(actor: str = "system") -> CleanupResult:
             "export_orphans_deleted": export_orphans_deleted,
             "upload_temps_deleted": upload_temps_deleted,
             "upload_artifacts_deleted": upload_artifacts_deleted,
+            "upload_artifacts_released": upload_artifacts_released,
+            "upload_orphans_deleted": upload_orphans_deleted,
+            "jobs_kept_for_unlink_failure": len(unlink_failed_job_ids),
             "upload_retention_days": upload_days,
             "job_retention_days": job_days,
             "export_retention_days": export_days,

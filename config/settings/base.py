@@ -248,6 +248,15 @@ REMOTE_MAX_QUEUE_DEPTH: int = env_int("REMOTE_MAX_QUEUE_DEPTH", 10000)
 # ---------------------------------------------------------------------------
 
 MAX_UPLOAD_MB: int = env_int("MAX_UPLOAD_MB", 100)
+# Retained raw-upload bytes are bounded independently of parsed row counts.
+# Defaults allow several maximum-size concurrent uploads per principal while
+# keeping the shared upload volume bounded even when terminal jobs are retained.
+UPLOAD_RETAINED_BYTES_PER_PRINCIPAL: int = env_int(
+    "UPLOAD_RETAINED_BYTES_PER_PRINCIPAL", 500 * 1024 * 1024
+)
+UPLOAD_RETAINED_BYTES_GLOBAL: int = env_int(
+    "UPLOAD_RETAINED_BYTES_GLOBAL", 2 * 1024 * 1024 * 1024
+)
 # Per-structure / per-record byte cap. Mirrors apps.core.security.MAX_STRUCTURE_LEN
 # and bounds the upload physical-line / SDF-record scanner (M-02).
 MAX_STRUCTURE_LEN: int = env_int("MAX_STRUCTURE_LEN", 100_000)

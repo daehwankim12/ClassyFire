@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from apps.batches.models import BatchItem, BatchJob
@@ -6,8 +8,11 @@ from apps.core.enums import BatchItemStatus
 
 
 @pytest.mark.django_db
-def test_overlong_text_row_is_invalid_without_rdkit_parse(client, monkeypatch, settings):
+def test_overlong_text_row_is_invalid_without_rdkit_parse(
+    client, monkeypatch, settings, tmp_path
+):
     settings.INGEST_DEFER_HEAVY_PROCESSING = True
+    settings.UPLOAD_ARTIFACT_DIR = str(tmp_path / "uploads")
 
     def fail_compute_identifiers(raw, detected_type):
         raise AssertionError("overlong row must not reach RDKit")
@@ -27,9 +32,15 @@ def test_overlong_text_row_is_invalid_without_rdkit_parse(client, monkeypatch, s
 
     assert response.status_code == 202
     job = BatchJob.objects.get(pk=response.json()["job_id"])
+    artifact = Path(settings.UPLOAD_ARTIFACT_DIR) / str(job.upload_artifact_path)
+    assert artifact.exists()
     run_pending_jobs("test-worker", max_jobs=1)
+    job.refresh_from_db()
     item = BatchItem.objects.get(job=job)
     assert item.status == BatchItemStatus.INVALID_INPUT
     assert "Row exceeds maximum length" in item.message
     assert "100017" in item.message
     assert "[truncated, 100017 chars total]" in item.original_input
+    assert job.upload_artifact_path is None
+    assert job.upload_size_bytes is None
+    assert not artifact.exists()

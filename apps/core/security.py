@@ -446,12 +446,101 @@ def _disk_usage_percent(path: Path) -> float:
     return ((usage.total - usage.free) / usage.total) * 100
 
 
+def _upload_root() -> Path:
+    from apps.batches.ingest import validate_upload_root
+
+    root = validate_upload_root(getattr(settings, "UPLOAD_ARTIFACT_DIR", ""))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _retained_upload_bytes_on_disk(root: Path) -> int:
+    """Return bytes currently retained in the configured upload directory."""
+    total = 0
+    for artifact in root.iterdir():
+        try:
+            if artifact.is_file():
+                total += artifact.stat().st_size
+        except FileNotFoundError:
+            # Retention cleanup may remove an artifact during this read. That
+            # can only increase the available allowance, so retry is unnecessary.
+            continue
+    return total
+
+
+def _principal_retained_upload_bytes(principal: str, max_upload_bytes: int) -> int:
+    """Return reserved bytes for one principal's still-linked raw artifacts."""
+    from apps.batches.models import BatchJob
+
+    sizes = (
+        BatchJob.objects.filter(remote_principal=principal)
+        .exclude(upload_artifact_path__isnull=True)
+        .exclude(upload_artifact_path="")
+        .values_list("upload_size_bytes", flat=True)
+    )
+    # Legacy/manual rows may lack size metadata. Charge them at the maximum
+    # upload size rather than letting unknown retained files bypass the quota.
+    return sum(
+        int(size) if size is not None and int(size) >= 0 else max_upload_bytes
+        for size in sizes
+    )
+
+
+def _retained_upload_allowance(
+    principal: str,
+) -> tuple[int, JsonResponse | None]:
+    """Return the maximum bytes one new spool may retain under all byte caps.
+
+    The caller holds the principal and global job-create advisory locks while
+    obtaining this allowance, streaming the upload, and inserting its BatchJob
+    reservation. Therefore concurrent admissions cannot spend the same bytes.
+    """
+    root = _upload_root()
+    max_upload_bytes = int(getattr(settings, "MAX_UPLOAD_MB", 100)) * 1024 * 1024
+    principal_cap = int(
+        getattr(settings, "UPLOAD_RETAINED_BYTES_PER_PRINCIPAL", 500 * 1024 * 1024)
+    )
+    global_cap = int(
+        getattr(settings, "UPLOAD_RETAINED_BYTES_GLOBAL", 2 * 1024 * 1024 * 1024)
+    )
+
+    principal_used = _principal_retained_upload_bytes(principal, max_upload_bytes)
+    global_used = _retained_upload_bytes_on_disk(root)
+
+    usage = shutil.disk_usage(root)
+    pause_percent = int(getattr(settings, "DISK_UPLOAD_PAUSE_PERCENT", 85))
+    pause_bytes = int(usage.total * pause_percent / 100)
+    disk_used = usage.total - usage.free
+
+    candidates: list[tuple[int, JsonResponse | None]] = [
+        (max(max_upload_bytes, 0), None),
+        (
+            max(principal_cap - principal_used, 0),
+            _quota_response("Retained upload byte quota exceeded."),
+        ),
+        (
+            max(global_cap - global_used, 0),
+            _quota_response("Global retained upload byte quota exceeded.", status=503),
+        ),
+        (
+            max(pause_bytes - disk_used, 0),
+            _quota_response(
+                "New job creation is paused because upload disk usage is above "
+                "the configured limit.",
+                status=503,
+            ),
+        ),
+    ]
+    return min(candidates, key=lambda candidate: candidate[0])
+
+
 def validate_job_create_controls(request: HttpRequest, row_count: int) -> JsonResponse | None:
     """Return a rejection response when job creation would exceed limits."""
     pause_percent = int(getattr(settings, "DISK_UPLOAD_PAUSE_PERCENT", 85))
-    if _disk_usage_percent(Path(settings.BASE_DIR)) >= pause_percent:
+    if _disk_usage_percent(_upload_root()) >= pause_percent:
         return _quota_response(
-            "New job creation is paused because disk usage is above the configured limit.",
+            "New job creation is paused because upload disk usage is above the "
+            "configured limit.",
             status=503,
         )
 
@@ -712,6 +801,7 @@ def spool_upload_under_quota(
     from apps.remote.budget import normalize_principal
 
     principal = _principal(request)
+    stored_principal = normalize_principal(principal)
     ip_address = _client_ip(request)
 
     with transaction.atomic():
@@ -724,13 +814,22 @@ def spool_upload_under_quota(
         if quota_error is not None:
             return None, "", quota_error
 
+        max_spool_bytes, retained_quota_error = _retained_upload_allowance(
+            stored_principal
+        )
+
         try:
             if is_text:
-                spooled = spool_text_input(upload)  # type: ignore[arg-type]
+                spooled = spool_text_input(  # type: ignore[arg-type]
+                    upload,
+                    max_bytes=max_spool_bytes,
+                )
             else:
-                spooled = spool_upload_file(upload)
+                spooled = spool_upload_file(upload, max_bytes=max_spool_bytes)
         except UploadTooLarge as exc:
             transaction.set_rollback(True)
+            if retained_quota_error is not None:
+                return None, "", retained_quota_error
             return None, "", _quota_response(str(exc), status=413)
 
         # The artifact is now on disk OUTSIDE the DB transaction. If ANY later
@@ -741,7 +840,7 @@ def spool_upload_under_quota(
             job = BatchJob.objects.create(
                 secret_hash=make_password(plaintext_secret),
                 remote_enabled=remote_enabled,
-                remote_principal=normalize_principal(principal),
+                remote_principal=stored_principal,
                 processing_state=BatchProcessingState.UPLOADING,
                 upload_artifact_path=spooled.relative_path,
                 upload_original_name=spooled.original_name,

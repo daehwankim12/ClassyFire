@@ -220,6 +220,8 @@ class TestBaseSettingsContract:
             "MAX_ROWS_PER_JOB",
             "JOB_CREATE_RATE_LIMIT_PER_MINUTE",
             "JOB_CREATE_DAILY_ROW_CAP",
+            "UPLOAD_RETAINED_BYTES_PER_PRINCIPAL",
+            "UPLOAD_RETAINED_BYTES_GLOBAL",
             "ACTIVE_JOB_CAP",
             "EXPORT_CREATE_RATE_LIMIT_PER_MINUTE",
             "JOB_ACCESS_COOKIE_DAYS",

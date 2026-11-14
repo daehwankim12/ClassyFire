@@ -48,6 +48,7 @@ The worker fans results only to items belonging to that generation.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 import uuid
 from collections.abc import Iterable
@@ -103,6 +104,8 @@ from apps.remote.negative_cache import (
     hard_negative_inchikeys,
 )
 from apps.remote.queue import RemoteQueueBackpressure
+
+logger = logging.getLogger(__name__)
 
 # Shown for a bare NON-STANDARD InChIKey input: it cannot be matched against the
 # standard-keyed caches directly (InChIKey is a one-way hash), but supplying the
@@ -1192,6 +1195,101 @@ def _resolve_spooled_artifact(job: BatchJob) -> Path:
     return artifact
 
 
+def _release_staged_upload_artifact(job: BatchJob) -> None:
+    """Delete a staged raw upload, then release its retained-byte reservation."""
+    relative_path = job.upload_artifact_path
+    if not relative_path:
+        return
+    artifact = _resolve_spooled_artifact(job)
+    try:
+        artifact.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Keep the path and byte metadata reserved when deletion fails. The
+        # retention cleanup can retry without letting those bytes bypass quotas.
+        logger.warning(
+            "failed to unlink staged upload artifact %s", artifact, exc_info=True
+        )
+        return
+
+    cleared = BatchJob.objects.filter(
+        pk=job.pk,
+        upload_artifact_path=relative_path,
+    ).update(
+        upload_artifact_path=None,
+        upload_original_name=None,
+        upload_content_type=None,
+        upload_size_bytes=None,
+        upload_sha256=None,
+    )
+    if cleared:
+        job.upload_artifact_path = None
+        job.upload_original_name = None
+        job.upload_content_type = None
+        job.upload_size_bytes = None
+        job.upload_sha256 = None
+
+
+_RAW_UPLOAD_DONE_STATES = (
+    BatchProcessingState.COMPLETE,
+    BatchProcessingState.ACTION_REQUIRED,
+    BatchProcessingState.FAILED,
+)
+
+
+def release_unneeded_upload_artifacts(*, limit: int = 500) -> int:
+    """Release raw uploads whose job can no longer read them; return the count.
+
+    A raw upload is only read while it is being staged into BatchItems, which
+    happens with the job claimed and no items yet; staging commits the items
+    and the state change together. So once a job HAS items, or has reached a
+    terminal processing state (including FAILED before staging, e.g. a row or
+    daily cap rejection, which is never re-claimed), its raw file is dead
+    weight that would otherwise stay charged against the retained-byte quotas
+    until job retention. This also drains artifacts left by jobs staged before
+    staging started releasing them. Rows another process holds are skipped.
+    """
+    candidate_ids = list(
+        BatchJob.objects.exclude(upload_artifact_path__isnull=True)
+        .exclude(upload_artifact_path="")
+        .filter(
+            Q(processing_state__in=_RAW_UPLOAD_DONE_STATES) | Q(items__isnull=False)
+        )
+        .order_by("created_at")
+        .values_list("pk", flat=True)
+        .distinct()[:limit]
+    )
+    released = 0
+    for job_id in candidate_ids:
+        with transaction.atomic():
+            job = (
+                BatchJob.objects.select_for_update(skip_locked=True)
+                .filter(pk=job_id)
+                .exclude(upload_artifact_path__isnull=True)
+                .exclude(upload_artifact_path="")
+                .first()
+            )
+            if job is None:
+                continue
+            if (
+                job.processing_state not in _RAW_UPLOAD_DONE_STATES
+                and not BatchItem.objects.filter(job_id=job.pk).exists()
+            ):
+                continue
+            try:
+                _release_staged_upload_artifact(job)
+            except ValueError:
+                logger.warning(
+                    "skipping upload artifact release for job %s: path escapes root",
+                    job.pk,
+                )
+                continue
+            if not job.upload_artifact_path:
+                released += 1
+    return released
+
+
 def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) -> None:
     """Parse a spooled upload artifact into BatchItems (UPLOADING → PARSING).
 
@@ -1213,10 +1311,9 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
     serialize on the locked job row, so the ``exists()`` race that produced
     duplicate rows / ``(job, row_order)`` collisions is closed.
 
-    Idempotent: a job whose artifact was already staged (items exist) is skipped,
-    so a worker that crashed after committing rows but before finishing
-    normalization re-enters here, locks the row, sees items exist, and returns
-    (state already PARSING because rows + state committed atomically).
+    Idempotent: a job whose artifact was already staged (items exist) skips row
+    creation, then releases any leftover raw artifact. Thus a worker that crashed
+    after committing rows can re-enter without duplicating items or quota usage.
     """
     if not job.upload_artifact_path:
         return
@@ -1239,9 +1336,10 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
             locked_job = _lock_owned_job(claim)
 
             # Re-check under the lock: a concurrent stager that won the race
-            # already committed rows + flipped state, so this worker returns
-            # without double-staging.
+            # already committed rows + flipped state, so this worker only retries
+            # releasing the raw artifact and does not double-stage.
             if BatchItem.objects.filter(job_id=locked_job.pk).exists():
+                _release_staged_upload_artifact(locked_job)
                 return
 
             row_iter = iter_uploaded_records_from_path(
@@ -1313,6 +1411,7 @@ def stage_spooled_upload(job: BatchJob, *, claim: IngestJobClaim | None = None) 
         ) from exc
 
     job.processing_state = BatchProcessingState.PARSING
+    _release_staged_upload_artifact(job)
 
 
 def process_job_items(job: BatchJob, *, claim: IngestJobClaim | None = None) -> None:
