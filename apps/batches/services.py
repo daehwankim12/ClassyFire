@@ -42,10 +42,9 @@ Local processing flow per row
 Global dedupe of RemoteTask
 ----------------------------
 The remote_tasks table has a partial unique constraint: only ONE active task
-per inchikey.  When creating a RemoteTask, catch IntegrityError in a
-savepoint (or use get_or_create over the active states), reuse the existing
-task, and leave the item PENDING_CLASSIFICATION.  This is expected; the
-worker fans results out to all waiting items in Task 9.
+per inchikey. Enrollment locks that generation, rechecks the live cache, and
+records the task identity on the item before committing PENDING_CLASSIFICATION.
+The worker fans results only to items belonging to that generation.
 """
 from __future__ import annotations
 
@@ -264,6 +263,14 @@ def _update_usage(inchikey: str) -> None:
     )
 
 
+class _ClassificationBecameAvailableError(Exception):
+    """Internal enrollment signal carrying the classification found after locking."""
+
+    def __init__(self, result: ClassificationLookupResult) -> None:
+        self.result = result
+        super().__init__("classification became available during remote enrollment")
+
+
 def _get_or_create_remote_task(
     inchikey: str,
     compound: CompoundStructure | None,
@@ -274,8 +281,11 @@ def _get_or_create_remote_task(
     """Get or create an active RemoteTask for *inchikey* (global dedupe).
 
     The partial-unique constraint allows only ONE active task per inchikey.
-    We try to create; on IntegrityError (duplicate active task) we fetch
-    the existing one in a savepoint so the outer transaction is unaffected.
+    Enrollment is serialized on the queue-control row and the selected task is
+    row-locked until the caller's transaction commits. A classification lookup
+    after that lock closes the completion race: if the generation completed
+    while this caller waited, the item resolves from the newly-live result
+    instead of joining a terminal task.
 
     If the global queue is at its high-water depth, ``enqueue_task`` raises
     :class:`RemoteQueueBackpressure`; that propagates out of the savepoint (it is
@@ -284,13 +294,56 @@ def _get_or_create_remote_task(
     """
     from apps.core.enums import ACTIVE_TASK_STATES
 
-    # Try to find an existing active task first (avoids exception-path overhead
-    # on the second job for the same inchikey).
-    existing = RemoteTask.objects.filter(
-        inchikey=inchikey,
-        state__in=ACTIVE_TASK_STATES,
-    ).first()
-    if existing is not None:
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("remote task enrollment requires an outer transaction")
+
+    with transaction.atomic():
+        # All batch enrollments take this gate before a task row, giving
+        # concurrent jobs a deterministic order even when they share many keys.
+        #
+        # Task rows are locked FOR NO KEY UPDATE (no_key=True): that still
+        # serialises against the worker's FOR UPDATE terminal transitions, but
+        # does not conflict with the FOR KEY SHARE that Postgres takes when a
+        # worker inserts RemoteAttempt/RemoteQueryItem rows referencing these
+        # tasks. A plain FOR UPDATE here deadlocks against that FK insert path.
+        remote_queue.lock_enqueue_gate()
+        while True:
+            existing = (
+                RemoteTask.objects.select_for_update(no_key=True)
+                .filter(
+                    inchikey=inchikey,
+                    state__in=ACTIVE_TASK_STATES,
+                )
+                .first()
+            )
+            if existing is None:
+                result = lookup_current_classification(inchikey)
+                if result is not None:
+                    raise _ClassificationBecameAvailableError(result)
+                task = remote_queue.enqueue_task(
+                    inchikey=inchikey,
+                    compound_id=compound.pk if compound is not None else None,
+                    principal=principal,
+                    priority=priority,
+                )
+                if task is None:
+                    continue
+                existing = (
+                    RemoteTask.objects.select_for_update(no_key=True)
+                    .filter(pk=task.pk, state__in=ACTIVE_TASK_STATES)
+                    .first()
+                )
+                if existing is None:
+                    continue
+
+            # SELECT FOR UPDATE waits for any terminal transition. Re-read the
+            # live classification afterwards so a completed generation cannot
+            # receive a late PENDING_CLASSIFICATION item.
+            result = lookup_current_classification(inchikey)
+            if result is not None:
+                raise _ClassificationBecameAvailableError(result)
+            break
+
         if priority > existing.priority:
             RemoteTask.objects.filter(pk=existing.pk, priority__lt=priority).update(
                 priority=priority
@@ -303,35 +356,34 @@ def _get_or_create_remote_task(
             existing.refresh_from_db(fields=["compound_id"])
         return existing
 
-    # No active task found — create one in a savepoint.
+
+def _enroll_remote_item(
+    item: BatchItem,
+    compound: CompoundStructure | None,
+    *,
+    principal: str | None = None,
+    priority: int = 0,
+) -> BatchItemStatus:
+    """Join ``item`` to one live task generation or resolve a raced completion."""
+    assert item.inchikey is not None
     try:
-        with transaction.atomic():
-            task = remote_queue.enqueue_task(
-                inchikey=inchikey,
-                compound_id=compound.pk if compound is not None else None,
-                principal=principal,
-                priority=priority,
-            )
-            if task is None:
-                raise IntegrityError("remote task create race")
-            return task
-    except IntegrityError:
-        # A concurrent create beat us; fetch the winner.
-        existing = RemoteTask.objects.filter(
-            inchikey=inchikey,
-            state__in=ACTIVE_TASK_STATES,
-        ).get()
-        if priority > existing.priority:
-            RemoteTask.objects.filter(pk=existing.pk, priority__lt=priority).update(
-                priority=priority
-            )
-            existing.refresh_from_db(fields=["priority"])
-        if compound is not None and existing.compound_id is None:
-            RemoteTask.objects.filter(pk=existing.pk, compound_id__isnull=True).update(
-                compound_id=compound.pk
-            )
-            existing.refresh_from_db(fields=["compound_id"])
-        return existing
+        task = _get_or_create_remote_task(
+            item.inchikey,
+            compound,
+            principal=principal,
+            priority=priority,
+        )
+    except _ClassificationBecameAvailableError as available:
+        item.remote_task = None
+        item.classification_snapshot = classification_lookup_snapshot(available.result)
+        _pin_resolved_classification(item, item.classification_snapshot)
+        item.message = None
+        return BatchItemStatus.FOUND_LIVE_CACHE
+
+    item.remote_task = task
+    status, message = _initial_status_for_remote_task(task)
+    item.message = message
+    return status
 
 
 def _initial_status_for_remote_task(task: RemoteTask) -> tuple[BatchItemStatus, str | None]:
@@ -402,6 +454,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
         item.inchikey = resolved_inchikey
         item.classification_snapshot = None
         item.resolved_classification_id = None
+        item.remote_task = None
 
         result = lookup_current_classification(resolved_inchikey)
         if result is not None:
@@ -412,6 +465,7 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
                 update_fields=[
                     "status",
                     "inchikey",
+                    "remote_task",
                     "classification_snapshot",
                     "resolved_classification",
                 ]
@@ -425,51 +479,35 @@ def submit_structure_for_item(item_id: int, structure: str) -> BatchItem:
             )
             item.compound = compound
             if job.remote_enabled:
-                item.status = BatchItemStatus.PENDING_CLASSIFICATION
-                item.message = None
-                item.save(
-                    update_fields=[
-                        "status",
-                        "inchikey",
-                        "compound",
-                        "message",
-                        "classification_snapshot",
-                        "resolved_classification",
-                    ]
-                )
                 try:
-                    task = _get_or_create_remote_task(
-                        resolved_inchikey,
+                    item.status = _enroll_remote_item(
+                        item,
                         compound,
                         principal=job.remote_principal,
                         priority=job.priority,
                     )
-                    status, message = _initial_status_for_remote_task(task)
-                    if status != BatchItemStatus.PENDING_CLASSIFICATION:
-                        item.status = status
-                        item.message = message
-                        item.save(update_fields=["status", "message"])
                 except RemoteBudgetExceededError:
+                    item.remote_task = None
                     item.status = BatchItemStatus.REMOTE_DELAYED
                     item.message = BUDGET_EXCEEDED_MESSAGE
-                    item.save(update_fields=["status", "message"])
                 except RemoteQueueBackpressure:
+                    item.remote_task = None
                     item.status = BatchItemStatus.REMOTE_DELAYED
                     item.message = _REMOTE_QUEUE_BACKPRESSURE_MESSAGE
-                    item.save(update_fields=["status", "message"])
             else:
                 item.status = BatchItemStatus.REMOTE_DELAYED
                 item.message = REMOTE_DISABLED_MESSAGE
-                item.save(
-                    update_fields=[
-                        "status",
-                        "inchikey",
-                        "compound",
-                        "message",
-                        "classification_snapshot",
-                        "resolved_classification",
-                    ]
-                )
+            item.save(
+                update_fields=[
+                    "status",
+                    "inchikey",
+                    "compound",
+                    "remote_task",
+                    "message",
+                    "classification_snapshot",
+                    "resolved_classification",
+                ]
+            )
 
     recompute_job_counters(item.job_id)
     item.refresh_from_db()
@@ -518,6 +556,7 @@ def _process_item(
     """
     item.classification_snapshot = None
     item.resolved_classification_id = None
+    item.remote_task_id = None
 
     # Pre-Step: Reject rows flagged by the parser as overlong without sending
     # them to RDKit.  This fires for both the legacy single-item path and the
@@ -620,15 +659,12 @@ def _process_item(
         # Create/reuse a RemoteTask. Key-only tasks are entity lookups; structure
         # tasks can proceed to calculation if entity lookup misses.
         try:
-            task = _get_or_create_remote_task(
-                norm.inchikey,
+            return _enroll_remote_item(
+                item,
                 compound,
                 principal=remote_principal,
                 priority=job_priority,
             )
-            status, message = _initial_status_for_remote_task(task)
-            item.message = message
-            return status
         except RemoteBudgetExceededError:
             item.message = BUDGET_EXCEEDED_MESSAGE
             return BatchItemStatus.REMOTE_DELAYED
@@ -787,6 +823,7 @@ _ITEM_UPDATE_FIELDS = [
     "detected_type",
     "inchikey",
     "compound",
+    "remote_task",
     "message",
     "original_input",
     "classification_snapshot",
@@ -1029,10 +1066,9 @@ def _retry_transiently_delayed_remote_items(
     while True:
         stop_cause: str | None = None
         with transaction.atomic():
-            # Lock retryable item rows before the parent job row. Remote fan-out
-            # updates matching BatchItem rows and then recomputes counters, which
-            # locks the BatchJob row; taking locks in that same item -> job order
-            # avoids a PostgreSQL ABBA deadlock for the same InChIKey.
+            # Lock retryable items before their parent job. Remote workers use
+            # item -> task and defer their BatchJob counter lock until commit, so
+            # this item -> job -> task enrollment cannot invert a held task lock.
             items = list(
                 BatchItem.objects.select_for_update()
                 .filter(
@@ -1048,6 +1084,7 @@ def _retry_transiently_delayed_remote_items(
             _lock_owned_job(claim)
             for index, item in enumerate(items):
                 inchikey = cast(str, item.inchikey)
+                item.remote_task = None
                 result = lookup_current_classification(inchikey)
                 if result is not None:
                     item.classification_snapshot = classification_lookup_snapshot(
@@ -1059,14 +1096,15 @@ def _retry_transiently_delayed_remote_items(
                     item.save(update_fields=_ITEM_UPDATE_FIELDS)
                     continue
                 if inchikey in hard_negative_inchikeys([inchikey]):
+                    item.remote_task = None
                     item.status = BatchItemStatus.REMOTE_TIMED_OUT
                     item.message = NEGATIVE_HARD_FAILED_MESSAGE
-                    item.save(update_fields=["status", "message"])
+                    item.save(update_fields=["status", "remote_task", "message"])
                     continue
 
                 try:
-                    _get_or_create_remote_task(
-                        inchikey,
+                    item.status = _enroll_remote_item(
+                        item,
                         item.compound,
                         principal=remote_principal,
                         priority=job_priority,
@@ -1077,7 +1115,7 @@ def _retry_transiently_delayed_remote_items(
                     # the caller parks the job until the budget window resets
                     # (or an operator raises the budget and requeues it).
                     item.message = BUDGET_EXCEEDED_MESSAGE
-                    item.save(update_fields=["message"])
+                    item.save(update_fields=["remote_task", "message"])
                     stop_cause = _PARK_CAUSE_BUDGET
                     break
                 except RemoteQueueBackpressure:
@@ -1092,13 +1130,14 @@ def _retry_transiently_delayed_remote_items(
                     BatchItem.objects.filter(
                         pk__in=[row.pk for row in items[index:]],
                         status=BatchItemStatus.REMOTE_DELAYED,
-                    ).update(message=_REMOTE_QUEUE_BACKPRESSURE_MESSAGE)
+                    ).update(
+                        remote_task=None,
+                        message=_REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+                    )
                     stop_cause = _PARK_CAUSE_BACKPRESSURE
                     break
                 else:
-                    item.status = BatchItemStatus.PENDING_CLASSIFICATION
-                    item.message = None
-                    item.save(update_fields=["status", "message"])
+                    item.save(update_fields=_ITEM_UPDATE_FIELDS)
         if stop_cause:
             return stop_cause
 

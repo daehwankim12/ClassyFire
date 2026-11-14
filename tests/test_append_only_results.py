@@ -225,6 +225,7 @@ def test_fanout_resolution_pins_resolved_classification_via_reconcile():
     from apps.batches.models import BatchItem
     from apps.core.enums import BatchItemStatus
     from apps.remote import fanout
+    from apps.remote.models import RemoteTask
 
     outcome = write_live_result(
         ASPIRIN_INCHIKEY, _norm(ASPIRIN_INCHIKEY),
@@ -236,14 +237,16 @@ def test_fanout_resolution_pins_resolved_classification_via_reconcile():
     job, _secret = create_job(rows, remote_enabled=True)
     item = job.items.get()
     # Force the waiting state regardless of how local processing resolved it.
+    task = RemoteTask.objects.create(inchikey=ASPIRIN_INCHIKEY)
     BatchItem.objects.filter(pk=item.pk).update(
         status=BatchItemStatus.PENDING_CLASSIFICATION,
         inchikey=ASPIRIN_INCHIKEY,
+        remote_task=task,
         classification_snapshot=None,
         resolved_classification=None,
     )
 
-    fanout.fan_out_result(ASPIRIN_INCHIKEY, BatchItemStatus.FOUND_WISHART_ENTITY)
+    fanout.fan_out_result(task, BatchItemStatus.FOUND_WISHART_ENTITY)
 
     item.refresh_from_db()
     assert item.status == BatchItemStatus.FOUND_WISHART_ENTITY

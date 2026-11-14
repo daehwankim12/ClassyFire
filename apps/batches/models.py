@@ -180,6 +180,17 @@ class BatchItem(models.Model):
         related_name="batch_items",
         help_text="Linked parsed structure once normalized.",
     )
+    remote_task = models.ForeignKey(
+        "remote.RemoteTask",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="batch_items",
+        help_text=(
+            "Remote task generation this item joined; fan-out is scoped to this "
+            "identity rather than only the InChIKey."
+        ),
+    )
     inchikey = models.CharField(
         max_length=27,
         null=True,

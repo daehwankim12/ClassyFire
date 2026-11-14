@@ -281,8 +281,9 @@ def test_inchikey_only_miss_remote_enabled_creates_remote_task():
     assert len(items) == 1
     assert items[0].status == BatchItemStatus.PENDING_CLASSIFICATION
 
-    # A RemoteTask must exist for this inchikey
-    assert RemoteTask.objects.filter(inchikey=GHOST_INCHIKEY).exists()
+    # The item records the exact task generation that owns its eventual fan-out.
+    task = RemoteTask.objects.get(inchikey=GHOST_INCHIKEY)
+    assert items[0].remote_task_id == task.pk
 
 
 @pytest.mark.django_db(transaction=True)
@@ -328,7 +329,8 @@ def test_inchikey_only_reusing_retry_wait_task_is_remote_delayed():
     item = BatchItem.objects.get(job=job)
     assert item.status == BatchItemStatus.REMOTE_DELAYED
     assert item.message == "Wishart is retrying this InChIKey; waiting for the next retry window."
-    assert RemoteTask.objects.filter(inchikey=GHOST_INCHIKEY).count() == 1
+    task = RemoteTask.objects.get(inchikey=GHOST_INCHIKEY)
+    assert item.remote_task_id == task.pk
 
 
 @pytest.mark.django_db(transaction=True)

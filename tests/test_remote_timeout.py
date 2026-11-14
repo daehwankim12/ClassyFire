@@ -206,15 +206,16 @@ def test_timeout_revokes_lease_and_fans_out_before_freeing_slot(monkeypatch):
 
     real_fan_out = fanout.fan_out_result
 
-    def inspect_terminal_fan_out(inchikey, status):
+    def inspect_terminal_fan_out(fanned_task, status):
+        assert fanned_task.pk == task.pk
         locked = RemoteTask.objects.get(pk=task.pk)
         assert locked.state == TaskState.RUNNING
         assert locked.lock_owner is None
         assert locked.lease_token is None
         assert locked.lease_version == 8
         # The active-key slot is still this generation's until fan-out finishes.
-        assert queue.enqueue_task(inchikey).pk == task.pk
-        return real_fan_out(inchikey, status)
+        assert queue.enqueue_task(fanned_task.inchikey).pk == task.pk
+        return real_fan_out(fanned_task, status)
 
     monkeypatch.setattr(fanout, "fan_out_result", inspect_terminal_fan_out)
 

@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from django.conf import settings
 from django.db import transaction
@@ -102,6 +102,7 @@ def _bulk_mark_backpressured(
         status=BatchItemStatus.REMOTE_TIMED_OUT,
     ).update(
         status=BatchItemStatus.REMOTE_DELAYED,
+        remote_task=None,
         message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
     )
     return updated, {item.job_id for item in items}, set(item_ids)
@@ -134,6 +135,7 @@ def _bulk_defer_timed_out_items(
                     status=BatchItemStatus.REMOTE_TIMED_OUT,
                 ).update(
                     status=BatchItemStatus.REMOTE_DELAYED,
+                    remote_task=None,
                     message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
                 )
             deferred += updated
@@ -484,8 +486,7 @@ def requeue_timed_out_items(
     """
     # Imported lazily to avoid an import cycle (services imports batches models).
     from apps.batches.services import (
-        _get_or_create_remote_task,
-        _initial_status_for_remote_task,
+        _enroll_remote_item,
         recompute_job_counters,
     )
     from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
@@ -576,58 +577,51 @@ def requeue_timed_out_items(
                 if item.pk in backpressured_item_ids:
                     continue
                 job = item.job
-                task = active_tasks.get(item.inchikey)
-                if task is None:
+                if item.inchikey not in active_tasks:
                     principal = normalize_principal(job.remote_principal)
                     if principal in budget_exhausted_principals:
                         skipped_budget += 1
                         continue
-                    try:
-                        task = _get_or_create_remote_task(
-                            item.inchikey,
-                            item.compound,
-                            principal=job.remote_principal,
-                            priority=job.priority,
-                        )
-                    except RemoteBudgetExceededError:
-                        budget_exhausted_principals.add(principal)
-                        skipped_budget += 1
-                        continue
-                    except RemoteQueueBackpressure:
-                        queue_backpressured = True
-                        remaining_without_tasks = [
-                            candidate
-                            for candidate in retryable_items[index:]
-                            if candidate.pk not in backpressured_item_ids
-                            and candidate.inchikey not in active_tasks
-                        ]
-                        updated, job_ids, item_ids = _bulk_mark_backpressured(
-                            remaining_without_tasks
-                        )
-                        skipped_backpressure += updated
-                        chunk_affected_job_ids.update(job_ids)
-                        chunk_release_job_ids.update(job_ids)
-                        backpressured_item_ids.update(item_ids)
-                        continue
-                    active_tasks[item.inchikey] = task
-                if job.priority > task.priority:
-                    updated = RemoteTask.objects.filter(
-                        pk=task.pk,
-                        priority__lt=job.priority,
-                    ).update(priority=job.priority)
-                    if updated:
-                        task.priority = job.priority
-                if item.compound_id and task.compound_id is None:
-                    updated = RemoteTask.objects.filter(
-                        pk=task.pk,
-                        compound_id__isnull=True,
-                    ).update(compound_id=item.compound_id)
-                    if updated:
-                        task.compound_id = item.compound_id
-                status, message = _initial_status_for_remote_task(task)
-                item.status = status
-                item.message = message
-                item.save(update_fields=["status", "message"])
+                try:
+                    item.status = _enroll_remote_item(
+                        item,
+                        item.compound,
+                        principal=job.remote_principal,
+                        priority=job.priority,
+                    )
+                except RemoteBudgetExceededError:
+                    budget_exhausted_principals.add(
+                        normalize_principal(job.remote_principal)
+                    )
+                    skipped_budget += 1
+                    continue
+                except RemoteQueueBackpressure:
+                    queue_backpressured = True
+                    remaining_without_tasks = [
+                        candidate
+                        for candidate in retryable_items[index:]
+                        if candidate.pk not in backpressured_item_ids
+                        and candidate.inchikey not in active_tasks
+                    ]
+                    updated, job_ids, item_ids = _bulk_mark_backpressured(
+                        remaining_without_tasks
+                    )
+                    skipped_backpressure += updated
+                    chunk_affected_job_ids.update(job_ids)
+                    chunk_release_job_ids.update(job_ids)
+                    backpressured_item_ids.update(item_ids)
+                    continue
+                if item.remote_task is not None:
+                    active_tasks[item.inchikey] = item.remote_task
+                item.save(
+                    update_fields=[
+                        "status",
+                        "remote_task",
+                        "message",
+                        "classification_snapshot",
+                        "resolved_classification",
+                    ]
+                )
                 requeued += 1
                 chunk_affected_job_ids.add(job.pk)
 
@@ -719,8 +713,7 @@ def requeue_budget_delayed_items(
     """
     # Imported lazily to avoid an import cycle (services imports batches models).
     from apps.batches.services import (
-        _get_or_create_remote_task,
-        _initial_status_for_remote_task,
+        _enroll_remote_item,
         recompute_job_counters,
     )
     from apps.remote.budget import RemoteBudgetExceededError, normalize_principal
@@ -786,8 +779,8 @@ def requeue_budget_delayed_items(
                     skipped_budget += 1
                     continue
                 try:
-                    task = _get_or_create_remote_task(
-                        cast(str, item.inchikey),
+                    item.status = _enroll_remote_item(
+                        item,
                         item.compound,
                         principal=item.job.remote_principal,
                         priority=item.job.priority,
@@ -807,13 +800,21 @@ def requeue_budget_delayed_items(
                     BatchItem.objects.filter(
                         pk__in=[row.pk for row in remaining],
                         status=BatchItemStatus.REMOTE_DELAYED,
-                    ).update(message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE)
+                    ).update(
+                        remote_task=None,
+                        message=REMOTE_QUEUE_BACKPRESSURE_MESSAGE,
+                    )
                     skipped_backpressure += len(remaining)
                     break
-                status, message = _initial_status_for_remote_task(task)
-                item.status = status
-                item.message = message
-                item.save(update_fields=["status", "message"])
+                item.save(
+                    update_fields=[
+                        "status",
+                        "remote_task",
+                        "message",
+                        "classification_snapshot",
+                        "resolved_classification",
+                    ]
+                )
                 requeued += 1
 
             _release_jobs_for_remote_retry(chunk_affected_job_ids)

@@ -106,12 +106,19 @@ def claim_from_task(task: RemoteTask) -> TaskClaim:
 def lock_owned_claim(claim: TaskClaim) -> RemoteTask:
     """Row-lock the claim's task and assert the lease still matches the snapshot.
 
-    ``SELECT ... FOR UPDATE`` the row, then verify its
+    Lock the generation's waiting items first, then ``SELECT ... FOR UPDATE``
+    the task row and verify its
     ``(lease_version, lease_token, lock_owner)`` still equal the IMMUTABLE
     ``claim``. If a fresher worker stole the lease the triple no longer matches
     and we raise :class:`LeaseLost` BEFORE any side effect. MUST be called inside
     ``transaction.atomic()`` so the returned row stays locked for the fenced work.
     """
+    # Waiting items are the first lock in the global item -> task order. Batch
+    # enrollment already owns its item before joining a task; taking the same
+    # order here prevents result fan-out from deadlocking with that enrollment.
+    from apps.remote import fanout
+
+    fanout.lock_task_items(claim.task_id)
     locked = RemoteTask.objects.select_for_update().get(pk=claim.task_id)
     if (
         locked.lease_version != claim.lease_version
@@ -180,8 +187,7 @@ def enqueue_task(
         with transaction.atomic():
             # Serialize concurrent enqueuers on the single queue-control row so
             # the count-then-insert below cannot race past max_depth (H-05).
-            control, _ = RemoteQueueControl.objects.get_or_create(provider="wishart")
-            RemoteQueueControl.objects.select_for_update().get(pk=control.pk)
+            lock_enqueue_gate()
             active_count = RemoteTask.objects.filter(
                 state__in=[s.value for s in TaskState.active_states()]
             ).count()
@@ -209,6 +215,12 @@ def enqueue_task(
             )
             existing.refresh_from_db(fields=["priority"])
         return existing
+
+
+def lock_enqueue_gate() -> RemoteQueueControl:
+    """Lock the queue-control row that serializes active-task enrollment."""
+    control, _ = RemoteQueueControl.objects.get_or_create(provider="wishart")
+    return RemoteQueueControl.objects.select_for_update().get(pk=control.pk)
 
 
 def _due_claimable_tasks(now):
@@ -406,7 +418,8 @@ def transition(task: RemoteTask, state: TaskState, **fields: object) -> None:
 def lock_owned_task(task: RemoteTask) -> RemoteTask:
     """Row-lock ``task`` and assert this worker still owns its lease (F-07).
 
-    ``SELECT ... FOR UPDATE`` the row, then verify its
+    Lock the generation's waiting items first, then ``SELECT ... FOR UPDATE``
+    the task row and verify its
     ``(lease_version, lease_token, lock_owner)`` still match the in-memory
     ``task`` the caller holds. If the lease was stolen/reclaimed (a fresh worker
     claimed it after stale-lock recovery) the triple no longer matches and we
@@ -416,6 +429,9 @@ def lock_owned_task(task: RemoteTask) -> RemoteTask:
     locked for the duration of the fenced work; the lock + ownership check make a
     subsequent :func:`transition_locked` on the returned instance race-free.
     """
+    from apps.remote import fanout
+
+    fanout.lock_task_items(task.pk)
     locked = RemoteTask.objects.select_for_update().get(pk=task.pk)
     if (
         locked.lease_version != task.lease_version
@@ -673,6 +689,8 @@ def timeout_stale_tasks(
     timed_out = 0
     for task_id in stale_ids:
         with transaction.atomic():
+            # Match fenced workers' item -> task lock order before terminal fan-out.
+            fanout.lock_task_items(task_id)
             task = (
                 RemoteTask.objects.select_for_update()
                 .filter(pk=task_id, created_at__lt=cutoff)
@@ -683,7 +701,6 @@ def timeout_stale_tasks(
                 # Another worker timed it out, or it resolved, between the scan
                 # and the lock. Skip — never double-finish.
                 continue
-            inchikey = task.inchikey
             _fail_live_remote_query_state_for_timed_out_task(task, message)
 
             # Revoke the captured lease while the row is still active. A provider
@@ -701,17 +718,18 @@ def timeout_stale_tasks(
                 updated_at=timezone.now(),
             )
 
-            # Fan out before DONE frees the partial-unique active-key slot. The
-            # nested atomic block is part of this transaction, so item updates,
-            # counter recomputation, and terminalization commit together.
-            fanout.fan_out_result(inchikey, BatchItemStatus.REMOTE_TIMED_OUT)
+            # Fan out this generation's waiters before DONE frees the
+            # partial-unique active-key slot; item updates, counters and
+            # terminalization commit together in this transaction.
+            fanout.fan_out_result(task, BatchItemStatus.REMOTE_TIMED_OUT)
 
             # Stamp a human-readable reason on this generation's timed-out items
             # (fan-out only sets status).
             from apps.batches.models import BatchItem
 
             BatchItem.objects.filter(
-                inchikey=inchikey, status=BatchItemStatus.REMOTE_TIMED_OUT
+                remote_task_id=task.pk,
+                status=BatchItemStatus.REMOTE_TIMED_OUT,
             ).exclude(message=message).update(message=message)
 
             # We still hold the row lock, so a plain transition is correct. Keep

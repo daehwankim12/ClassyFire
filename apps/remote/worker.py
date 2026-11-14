@@ -342,7 +342,7 @@ class RemoteWorker:
             )
             return
         try:
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
         except Exception:
             logger.exception(
                 "could not fan out unexpected failure for task %s (inchikey=%s)",
@@ -368,7 +368,7 @@ class RemoteWorker:
             if not RemoteTask.objects.filter(
                 pk=task.pk, state=TaskState.DONE
             ).exists():
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
         try:
             queue.transition(task, TaskState.RUNNING)
@@ -432,7 +432,7 @@ class RemoteWorker:
                 task,
                 delay_seconds=_bucket_retry_delay_seconds(self.rate_limiter.entity),
             )
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
             return
         try:
             result = self.provider.lookup_entity(task.inchikey)
@@ -467,7 +467,7 @@ class RemoteWorker:
                     task.inchikey,
                     exc,
                 )
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
 
         if result.status == EntityLookupStatus.RETRYABLE_ERROR:
@@ -510,9 +510,7 @@ class RemoteWorker:
                     # This task cannot submit without a structure, but the
                     # provider did answer. This item needs a structure before it
                     # can use the independent query endpoint.
-                    fanout.fan_out_result(
-                        locked.inchikey, BatchItemStatus.NEED_STRUCTURE
-                    )
+                    fanout.fan_out_result(locked, BatchItemStatus.NEED_STRUCTURE)
                     queue.transition_locked(
                         locked, TaskState.DONE, lock_owner=None, locked_at=None
                     )
@@ -550,7 +548,7 @@ class RemoteWorker:
                     task.inchikey,
                 )
             elif owned:
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
 
         if result.status == EntityLookupStatus.AUTH_FAILURE:
@@ -576,7 +574,7 @@ class RemoteWorker:
                     task.inchikey,
                     result.detail,
                 )
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
 
         if result.status == EntityLookupStatus.PERMANENT_ERROR:
@@ -595,7 +593,7 @@ class RemoteWorker:
                     raw_body_text=result.raw_text,
                     safe_headers=result.safe_headers,
                 )
-                fanout.fan_out_result(locked.inchikey, BatchItemStatus.INVALID_INPUT)
+                fanout.fan_out_result(locked, BatchItemStatus.INVALID_INPUT)
                 queue.finish_task(locked)
 
             if self._with_owned_claim(claim, write_permanent):
@@ -631,7 +629,7 @@ class RemoteWorker:
                     task.inchikey,
                     result.detail,
                 )
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
 
         if result.status == EntityLookupStatus.FOUND and result.raw_json is not None:
@@ -691,9 +689,7 @@ class RemoteWorker:
                     safe_headers=result.safe_headers,
                 )
                 if structure is None:
-                    fanout.fan_out_result(
-                        locked.inchikey, BatchItemStatus.NEED_STRUCTURE
-                    )
+                    fanout.fan_out_result(locked, BatchItemStatus.NEED_STRUCTURE)
                     queue.transition_locked(
                         locked, TaskState.DONE, lock_owner=None, locked_at=None
                     )
@@ -725,7 +721,7 @@ class RemoteWorker:
                 result.status,
                 task.inchikey,
             )
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
 
     @staticmethod
     def _canonical_payload(structures: list[tuple[str, str]]) -> dict:
@@ -809,7 +805,7 @@ class RemoteWorker:
         for member, (inchikey, structure) in zip(members, structures, strict=True):
             if (inchikey, self._structure_hash(structure)) in reserved_pairs:
                 queue.defer_task(member, delay_seconds=self.lease_seconds)
-                fanout.mark_items_delayed(member.inchikey)
+                fanout.mark_items_delayed(member)
             else:
                 free_members.append(member)
                 free_structures.append((inchikey, structure))
@@ -919,7 +915,7 @@ class RemoteWorker:
             delay = _bucket_retry_delay_seconds(self.rate_limiter.submit)
             for member in members:
                 queue.park_submit_wait(member, delay_seconds=delay)
-                fanout.mark_items_delayed(member.inchikey)
+                fanout.mark_items_delayed(member)
             return
 
         # Persist INTENT (PENDING) + the per-member reservations BEFORE the
@@ -970,7 +966,7 @@ class RemoteWorker:
             else:
                 for member in members:
                     queue.schedule_retry(member)
-                    fanout.mark_items_delayed(member.inchikey)
+                    fanout.mark_items_delayed(member)
             return
 
         try:
@@ -1007,7 +1003,7 @@ class RemoteWorker:
             submission.save(update_fields=["state", "detail", "updated_at"])
             for member in members:
                 queue.park_for_operator(member)
-                fanout.mark_items_delayed(member.inchikey)
+                fanout.mark_items_delayed(member)
             return
         except RetryableProviderError as exc:
             self._record_attempt(
@@ -1052,7 +1048,7 @@ class RemoteWorker:
                 else:
                     queue.schedule_retry(member)
                 if negative.state != negative.State.HARD_FAILED:
-                    fanout.mark_items_delayed(member.inchikey)
+                    fanout.mark_items_delayed(member)
             return
         except AuthProviderError as exc:
             # AUTH_FAILURE: stop retrying, do NOT burn attempts, surface (F-10).
@@ -1075,7 +1071,7 @@ class RemoteWorker:
             logger.error("remote submit AUTH_FAILURE (operator action): %s", exc)
             for member in members:
                 queue.defer_task(member, delay_seconds=self.lease_seconds)
-                fanout.mark_items_delayed(member.inchikey)
+                fanout.mark_items_delayed(member)
             return
         except ProtocolProviderError as exc:
             # Unmapped status: never treat as success; surface + defer (F-10).
@@ -1110,7 +1106,7 @@ class RemoteWorker:
                     )
                 else:
                     queue.schedule_retry(member)
-                    fanout.mark_items_delayed(member.inchikey)
+                    fanout.mark_items_delayed(member)
             return
         except NonRetryableProviderError as exc:
             self._record_attempt(
@@ -1214,7 +1210,7 @@ class RemoteWorker:
             )
             for member in members:
                 queue.park_for_operator(member)
-                fanout.mark_items_delayed(member.inchikey)
+                fanout.mark_items_delayed(member)
             return
 
         # Step 2: park each member in POLL_WAIT, tolerating a per-member
@@ -1234,7 +1230,7 @@ class RemoteWorker:
         try:
             with transaction.atomic():
                 locked = queue.lock_owned_claim(claim)
-                fanout.fan_out_result(locked.inchikey, status)
+                fanout.fan_out_result(locked, status)
                 queue.transition_locked(
                     locked, TaskState.DONE, lock_owner=None, locked_at=None
                 )
@@ -1316,7 +1312,7 @@ class RemoteWorker:
             # this payload for explicit resolution and move to the next task.
             for member in members:
                 queue.park_for_operator(member)
-                fanout.mark_items_delayed(member.inchikey)
+                fanout.mark_items_delayed(member)
             return
 
         # PENDING in-doubt: NEVER re-POST while the key is held. Once the cap or
@@ -1378,7 +1374,7 @@ class RemoteWorker:
                 queue.park_for_operator(member)
             else:
                 queue.defer_task(member, delay_seconds=self.lease_seconds)
-            fanout.mark_items_delayed(member.inchikey)
+            fanout.mark_items_delayed(member)
 
     @staticmethod
     def _block_provider_auth(detail: str) -> None:
@@ -1528,13 +1524,13 @@ class RemoteWorker:
         )
         if item is None:
             queue.schedule_retry(task)
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
             return
         query = item.query
         remote_query_id = query.remote_query_id
         if remote_query_id is None:
             queue.schedule_retry(task)
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
             return
 
         # Polls use the same limiter handle as entity GETs. In production,
@@ -1620,9 +1616,7 @@ class RemoteWorker:
                         detail=poll.detail,
                     )
                     if negative.state == negative.State.HARD_FAILED:
-                        fanout.fan_out_result(
-                            locked.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
-                        )
+                        fanout.fan_out_result(locked, BatchItemStatus.REMOTE_TIMED_OUT)
                         queue.finish_task(locked)
                     elif poll.retry_after is not None:
                         queue.retry_after_override(locked, poll.retry_after)
@@ -1634,7 +1628,7 @@ class RemoteWorker:
             if not RemoteTask.objects.filter(
                 pk=task.pk, state=TaskState.DONE
             ).exists():
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
 
         if poll.status == PollStatus.AUTH_FAILURE:
@@ -1662,7 +1656,7 @@ class RemoteWorker:
                 self._log_poll_lease_lost(task, "AUTH_FAILURE")
                 return
             logger.error("remote poll AUTH_FAILURE (operator action): %s", poll.detail)
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
             return
 
         if poll.status in (PollStatus.NOT_FOUND, PollStatus.PROTOCOL_ERROR):
@@ -1703,9 +1697,7 @@ class RemoteWorker:
                         detail=poll.detail,
                     )
                     if negative.state == negative.State.HARD_FAILED:
-                        fanout.fan_out_result(
-                            locked.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
-                        )
+                        fanout.fan_out_result(locked, BatchItemStatus.REMOTE_TIMED_OUT)
                         queue.finish_task(locked)
                     else:
                         queue.schedule_retry(locked)
@@ -1716,7 +1708,7 @@ class RemoteWorker:
             if not RemoteTask.objects.filter(
                 pk=task.pk, state=TaskState.DONE
             ).exists():
-                fanout.mark_items_delayed(task.inchikey)
+                fanout.mark_items_delayed(task)
             return
 
         if poll.status == PollStatus.RUNNING:
@@ -1969,7 +1961,7 @@ class RemoteWorker:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(member_claim)
                     fanout.fan_out_result(
-                        locked.inchikey, BatchItemStatus.COMPLETE_AFTER_WISHART
+                        locked, BatchItemStatus.COMPLETE_AFTER_WISHART
                     )
                     queue.transition_locked(
                         locked, TaskState.DONE, lock_owner=None, locked_at=None
@@ -2202,9 +2194,7 @@ class RemoteWorker:
                         detail="missing from completed provider response",
                     )
                     if negative.state == negative.State.HARD_FAILED:
-                        fanout.fan_out_result(
-                            locked.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
-                        )
+                        fanout.fan_out_result(locked, BatchItemStatus.REMOTE_TIMED_OUT)
                         queue.finish_task(locked)
                     else:
                         queue.schedule_retry(locked)
@@ -2235,7 +2225,7 @@ class RemoteWorker:
                     task.inchikey,
                 )
                 return
-            fanout.mark_items_delayed(task.inchikey)
+            fanout.mark_items_delayed(task)
             return
         if not self._key_matches(task.inchikey, norm.inchikey):
             self._handle_key_mismatch(claim, norm, query=query)
@@ -2282,7 +2272,7 @@ class RemoteWorker:
                 retrieved_at=query.submitted_at if query is not None else timezone.now(),
             )
             mark_negative_resolved_from_wishart(locked.inchikey)
-            fanout.fan_out_result(locked.inchikey, final_status)
+            fanout.fan_out_result(locked, final_status)
             queue.transition_locked(
                 locked, TaskState.DONE, lock_owner=None, locked_at=None
             )
@@ -2450,9 +2440,7 @@ class RemoteWorker:
             # have appended a REJECTED_MISMATCH event and left the live pointer
             # untouched. Assert the contract rather than trusting it silently.
             assert not outcome.applied, "mismatch must never advance the live pointer"
-            fanout.fan_out_result(
-                locked.inchikey, BatchItemStatus.RESULT_KEY_MISMATCH
-            )
+            fanout.fan_out_result(locked, BatchItemStatus.RESULT_KEY_MISMATCH)
             queue.transition_locked(
                 locked, TaskState.DONE, lock_owner=None, locked_at=None
             )
