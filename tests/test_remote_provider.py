@@ -390,6 +390,41 @@ def test_wishart_retry_after_delta_seconds():
     assert result.retry_after == 45.0
 
 
+@pytest.mark.parametrize(
+    "header",
+    ["inf", "Infinity", "NaN", "1e3", "1.5", "+30", "-1"],
+)
+def test_wishart_retry_after_rejects_non_decimal_delta_seconds(header):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": header})
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after is None
+
+
+def test_wishart_retry_after_large_delta_is_capped(settings):
+    settings.WISHART_MAX_RETRY_AFTER_SECONDS = 300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "9" * 10_000})
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after == 300.0
+
+
+def test_wishart_retry_after_zero_cap_uses_normal_backoff(settings):
+    settings.WISHART_MAX_RETRY_AFTER_SECONDS = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "30"})
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after is None
+
+
 def test_wishart_retry_after_http_date_form():
     # ACCEPTANCE (F-10): Retry-After supports BOTH delta-seconds AND HTTP-date.
     import email.utils
@@ -405,6 +440,20 @@ def test_wishart_retry_after_http_date_form():
     assert result.status == EntityLookupStatus.RETRYABLE_ERROR
     assert result.retry_after is not None
     assert 110 < result.retry_after <= 121
+
+
+def test_wishart_retry_after_far_future_http_date_is_capped(settings):
+    settings.WISHART_MAX_RETRY_AFTER_SECONDS = 300
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "Fri, 31 Dec 9999 23:59:59 GMT"},
+        )
+
+    result = _wishart_with(handler).lookup_entity(IK_A)
+    assert result.status == EntityLookupStatus.RETRYABLE_ERROR
+    assert result.retry_after == 300.0
 
 
 def test_wishart_retry_after_malformed_header_is_ignored_for_entity():

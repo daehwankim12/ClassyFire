@@ -1,11 +1,12 @@
 """Admin registration for the remote work queue and its control surface.
 
-All models are read-only. Three audited operational actions are exposed:
+All models are read-only. Four audited operational actions are exposed:
 
 * RemoteTask  — reset selected DEFERRED/RETRY_WAIT tasks to READY.
 * RemoteProviderControl — re-enable an AUTH_BLOCKED provider, plus global
   pause / resume buttons (with a live status banner) on the changelist.
 * RemoteSubmission — mark an in-doubt UNKNOWN submission FAILED.
+* RemoteRateBucket — clear selected persisted Retry-After blocks.
 
 Every action reuses verified service logic and emits a SystemEvent audit row.
 """
@@ -15,6 +16,7 @@ from typing import Any
 
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.db.models import QuerySet
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.urls import path
@@ -318,6 +320,43 @@ class RemoteRateBucketAdmin(ReadOnlyModelAdmin):
         "blocked_until",
     )
     list_filter = ("provider",)
+    actions = ("reset_retry_after",)
+
+    @admin.action(
+        description="Clear selected Retry-After bucket blocks",
+        permissions=("operate",),
+    )
+    def reset_retry_after(
+        self, request: HttpRequest, queryset: QuerySet[RemoteRateBucket]
+    ) -> None:
+        with transaction.atomic():
+            blocked = list(
+                queryset.select_for_update()
+                .exclude(blocked_until__isnull=True)
+                .values("id", "provider", "bucket", "blocked_until")
+            )
+            bucket_ids = [row["id"] for row in blocked]
+            count = RemoteRateBucket.objects.filter(pk__in=bucket_ids).update(
+                blocked_until=None
+            )
+            SystemEvent.objects.create(
+                category=EventCategory.REMOTE,
+                event_type="rate_bucket_retry_after_reset",
+                payload={
+                    "actor": request.user.get_username(),
+                    "count": count,
+                    "buckets": [
+                        {
+                            "id": row["id"],
+                            "provider": row["provider"],
+                            "bucket": row["bucket"],
+                            "previous_blocked_until": row["blocked_until"].isoformat(),
+                        }
+                        for row in blocked
+                    ],
+                },
+            )
+        self.message_user(request, f"Cleared {count} Retry-After bucket block(s).")
 
 
 @admin.register(RemoteBudgetLedger)

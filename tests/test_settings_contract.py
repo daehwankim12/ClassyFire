@@ -187,6 +187,11 @@ class TestBaseSettingsContract:
         assert hasattr(settings, "REMOTE_TIMEOUT_SECONDS")
         assert isinstance(settings.REMOTE_TIMEOUT_SECONDS, int)
 
+    def test_wishart_max_retry_after_seconds(self, settings: object) -> None:
+        assert hasattr(settings, "WISHART_MAX_RETRY_AFTER_SECONDS")
+        assert isinstance(settings.WISHART_MAX_RETRY_AFTER_SECONDS, int)
+        assert 0 <= settings.WISHART_MAX_RETRY_AFTER_SECONDS <= 24 * 60 * 60
+
     def test_max_upload_mb(self, settings: object) -> None:
         assert hasattr(settings, "MAX_UPLOAD_MB")
         assert isinstance(settings.MAX_UPLOAD_MB, int)

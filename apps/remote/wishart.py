@@ -63,6 +63,7 @@ from apps.remote.provider import (
 # Response headers safe to persist verbatim (no auth/cookies/PII). Lower-cased.
 SAFE_RESPONSE_HEADERS = {"content-type", "retry-after", "x-request-id"}
 DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
+DEFAULT_MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
 
 
 class ResponseTooLargeError(ValueError):
@@ -88,34 +89,62 @@ def _safe_headers(response: httpx.Response | _BufferedResponse) -> dict[str, str
     }
 
 
+def _retry_after_cap_seconds() -> int:
+    """Return the configured retry cap, bounded by the 24-hour safety ceiling."""
+    try:
+        configured = int(
+            getattr(
+                settings,
+                "WISHART_MAX_RETRY_AFTER_SECONDS",
+                DEFAULT_MAX_RETRY_AFTER_SECONDS,
+            )
+        )
+    except (TypeError, ValueError, OverflowError):
+        configured = DEFAULT_MAX_RETRY_AFTER_SECONDS
+    return min(max(configured, 0), DEFAULT_MAX_RETRY_AFTER_SECONDS)
+
+
 def _parse_retry_after(response: httpx.Response | _BufferedResponse) -> float | None:
     """Parse a ``Retry-After`` header supporting BOTH forms (F-10).
 
-    * delta-seconds: ``Retry-After: 120`` → ``120.0``.
+    * delta-seconds: ``Retry-After: 120`` → ``120.0`` (decimal digits only).
     * HTTP-date:     ``Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`` → seconds
       from now until that instant (clamped at >= 0).
 
+    Both forms are capped before they can reach scheduler datetime arithmetic.
     Returns ``None`` when the header is absent or unparseable.
     """
     raw = response.headers.get("Retry-After")
     if raw is None:
         return None
     raw = raw.strip()
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        pass
+    cap = _retry_after_cap_seconds()
+    if cap == 0:
+        return None
+    # RFC 9110 delta-seconds is 1*DIGIT.  Do not let Python's permissive float
+    # grammar admit signs, fractions, exponents, NaN, or infinity.  Compare the
+    # normalized decimal text before int conversion so even enormous values are
+    # safely clamped without constructing an unbounded integer.
+    if raw and raw.isascii() and raw.isdecimal():
+        normalized = raw.lstrip("0") or "0"
+        cap_text = str(cap)
+        if len(normalized) > len(cap_text) or (
+            len(normalized) == len(cap_text) and normalized > cap_text
+        ):
+            return float(cap)
+        return float(int(normalized, 10))
     # HTTP-date form.
     try:
         parsed = email.utils.parsedate_to_datetime(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    if parsed is None:
+    if parsed is None or parsed.tzinfo is None:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    delta = (parsed - datetime.now(UTC)).total_seconds()
-    return max(delta, 0.0)
+    try:
+        delta = (parsed - datetime.now(UTC)).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return min(max(delta, 0.0), float(cap))
 
 
 class WishartDirectProvider:

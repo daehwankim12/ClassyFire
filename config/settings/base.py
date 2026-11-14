@@ -187,6 +187,12 @@ REMOTE_POLL_MIN_SECONDS: int = env_int("REMOTE_POLL_MIN_SECONDS", 60)
 REMOTE_MAX_CONCURRENCY: int = env_int("REMOTE_MAX_CONCURRENCY", 2)
 REMOTE_TIMEOUT_SECONDS: int = env_int("REMOTE_TIMEOUT_SECONDS", 45)
 WISHART_MAX_RESPONSE_BYTES: int = env_int("WISHART_MAX_RESPONSE_BYTES", 1_048_576)
+# Provider Retry-After hints may reduce this 24-hour operational ceiling but
+# cannot raise the parser's hard safety bound above one normal retry cycle.
+WISHART_MAX_RETRY_AFTER_SECONDS: int = min(
+    max(env_int("WISHART_MAX_RETRY_AFTER_SECONDS", 24 * 60 * 60), 0),
+    24 * 60 * 60,
+)
 # F-06: an in-doubt PENDING submission intent (crash after POST / before commit)
 # is aged out to FAILED — freeing the (provider, payload_hash) idempotency key so
 # exactly ONE genuine re-POST may occur — once EITHER it has been reconciled this

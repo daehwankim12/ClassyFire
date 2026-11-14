@@ -256,6 +256,7 @@ OPERATE_GATED_ACTIONS = [
     (BatchJob, "cancel_and_delete"),
     (BatchJob, "set_high_priority"),
     (BatchJob, "reset_priority"),
+    (RemoteRateBucket, "reset_retry_after"),
 ]
 
 
@@ -678,6 +679,42 @@ def test_reset_provider_auth_reenables_and_audits():
     assert control.blocked_reason == ""
     assert event.event_type == "provider_auth_reset"
     assert event.payload == {"provider": "wishart", "actor": "tester"}
+
+
+# --------------------------------------------------------------------------
+# Operational action: clear persisted Retry-After bucket blocks
+# --------------------------------------------------------------------------
+
+def test_reset_rate_bucket_action_clears_block_and_audits(admin_client):
+    blocked_until = timezone.now() + timezone.timedelta(days=365)
+    bucket = RemoteRateBucket.objects.create(
+        provider="wishart",
+        bucket="request",
+        capacity=1,
+        tokens=0.0,
+        refill_rate_per_sec=1 / 6,
+        blocked_until=blocked_until,
+    )
+
+    response = admin_client.post(
+        reverse("admin:remote_remoteratebucket_changelist"),
+        {
+            "action": "reset_retry_after",
+            "_selected_action": [str(bucket.pk)],
+        },
+    )
+    assert response.status_code == 302
+
+    bucket.refresh_from_db()
+    assert bucket.blocked_until is None
+    event = SystemEvent.objects.get(event_type="rate_bucket_retry_after_reset")
+    assert event.payload["actor"] == "admin"
+    assert event.payload["count"] == 1
+    assert event.payload["buckets"][0]["id"] == bucket.pk
+    assert (
+        event.payload["buckets"][0]["previous_blocked_until"]
+        == blocked_until.isoformat()
+    )
 
 
 # --------------------------------------------------------------------------
