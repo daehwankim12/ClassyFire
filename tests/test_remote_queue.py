@@ -376,10 +376,10 @@ def test_poll_wait_task_already_linked_to_query_is_not_claimed_as_batch_extra(
 
 
 def test_batch_submit_retryable_failure_retries_all_claimed_members(settings):
-    # If a batched /queries submit fails before a RemoteQuery is created, every
-    # task included in that submit must be released into retry. Extras have
-    # already been LOCKED by _claim_batch_extras, so handling only the primary
-    # task would strand the rest until stale-lock recovery.
+    # If a provider proves a batched /queries submit was rejected before
+    # acceptance, every task included in that submit must be released into retry.
+    # Extras have already been LOCKED by _claim_batch_extras, so handling only the
+    # primary task would strand the rest until stale-lock recovery.
     settings.REMOTE_BATCH_SIZE = 3
     job = _job()
     for row, ik in enumerate((IK_A, IK_B, IK_C)):
@@ -1634,8 +1634,8 @@ def test_reconcile_submissions_command_park_unknown_holds_key():
 
 
 def test_submit_retryable_failure_frees_idempotency_key():
-    # A retryable submit failure flips the intent to FAILED so the key can be
-    # reused by a later retry (no permanent block).
+    # A provider-confirmed pre-acceptance failure flips the intent to FAILED so
+    # the key can be reused by a later retry (no permanent block).
     job = _job()
     comp = _compound(IK_A)
     _item(job, IK_A, 0, compound=comp)

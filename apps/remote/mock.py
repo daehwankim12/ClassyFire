@@ -89,6 +89,7 @@ class MockProvider:
     entity_retryable_for: set[str] = field(default_factory=set)
     entity_protocol_error_for: set[str] = field(default_factory=set)
     entity_retry_after: float | None = None
+    # A transient submit rejection known to occur before provider acceptance.
     submit_retryable: bool = False
     submit_non_retryable: bool = False
     poll_retryable_for: set[str] = field(default_factory=set)
@@ -140,7 +141,7 @@ class MockProvider:
         if self.submit_non_retryable:
             raise NonRetryableProviderError("simulated invalid structure")
         if self.submit_retryable:
-            raise RetryableProviderError("simulated submit 5xx")
+            raise RetryableProviderError("simulated pre-acceptance submit rejection")
         query_id = next(self._ids)
         return SubmitResult(remote_query_id=query_id, raw_json={"id": query_id})
 

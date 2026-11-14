@@ -972,16 +972,16 @@ class RemoteWorker:
         try:
             submit = self.provider.submit_structures(structures)
         except AmbiguousSubmissionError as exc:
-            # The POST may have reached the provider (transport error after the
-            # request left): provider acceptance is UNKNOWN. PARK the intent as
-            # UNKNOWN — a LIVE state that KEEPS HOLDING the idempotency key — so
-            # the worker NEVER auto-resubmits the same (provider, payload_hash)
+            # The POST may have reached the provider, and its response does not
+            # prove rejection: provider acceptance is UNKNOWN. PARK the intent
+            # as UNKNOWN — a LIVE state that KEEPS HOLDING the idempotency key —
+            # so the worker NEVER auto-resubmits the same (provider, payload_hash)
             # (F-06). MUST NOT call _fail_submission() (which would free the key
             # and allow a duplicate POST). An operator resolves it out-of-band
             # via resolve_submission.
             # Quarantine only this in-doubt payload. Unrelated work keeps moving.
             detail = (
-                "provider acceptance unknown after submit transport error; "
+                "provider acceptance unknown after submit; "
                 "automatic re-submit is blocked"
             )
             self._record_attempt(
@@ -1020,7 +1020,8 @@ class RemoteWorker:
                 raw_body_text=exc.raw_text,
                 safe_headers=exc.safe_headers,
             )
-            # Free the idempotency key so a later retry can re-submit.
+            # Providers may use this path only when they can prove the request
+            # was not accepted, making it safe for a later retry to re-submit.
             self._fail_submission(submission, detail=f"retryable: {exc}")
             retry_after = exc.retry_after
             honor_retry_after = _should_honor_retry_after(
@@ -1403,8 +1404,8 @@ class RemoteWorker:
         """Flip an intent to FAILED so its idempotency key can be reused.
 
         A FAILED submission no longer holds the idempotency slot, so its per-member
-        reservations (R-01) MUST be released too — otherwise a legitimate retry of
-        a member that merely hit a retryable submit error could never re-POST.
+        reservations (R-01) MUST be released too — otherwise a legitimate retry
+        after provider-confirmed non-acceptance could never re-POST.
         """
         with transaction.atomic():
             submission.state = SubmissionState.FAILED

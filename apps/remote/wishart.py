@@ -13,7 +13,11 @@ HTTP outcomes are classified EXPLICITLY (F-10) via
 * ``404``                     → NOT_FOUND (entity/query absent → MISS for entity).
 * ``401`` / ``403``           → AUTH_FAILURE (stop retrying, surface to operator).
 * ``408`` / ``425`` / ``429`` / ``5xx`` / timeout / connection reset → RETRYABLE
-  (honour ``Retry-After``, supporting BOTH delta-seconds AND HTTP-date forms).
+  for GETs (honour ``Retry-After``, delta-seconds AND HTTP-date forms). For the
+  non-idempotent submit POST, ``408`` / ``425`` / ``429`` / ``501`` / ``503`` /
+  ``505`` stay RETRYABLE (they state the request was not processed), while the
+  other ``5xx`` (``500`` / ``502`` / ``504`` …) are AMBIGUOUS ACCEPTANCE: the
+  server or a gateway may have committed the query before failing.
 * other definite ``4xx``      → PERMANENT (non-retryable input error).
 * unknown/unmapped status     → PROTOCOL ERROR (never silently COMPLETE).
 
@@ -65,6 +69,11 @@ from apps.remote.provider import (
 SAFE_RESPONSE_HEADERS = {"content-type", "retry-after", "x-request-id"}
 DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
 DEFAULT_MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60
+# Retry-class statuses that state the submit request was NOT processed, so a
+# retry cannot duplicate an accepted query: request timeout, too early, rate
+# limited, not implemented, unavailable, HTTP version not supported. Other 5xx
+# (500/502/504/...) may follow a commit and are treated as ambiguous.
+_SUBMIT_NOT_PROCESSED_STATUSES = frozenset({408, 425, 429, 501, 503, 505})
 
 
 class ResponseTooLargeError(ValueError):
@@ -365,7 +374,22 @@ class WishartDirectProvider:
         headers = _safe_headers(resp)
         raw_text = resp.raw_text
         outcome = classify_http_status(resp.status_code)
+        if outcome is HttpOutcome.RETRYABLE and (
+            resp.status_code not in _SUBMIT_NOT_PROCESSED_STATUSES
+        ):
+            # A 500/502/504-class response does not prove that this
+            # non-idempotent POST was rejected: the application or a gateway may
+            # fail after committing the query. Keep the durable intent and
+            # reservations live for reconciliation instead of a duplicate POST.
+            raise AmbiguousSubmissionError(
+                f"HTTP {resp.status_code}; provider acceptance unknown",
+                raw_text=raw_text,
+                safe_headers=headers,
+                http_status=resp.status_code,
+            )
         if outcome is HttpOutcome.RETRYABLE:
+            # Not processed (408/425/429/501/503/505): safe to retry, honouring
+            # the provider's Retry-After so a rate limit backs the queue off.
             raise RetryableProviderError(
                 f"HTTP {resp.status_code}",
                 retry_after=_parse_retry_after(resp),

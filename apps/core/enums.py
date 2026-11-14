@@ -235,11 +235,12 @@ class SubmissionState(models.TextChoices):
     The submission outbox makes a /queries POST crash-safe and idempotent. A row
     is written with state=PENDING *before* the network call. After the POST
     succeeds the SAME transaction flips it to SUBMITTED and links the RemoteQuery.
-    A retryable failure (no provider id obtained) flips it to FAILED so the
+    A failure that proves provider non-acceptance flips it to FAILED so the
     deterministic idempotency key ``(provider, payload_hash)`` can be reused by a
-    later submit. The partial-UNIQUE over the non-FAILED states guarantees that a
-    crash between intent and confirmation cannot cause a second POST: the next
-    worker tick finds the existing live row and reconciles instead.
+    later submit. An ambiguous response instead moves to UNKNOWN. The
+    partial-UNIQUE over the non-FAILED states guarantees that a crash between
+    intent and confirmation cannot cause a second POST: the next worker tick
+    finds the existing live row and reconciles instead.
 
     UNKNOWN is the in-doubt terminus: when a PENDING intent cannot be confirmed
     (the provider may have ACCEPTED the POST but the socket dropped, then the

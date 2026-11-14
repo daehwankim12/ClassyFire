@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import httpx
 import pytest
-from django.utils import timezone
 
 from apps.batches.models import BatchItem, BatchJob
 from apps.compounds.models import CompoundStructure
-from apps.core.enums import BatchItemStatus, TaskState
+from apps.core.enums import BatchItemStatus, SubmissionState, TaskState
 from apps.remote import queue
-from apps.remote.models import RemoteTask
+from apps.remote.models import RemoteSubmission, RemoteTask
 from apps.remote.worker import RemoteWorker
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -116,8 +115,12 @@ def test_first_entity_500_with_structure_submits_immediately():
 
     assert provider.submit_calls == 1
     task.refresh_from_db()
-    assert task.state == TaskState.RETRY_WAIT
-    assert task.attempt == 1
+    # The submit itself got a 500, which may follow a commit upstream: the
+    # intent is held UNKNOWN and the task parked for reconciliation rather than
+    # auto-retried into a possible duplicate query.
+    assert task.state == TaskState.DEFERRED
+    assert task.next_run_at is None
+    assert RemoteSubmission.objects.filter(state=SubmissionState.UNKNOWN).count() == 1
 
 
 def test_entity_500_with_retry_after_submits_without_honoring_retry_after():
@@ -131,9 +134,9 @@ def test_entity_500_with_retry_after_submits_without_honoring_retry_after():
     assert limiter.entity.penalties == []
     assert limiter.submit.penalties == []
     task.refresh_from_db()
-    assert task.attempt == 1
-    assert task.next_run_at is not None
-    assert (task.next_run_at - timezone.now()).total_seconds() < 120
+    # Neither the entity nor the (ambiguous) submit 500 honours Retry-After.
+    assert task.state == TaskState.DEFERRED
+    assert task.next_run_at is None
 
 
 def test_third_entity_500_with_retry_after_escalates_to_submit():

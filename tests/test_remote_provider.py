@@ -13,6 +13,7 @@ import pytest
 
 from apps.remote.mock import MockProvider, build_query_response, build_raw
 from apps.remote.provider import (
+    AmbiguousSubmissionError,
     AuthProviderError,
     EntityLookupStatus,
     HttpOutcome,
@@ -188,13 +189,31 @@ def test_wishart_entity_500_retryable():
     assert result.status == EntityLookupStatus.RETRYABLE_ERROR
 
 
-def test_wishart_submit_5xx_retryable():
+@pytest.mark.parametrize("status_code", [500, 502, 504])
+def test_wishart_submit_post_commit_5xx_is_ambiguous(status_code):
+    """A 5xx that can follow an upstream commit must never be auto-retried."""
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(502)
+        return httpx.Response(status_code)
 
     provider = _wishart_with(handler)
-    with pytest.raises(RetryableProviderError):
+    with pytest.raises(AmbiguousSubmissionError) as excinfo:
         provider.submit_structures([(IK_A, "CCO")])
+    assert excinfo.value.http_status == status_code
+
+
+@pytest.mark.parametrize("status_code", [408, 425, 429, 501, 503, 505])
+def test_wishart_submit_not_processed_status_is_retryable(status_code):
+    """Statuses stating the request was not processed stay safely retryable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, headers={"Retry-After": "30"})
+
+    provider = _wishart_with(handler)
+    with pytest.raises(RetryableProviderError) as excinfo:
+        provider.submit_structures([(IK_A, "CCO")])
+    assert excinfo.value.http_status == status_code
+    assert excinfo.value.retry_after == 30
 
 
 def test_wishart_submit_400_non_retryable():

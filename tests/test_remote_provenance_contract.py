@@ -104,8 +104,8 @@ def _submit_response(case: str) -> httpx.Response:
     if case == "500":
         return httpx.Response(500, text="internal server error")
     if case == "non_json_error_body":
-        # A retryable status (503) whose body is NOT JSON: must be preserved
-        # verbatim on the attempt and classified RETRYABLE.
+        # A retryable status (503: not processed) whose body is NOT JSON: must be
+        # preserved verbatim on the attempt and classified RETRYABLE.
         return httpx.Response(503, text="<html>upstream unavailable</html>")
     raise AssertionError(f"unknown submit case {case!r}")
 
@@ -302,7 +302,7 @@ def remote_outcome_harness():
         ("SUBMIT", "401", "AUTH_FAILURE"),
         ("SUBMIT", "403", "AUTH_FAILURE"),
         ("SUBMIT", "429", "RETRYABLE"),
-        ("SUBMIT", "500", "RETRYABLE"),
+        ("SUBMIT", "500", "UNKNOWN_ACCEPTANCE"),
         ("SUBMIT", "timeout", "UNKNOWN_ACCEPTANCE"),
         ("SUBMIT", "non_json_error_body", "RETRYABLE"),
         ("POLL", "running", "RUNNING"),

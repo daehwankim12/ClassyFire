@@ -156,10 +156,10 @@ def test_worker_submit_failure_hard_fails_on_third_negative_count():
 
     class SubmitFailProvider:
         def submit_structures(self, structures):
-            raise RetryableProviderError("submit down", http_status=500)
+            raise RetryableProviderError("submit rejected before provider acceptance")
 
-    record_negative_failure(IK, operation="SUBMIT", http_status=500, detail="first")
-    record_negative_failure(IK, operation="SUBMIT", http_status=500, detail="second")
+    record_negative_failure(IK, operation="SUBMIT", http_status=None, detail="first")
+    record_negative_failure(IK, operation="SUBMIT", http_status=None, detail="second")
     task = _claimed_structure_task()
     worker = RemoteWorker(
         SubmitFailProvider(),

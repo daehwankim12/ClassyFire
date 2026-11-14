@@ -203,7 +203,9 @@ class RetryableProviderError(ProviderError):
     """A transient failure the worker should retry with backoff.
 
     ``retry_after`` (seconds), when set, takes absolute precedence over the
-    computed backoff (server ``429``/``Retry-After``).
+    computed backoff (server ``429``/``Retry-After``). A provider may use this
+    for a non-idempotent submit only when the failure proves that the request
+    was not accepted; otherwise it must raise :class:`AmbiguousSubmissionError`.
     """
 
     def __init__(
@@ -227,12 +229,12 @@ class RetryableProviderError(ProviderError):
 class AmbiguousSubmissionError(ProviderError):
     """A submit POST may have reached the provider; automatic retry is forbidden.
 
-    Raised when a ``/queries`` POST fails AFTER the request may have been sent
-    (timeout / transport error): the provider could have ACCEPTED the submission
-    even though the local response was lost. The worker must NOT auto-resubmit
-    the same ``(provider, payload_hash)`` (that would duplicate the upstream
-    submission, F-06); instead it parks the intent in ``UNKNOWN`` (key held) for
-    operator reconciliation.
+    Raised when a ``/queries`` POST fails after the request may have been sent,
+    or returns a status that does not prove rejection. The provider could have
+    ACCEPTED the submission even though the usable response was lost. The worker
+    must NOT auto-resubmit the same ``(provider, payload_hash)`` (that would
+    duplicate the upstream submission, F-06); instead it parks the intent in
+    ``UNKNOWN`` (key held) for operator reconciliation.
     """
 
 

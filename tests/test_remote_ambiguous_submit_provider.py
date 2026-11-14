@@ -29,6 +29,22 @@ class AcceptedThenReadErrorTransport(httpx.BaseTransport):
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
 
+class CommittedThenServerErrorTransport(httpx.BaseTransport):
+    """A provider that commits the query but returns an ambiguous server error."""
+
+    def __init__(self) -> None:
+        self.submit_count = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/entities/"):
+            return httpx.Response(404, request=request)
+        if request.method == "POST" and request.url.path == "/queries.json":
+            # The simulated upstream side effect occurs before the 500 response.
+            self.submit_count += 1
+            return httpx.Response(500, text="committed, response failed", request=request)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+
 class NoSleepLimiter:
     class Bucket:
         def allow(self) -> bool:
@@ -90,6 +106,28 @@ def test_actual_wishart_submit_read_error_parks_unknown_without_repost(settings)
     task.refresh_from_db()
     assert task.state == TaskState.READY
     assert task.next_run_at is not None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_actual_wishart_commit_then_500_parks_unknown_without_repost(settings):
+    _apply_settings(settings)
+    _seed_ready_task()
+
+    transport = CommittedThenServerErrorTransport()
+    worker = _build_worker(transport)
+
+    assert worker.tick() is True
+    assert transport.submit_count == 1
+    submission = RemoteSubmission.objects.get()
+    assert submission.state == SubmissionState.UNKNOWN
+    assert RemoteSubmissionMember.objects.get(submission=submission).active is True
+
+    for _ in range(5):
+        assert worker.tick() is False
+
+    assert transport.submit_count == 1
+    submission.refresh_from_db()
+    assert submission.state == SubmissionState.UNKNOWN
 
 
 class AmbiguousSubmitProvider(MockProvider):
