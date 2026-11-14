@@ -29,13 +29,17 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import hmac
 import io
 import logging
 import re
+import secrets
 import shutil
+import threading
 import zipfile
+from collections import OrderedDict
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -63,6 +67,8 @@ MAX_DECOMPRESSION_RATIO: float = 100.0  # reject if expanded > N x compressed
 
 SHARED_ACCESS_SESSION_KEY = "shared_access_authenticated"
 SHARED_ACCESS_PRINCIPAL_SESSION_KEY = "shared_access_principal"
+SHARED_ACCESS_GLOBAL_FAILURE_KEY = "classyfire:shared-access-login-failures:global"
+_SHARED_ACCESS_TOKEN_CHECK_CACHE = "_classyfire_shared_access_token_check"
 JOB_ACCESS_COOKIE_PREFIX = "cf_job_access_"
 JOB_ACCESS_COOKIE_SALT = "classyfire-job-access"
 
@@ -105,11 +111,16 @@ def _check_bearer(request: HttpRequest) -> bool:
     if not token:
         return False
 
-    stored_hash = _get_shared_hash()
-    if not stored_hash:
-        return False
+    cached = getattr(request, _SHARED_ACCESS_TOKEN_CHECK_CACHE, None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == token_info:
+        return bool(cached[1])
 
-    return bool(check_password(token, stored_hash))
+    stored_hash = _get_shared_hash()
+    authenticated = bool(
+        stored_hash and _verify_shared_access_password(request, token, stored_hash)
+    )
+    setattr(request, _SHARED_ACCESS_TOKEN_CHECK_CACHE, (token_info, authenticated))
+    return authenticated
 
 
 def _is_authenticated(request: HttpRequest, job_id: str | None = None) -> bool:
@@ -200,7 +211,9 @@ def require_shared_access_web(view_func: Callable) -> Callable:
 def authenticate_shared_password(request: HttpRequest, password: str) -> bool:
     """Persist a browser shared-access session when *password* matches."""
     stored_hash = _get_shared_hash()
-    if not stored_hash or not check_password(password, stored_hash):
+    if not stored_hash or not _verify_shared_access_password(
+        request, password, stored_hash
+    ):
         return False
     if request.session.session_key is None:
         request.session.create()
@@ -210,7 +223,6 @@ def authenticate_shared_password(request: HttpRequest, password: str) -> bool:
     request.session[SHARED_ACCESS_PRINCIPAL_SESSION_KEY] = (
         _shared_access_principal_for_token(password)
     )
-    clear_shared_access_login_failures(request)
     return True
 
 
@@ -251,29 +263,37 @@ def _login_throttle_window_seconds() -> int:
     return int(getattr(settings, "SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS", 300))
 
 
-def record_failed_login_attempt(ip_address: str) -> bool:
-    """Atomically record one failed login for *ip_address* (DB-backed).
+def _global_login_throttle_limit() -> int:
+    return max(
+        1,
+        int(getattr(settings, "SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES", 50)),
+    )
 
-    Returns ``True`` iff THIS call is the one that CROSSES the failure threshold
-    (i.e. moved the shared counter from below the cap to exactly the cap). This
-    "crossing" semantics is what makes the throttle's atomicity observable: under
-    concurrency, ``select_for_update`` serialises the increments so that across N
-    racing callers exactly one observes the crossing (returns True). Callers that
-    only need to know whether the IP is *currently* blocked must use
-    :func:`is_shared_access_login_throttled` / :func:`_ip_is_login_throttled`,
-    which read ``failure_count >= limit``.
-    """
+
+def _global_login_throttle_window_seconds() -> int:
+    return max(
+        1,
+        int(
+            getattr(
+                settings,
+                "SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS",
+                _login_throttle_window_seconds(),
+            )
+        ),
+    )
+
+
+def _record_login_failure(key: str, limit: int, window_seconds: int) -> bool:
+    """Atomically increment one DB-backed failure counter."""
     from django.db import IntegrityError
 
     from apps.core.models import LoginThrottle
 
-    limit = _login_throttle_limit()
     if limit < 0:
         return False
 
-    key = throttle_key_for_ip(ip_address)
     now = timezone.now()
-    window = timedelta(seconds=_login_throttle_window_seconds())
+    window = timedelta(seconds=window_seconds)
 
     # Phase 1: ensure the row EXISTS and is committed, in its own savepoint.
     # Doing the create separately means a unique-constraint race between racing
@@ -303,17 +323,28 @@ def record_failed_login_attempt(ip_address: str) -> bool:
         return row.failure_count == limit
 
 
-def _ip_is_login_throttled(ip_address: str) -> bool:
-    """Return True when *ip_address* is currently blocked (DB-backed gate read)."""
+def record_failed_login_attempt(ip_address: str) -> bool:
+    """Atomically record one failed login for *ip_address* (DB-backed).
+
+    Returns ``True`` iff this call crosses the per-IP failure threshold. The
+    row lock serialises racing increments so exactly one caller observes that
+    crossing; use :func:`_ip_is_login_throttled` to read the blocked state.
+    """
+    return _record_login_failure(
+        throttle_key_for_ip(ip_address),
+        _login_throttle_limit(),
+        _login_throttle_window_seconds(),
+    )
+
+
+def _login_throttle_key_is_blocked(key: str, limit: int, window_seconds: int) -> bool:
     from apps.core.models import LoginThrottle
 
-    limit = _login_throttle_limit()
     if limit < 0:
         return False
 
-    key = throttle_key_for_ip(ip_address)
     now = timezone.now()
-    window = timedelta(seconds=_login_throttle_window_seconds())
+    window = timedelta(seconds=window_seconds)
     row = LoginThrottle.objects.filter(key=key).only(
         "failure_count", "window_started_at"
     ).first()
@@ -325,13 +356,163 @@ def _ip_is_login_throttled(ip_address: str) -> bool:
     return row.failure_count >= limit
 
 
+def _ip_is_login_throttled(ip_address: str) -> bool:
+    """Return True when *ip_address* is currently blocked (DB-backed gate read)."""
+    return _login_throttle_key_is_blocked(
+        throttle_key_for_ip(ip_address),
+        _login_throttle_limit(),
+        _login_throttle_window_seconds(),
+    )
+
+
+def _shared_access_throttle_specs(request: HttpRequest) -> tuple[tuple[str, int, int], ...]:
+    return (
+        (
+            _shared_access_login_failure_key(request),
+            _login_throttle_limit(),
+            _login_throttle_window_seconds(),
+        ),
+        (
+            SHARED_ACCESS_GLOBAL_FAILURE_KEY,
+            _global_login_throttle_limit(),
+            _global_login_throttle_window_seconds(),
+        ),
+    )
+
+
+# Per-process memory of shared-access credentials that already verified against
+# the current stored hash. A known-good credential then skips both the failure
+# throttle and the slow password KDF, so an attacker exhausting the per-IP or
+# global failure counters cannot lock out legitimate API clients (and valid
+# requests no longer pay one KDF each). Entries are HMACs under a random
+# per-process key, so a memory disclosure does not yield a fast offline oracle
+# for the password; the stored hash is part of the MAC input, so rotating the
+# shared password invalidates every entry.
+_VERIFIED_SHARED_CREDENTIALS_MAX = 64
+_VERIFIED_SHARED_CREDENTIALS: OrderedDict[str, None] = OrderedDict()
+_VERIFIED_SHARED_CREDENTIALS_LOCK = threading.Lock()
+_VERIFIED_SHARED_CREDENTIALS_KEY = secrets.token_bytes(32)
+
+
+def _verified_credential_mac(password: str, stored_hash: str) -> str:
+    message = f"{stored_hash}\x00{password}".encode()
+    return hmac.new(_VERIFIED_SHARED_CREDENTIALS_KEY, message, hashlib.sha256).hexdigest()
+
+
+def _is_known_verified_credential(mac: str) -> bool:
+    with _VERIFIED_SHARED_CREDENTIALS_LOCK:
+        if mac not in _VERIFIED_SHARED_CREDENTIALS:
+            return False
+        _VERIFIED_SHARED_CREDENTIALS.move_to_end(mac)
+        return True
+
+
+def _remember_verified_credential(mac: str) -> None:
+    with _VERIFIED_SHARED_CREDENTIALS_LOCK:
+        _VERIFIED_SHARED_CREDENTIALS[mac] = None
+        _VERIFIED_SHARED_CREDENTIALS.move_to_end(mac)
+        while len(_VERIFIED_SHARED_CREDENTIALS) > _VERIFIED_SHARED_CREDENTIALS_MAX:
+            _VERIFIED_SHARED_CREDENTIALS.popitem(last=False)
+
+
+def _forget_verified_credentials() -> None:
+    """Drop the per-process verified-credential memory (tests, rotation)."""
+    with _VERIFIED_SHARED_CREDENTIALS_LOCK:
+        _VERIFIED_SHARED_CREDENTIALS.clear()
+
+
+def _ensure_login_throttle_rows(keys: list[str], now: datetime) -> None:
+    from apps.core.models import LoginThrottle
+
+    # ignore_conflicts: one INSERT ... ON CONFLICT DO NOTHING instead of a failed
+    # INSERT (and a logged duplicate-key ERROR) per key on every request.
+    LoginThrottle.objects.bulk_create(
+        [LoginThrottle(key=key, failure_count=0, window_started_at=now) for key in keys],
+        ignore_conflicts=True,
+    )
+
+
+def _verify_shared_access_password(
+    request: HttpRequest,
+    password: str,
+    stored_hash: str,
+) -> bool:
+    """Verify one shared password under per-IP and global failure caps.
+
+    A credential already verified in this process is accepted without touching
+    the counters. Otherwise the caps are checked in a short locked transaction
+    and the KDF runs only if neither cap is exhausted — but never while a
+    throttle row lock is held, so concurrent requests are not serialised behind
+    one slow password hash. A failure is then counted with an atomic increment.
+    Concurrent first-time guesses can overshoot a cap by at most the number of
+    in-flight requests, which still bounds both single-source and distributed
+    guessing.
+    """
+    from django.db.models import F
+
+    from apps.core.models import LoginThrottle
+
+    mac = _verified_credential_mac(password, stored_hash)
+    if _is_known_verified_credential(mac):
+        return True
+
+    specs = tuple(spec for spec in _shared_access_throttle_specs(request) if spec[1] >= 0)
+    if not specs:
+        authenticated = bool(check_password(password, stored_hash))
+        if authenticated:
+            _remember_verified_credential(mac)
+        return authenticated
+
+    now = timezone.now()
+    keys = [spec[0] for spec in specs]
+    _ensure_login_throttle_rows(keys, now)
+
+    with transaction.atomic():
+        rows = {
+            row.key: row
+            for row in LoginThrottle.objects.select_for_update()
+            .filter(key__in=keys)
+            .order_by("key")
+        }
+        for key, limit, window_seconds in specs:
+            row = rows[key]
+            if row.window_started_at <= now - timedelta(seconds=window_seconds):
+                row.failure_count = 0
+                row.window_started_at = now
+                row.save(
+                    update_fields=["failure_count", "window_started_at", "updated_at"]
+                )
+            if row.failure_count >= limit:
+                return False
+
+    authenticated = bool(check_password(password, stored_hash))
+    if authenticated:
+        _remember_verified_credential(mac)
+        # A valid credential clears only its IP's failures. Global failures
+        # belong to all clients and must not be erasable by one authenticated
+        # request while a distributed guessing attempt is in progress.
+        LoginThrottle.objects.filter(
+            key=_shared_access_login_failure_key(request), failure_count__gt=0
+        ).update(failure_count=0, window_started_at=now, updated_at=now)
+        return True
+
+    LoginThrottle.objects.filter(key__in=keys).update(
+        failure_count=F("failure_count") + 1, updated_at=timezone.now()
+    )
+    return False
+
+
 def is_shared_access_login_throttled(request: HttpRequest) -> bool:
     """Return True when repeated failed shared-password attempts hit the cap."""
-    return _ip_is_login_throttled(_client_ip(request))
+    return any(
+        _login_throttle_key_is_blocked(key, limit, window_seconds)
+        for key, limit, window_seconds in _shared_access_throttle_specs(request)
+    )
 
 
 def record_shared_access_login_failure(request: HttpRequest) -> None:
-    record_failed_login_attempt(_client_ip(request))
+    for key, limit, window_seconds in _shared_access_throttle_specs(request):
+        _record_login_failure(key, limit, window_seconds)
 
 
 def clear_shared_access_login_failures(request: HttpRequest) -> None:

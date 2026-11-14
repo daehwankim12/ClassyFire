@@ -5,7 +5,6 @@ from django.utils.http import url_has_allowed_host_and_scheme
 from apps.core.security import (
     authenticate_shared_password,
     is_shared_access_login_throttled,
-    record_shared_access_login_failure,
 )
 
 
@@ -32,7 +31,6 @@ def shared_access_view(request: HttpRequest) -> HttpResponse:
             response = HttpResponse(status=303)
             response["Location"] = next_url
             return response
-        record_shared_access_login_failure(request)
         error = "Invalid shared password."
 
     return render(

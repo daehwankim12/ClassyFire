@@ -2,7 +2,7 @@
 
 Holds infrastructure-level state that must be shared across all gunicorn
 worker processes. In particular, :class:`LoginThrottle` backs the shared-access
-login failure throttle with a single database-resident counter (rather than the
+login failure throttle with database-resident counters (rather than the
 process-local Django cache), so the throttle actually limits attempts when more
 than one worker is running.
 """
@@ -12,9 +12,9 @@ from django.db import models
 
 
 class LoginThrottle(models.Model):
-    """Per-key (per-IP) shared counter for failed shared-access login attempts.
+    """Per-key shared counter for failed shared-access login attempts.
 
-    One row per throttle key. Increments are serialised with
+    Per-IP and global limits each use a distinct row. Increments are serialised with
     ``select_for_update`` so concurrent worker processes share a single,
     atomically-updated failure counter (no lost updates).
     """

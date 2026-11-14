@@ -270,6 +270,184 @@ class TestAuthGateUnauthenticated:
     @pytest.mark.django_db(transaction=True)
     @override_settings(
         SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        SHARED_ACCESS_LOGIN_MAX_FAILURES=2,
+        SHARED_ACCESS_LOGIN_WINDOW_SECONDS=60,
+        SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES=100,
+        SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS=60,
+    )
+    @pytest.mark.parametrize(
+        "auth_header",
+        [
+            {"HTTP_AUTHORIZATION": "Bearer wrong-token"},
+            {"HTTP_X_SHARED_ACCESS_TOKEN": "wrong-token"},
+        ],
+    )
+    def test_bad_token_headers_stop_password_checks_at_ip_limit(
+        self,
+        auth_header: dict[str, str],
+    ) -> None:
+        import unittest.mock as mock
+
+        from django.test import RequestFactory
+
+        from apps.core.security import _check_bearer
+
+        factory = RequestFactory()
+        with mock.patch(
+            "apps.core.security.check_password", return_value=False
+        ) as password_check:
+            for _attempt in range(3):
+                request = factory.get(
+                    "/api/jobs", REMOTE_ADDR="198.51.100.91", **auth_header
+                )
+                assert _check_bearer(request) is False
+
+        assert password_check.call_count == 2
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        SHARED_ACCESS_LOGIN_MAX_FAILURES=100,
+        SHARED_ACCESS_LOGIN_WINDOW_SECONDS=60,
+        SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES=2,
+        SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS=60,
+    )
+    def test_bad_bearers_stop_password_checks_at_global_limit(self) -> None:
+        import unittest.mock as mock
+
+        from django.test import RequestFactory
+
+        from apps.core.security import _check_bearer
+
+        factory = RequestFactory()
+        with mock.patch(
+            "apps.core.security.check_password", return_value=False
+        ) as password_check:
+            for suffix in range(3):
+                request = factory.get(
+                    "/api/jobs",
+                    REMOTE_ADDR=f"198.51.100.{suffix + 1}",
+                    HTTP_AUTHORIZATION="Bearer wrong-token",
+                )
+                assert _check_bearer(request) is False
+
+        assert password_check.call_count == 2
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        SHARED_ACCESS_LOGIN_MAX_FAILURES=2,
+        SHARED_ACCESS_LOGIN_WINDOW_SECONDS=60,
+        SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES=10,
+        SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS=60,
+    )
+    def test_valid_bearer_result_is_reused_within_request(self) -> None:
+        import unittest.mock as mock
+
+        from django.test import RequestFactory
+
+        from apps.core.security import _check_bearer
+
+        request = RequestFactory().get(
+            "/api/jobs",
+            REMOTE_ADDR="198.51.100.92",
+            HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+        )
+        with mock.patch(
+            "apps.core.security.check_password", return_value=True
+        ) as password_check:
+            assert _check_bearer(request) is True
+            assert _check_bearer(request) is True
+
+        password_check.assert_called_once_with(_TEST_PASSWORD, _TEST_HASH)
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        SHARED_ACCESS_LOGIN_MAX_FAILURES=2,
+        SHARED_ACCESS_LOGIN_WINDOW_SECONDS=60,
+        SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES=2,
+        SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS=60,
+    )
+    def test_known_valid_bearer_is_not_locked_out_by_exhausted_counters(self) -> None:
+        """An attacker exhausting the caps must not lock out a working client."""
+        import unittest.mock as mock
+
+        from django.test import RequestFactory
+
+        from apps.core.security import _check_bearer
+
+        factory = RequestFactory()
+        client_ip = "198.51.100.93"
+
+        def fake_check(password: str, stored_hash: str) -> bool:
+            return password == _TEST_PASSWORD
+
+        with mock.patch(
+            "apps.core.security.check_password", side_effect=fake_check
+        ) as password_check:
+            # The legitimate client authenticates once.
+            ok = factory.get(
+                "/api/jobs",
+                REMOTE_ADDR=client_ip,
+                HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+            )
+            assert _check_bearer(ok) is True
+            # An attacker then exhausts both the per-IP (same IP: shared NAT) and
+            # the global failure caps.
+            for _attempt in range(4):
+                bad = factory.get(
+                    "/api/jobs",
+                    REMOTE_ADDR=client_ip,
+                    HTTP_AUTHORIZATION="Bearer wrong-token",
+                )
+                assert _check_bearer(bad) is False
+            calls_after_attack = password_check.call_count
+
+            # The known-good credential is still accepted, without a KDF run.
+            again = factory.get(
+                "/api/jobs",
+                REMOTE_ADDR=client_ip,
+                HTTP_AUTHORIZATION=f"Bearer {_TEST_PASSWORD}",
+            )
+            assert _check_bearer(again) is True
+            assert password_check.call_count == calls_after_attack
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
+        SHARED_ACCESS_LOGIN_MAX_FAILURES=5,
+        SHARED_ACCESS_LOGIN_WINDOW_SECONDS=60,
+        SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES=50,
+        SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS=60,
+    )
+    def test_password_kdf_never_runs_inside_a_throttle_transaction(self) -> None:
+        """Row locks must not be held across the slow password hash."""
+        import unittest.mock as mock
+
+        from django.db import connection
+        from django.test import RequestFactory
+
+        from apps.core.security import _check_bearer
+
+        def assert_not_in_transaction(password: str, stored_hash: str) -> bool:
+            assert not connection.in_atomic_block
+            return False
+
+        with mock.patch(
+            "apps.core.security.check_password", side_effect=assert_not_in_transaction
+        ) as password_check:
+            request = RequestFactory().get(
+                "/api/jobs",
+                REMOTE_ADDR="198.51.100.94",
+                HTTP_AUTHORIZATION="Bearer wrong-token",
+            )
+            assert _check_bearer(request) is False
+        assert password_check.call_count == 1
+
+    @pytest.mark.django_db(transaction=True)
+    @override_settings(
+        SHARED_ACCESS_PASSWORD_HASH=_TEST_HASH,
         JOB_CREATE_RATE_LIMIT_PER_MINUTE=1,
     )
     def test_job_create_rate_limit_rejects_abuse(self) -> None:
@@ -1150,6 +1328,7 @@ class TestSecurityImplementationGuards:
         assert first != different_ip
         assert all(-(2**31) <= value < 2**31 for value in first)
 
+    @pytest.mark.django_db
     def test_invalid_bearer_header_does_not_spoof_session_principal(self) -> None:
         from django.contrib.auth.hashers import make_password
         from django.test import RequestFactory
@@ -1171,6 +1350,7 @@ class TestSecurityImplementationGuards:
         with override_settings(SHARED_ACCESS_PASSWORD_HASH=make_password("correct")):
             assert _principal(request).startswith("shared-access-session:")
 
+    @pytest.mark.django_db
     def test_shared_access_principal_canonicalizes_bearer_whitespace(self) -> None:
         from django.contrib.auth.hashers import make_password
         from django.test import RequestFactory

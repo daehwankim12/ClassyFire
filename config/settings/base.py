@@ -158,6 +158,15 @@ SHARED_ACCESS_LOGIN_MAX_FAILURES: int = env_int(
 SHARED_ACCESS_LOGIN_WINDOW_SECONDS: int = env_int(
     "SHARED_ACCESS_LOGIN_WINDOW_SECONDS", SHARED_ACCESS_LOGIN_FAILURE_WINDOW_SECONDS
 )
+# A global cap bounds password-KDF work even when guesses are distributed across
+# many source addresses. Valid credentials do not consume this failure budget;
+# both values are clamped to at least 1 at the authentication boundary.
+SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES: int = env_int(
+    "SHARED_ACCESS_LOGIN_GLOBAL_MAX_FAILURES", 50
+)
+SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS: int = env_int(
+    "SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS", SHARED_ACCESS_LOGIN_WINDOW_SECONDS
+)
 
 # ---------------------------------------------------------------------------
 # ClassyFire remote API
