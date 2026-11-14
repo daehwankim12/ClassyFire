@@ -40,6 +40,20 @@ def test_dockerfile_uses_selective_copy_not_broad_copy_all():
         assert directive in dockerfile
 
 
+def test_dockerfile_keeps_collectstatic_secret_out_of_runtime_environment():
+    dockerfile = Path("Dockerfile").read_text()
+    instructions = dockerfile.replace("\\\n", " ").splitlines()
+
+    assert not any(
+        "DJANGO_SECRET_KEY" in instruction
+        for instruction in instructions
+        if instruction.startswith(("ARG ", "ENV "))
+    )
+    assert "build-time-placeholder-not-for-use" not in dockerfile
+    assert 'RUN DJANGO_SECRET_KEY="$(python -c' in dockerfile
+    assert "secrets.token_urlsafe(64)" in dockerfile
+
+
 def test_image_secret_scan_script_checks_history_and_layers():
     script = Path("scripts/check_image_for_secrets.sh").read_text()
     assert "docker history" in script

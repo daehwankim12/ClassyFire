@@ -11,6 +11,8 @@ Required environment variables (raises ImproperlyConfigured when absent):
 """
 from __future__ import annotations
 
+from django.core.exceptions import ImproperlyConfigured
+
 from apps.core.settings import env_required, env_str
 
 # Import all base settings first
@@ -20,7 +22,13 @@ from .base import *  # noqa: F403
 # Required secrets — raise early with a clear message if any are absent
 # ---------------------------------------------------------------------------
 
+_UNSAFE_SECRET_KEYS = frozenset({"build-time-placeholder-not-for-use"})
+
 SECRET_KEY: str = env_required("DJANGO_SECRET_KEY")  # type: ignore[no-redef]
+if SECRET_KEY.strip() in _UNSAFE_SECRET_KEYS:
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY uses a known unsafe placeholder; configure a unique secret."
+    )
 
 _postgres_password: str = env_required("POSTGRES_PASSWORD")
 DATABASES["default"]["PASSWORD"] = _postgres_password  # noqa: F405 (from base *)
@@ -93,8 +101,6 @@ STORAGES = {
 # EXPORT_DIR is read by apps/batches/exports.py; the dev default is
 # BASE_DIR/export_cache which remains unchanged for local development.
 # ---------------------------------------------------------------------------
-
-from django.core.exceptions import ImproperlyConfigured  # noqa: E402
 
 from apps.core.settings import env_str as _env_str  # noqa: E402
 

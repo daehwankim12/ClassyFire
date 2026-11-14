@@ -262,6 +262,19 @@ class TestProdRequiredVars:
         with pytest.raises(ImproperlyConfigured):
             _reload_prod_settings(monkeypatch, {"DJANGO_SECRET_KEY": ""})
 
+    @pytest.mark.parametrize(
+        "secret_key",
+        [
+            "build-time-placeholder-not-for-use",
+            "  build-time-placeholder-not-for-use  ",
+        ],
+    )
+    def test_prod_rejects_known_secret_key_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch, secret_key: str
+    ) -> None:
+        with pytest.raises(ImproperlyConfigured, match="known unsafe placeholder"):
+            _reload_prod_settings(monkeypatch, {"DJANGO_SECRET_KEY": secret_key})
+
     def test_prod_raises_without_postgres_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with pytest.raises(ImproperlyConfigured):
             _reload_prod_settings(monkeypatch, {"POSTGRES_PASSWORD": ""})

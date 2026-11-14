@@ -72,17 +72,16 @@ ENV PATH="/app/.venv/bin:${PATH}"
 
 # ── Static files ─────────────────────────────────────────────────────────────
 # Collect static files at build time so the web container is ready immediately.
-# DJANGO_SECRET_KEY is set to a dummy value; collectstatic does not need a real
-# one.  The real key is injected at runtime via env_file / environment.
-ARG DJANGO_SECRET_KEY=build-time-placeholder-not-for-use
+# collectstatic does not need the deployment's signing key. Generate a temporary
+# value for that process only; the real key must be injected at runtime.
 ARG DJANGO_SETTINGS_MODULE=config.settings.prod
-ENV DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY} \
-    DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}
+ENV DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE}
 
-# Collect static at build with placeholder env (collectstatic needs no DB).
+# Collect static at build with temporary env (collectstatic needs no DB).
 # Failure aborts the image build so misconfigured static storage is caught
 # immediately rather than silently producing a broken image.
-RUN POSTGRES_HOST=localhost POSTGRES_PASSWORD=placeholder \
+RUN DJANGO_SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(64))')" \
+    POSTGRES_HOST=localhost POSTGRES_PASSWORD=placeholder \
     NGROK_DOMAIN=placeholder.example.com \
     SHARED_ACCESS_PASSWORD_HASH=placeholder \
     python manage.py collectstatic --noinput
