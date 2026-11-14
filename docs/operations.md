@@ -156,6 +156,9 @@ docker compose exec web python manage.py run_backup
 docker compose exec web python manage.py export_backup_bundle \
   --output /backups/classyfire-portable-backup.tar.gz
 
+# Record the printed Checksum through a trusted channel separate from the bundle.
+TRUSTED_BUNDLE_SHA256=<printed-checksum>
+
 # Copy the tarball from the web container to the host.
 WEB=$(docker compose ps -q web)
 docker cp "$WEB:/backups/classyfire-portable-backup.tar.gz" ./classyfire-portable-backup.tar.gz
@@ -170,12 +173,19 @@ docker cp ./classyfire-portable-backup.tar.gz "$WEB:/tmp/classyfire-portable-bac
 
 # Verify and stage the bundle into /backups.
 docker compose exec web python manage.py import_backup_bundle \
-  /tmp/classyfire-portable-backup.tar.gz
+  /tmp/classyfire-portable-backup.tar.gz \
+  --checksum "$TRUSTED_BUNDLE_SHA256"
 ```
 
-Import is non-destructive: it verifies checksums and stages files in the backup
-directory, but it does not restore the live database. Run the explicit restore
-procedure only after stopping writers and confirming the imported manifest.
+Obtain the expected checksum from a trusted channel that is separate from the
+disk, host, or remote storage carrying the bundle. Do not calculate it from the
+received copy. Import refuses a bundle that does not match that trust value
+before parsing it or staging files in the backup directory.
+
+Import is non-destructive: after authenticating the whole bundle, it verifies
+the manifest's payload checksums and stages files in the backup directory, but
+it does not restore the live database. Run the explicit restore procedure only
+after stopping writers and confirming the imported manifest.
 
 ### Restore smoke test
 

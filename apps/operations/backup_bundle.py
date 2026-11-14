@@ -7,7 +7,11 @@ It deliberately does not restore the live database.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import hmac
 import json
+import re
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -222,19 +226,42 @@ def _safe_tar_member(member: tarfile.TarInfo) -> str:
     return name
 
 
-def import_backup_bundle(
+def _trusted_bundle_copy(
+    bundle_path: Path,
+    destination: Path,
+    expected_checksum: str,
+) -> str:
+    if not isinstance(expected_checksum, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{64}", expected_checksum
+    ):
+        raise BackupBundleError("expected bundle checksum must be a 64-character SHA-256")
+
+    try:
+        digest = hashlib.sha256()
+        with bundle_path.open("rb") as source, destination.open("wb") as target:
+            while chunk := source.read(1024 * 1024):
+                target.write(chunk)
+                digest.update(chunk)
+    except OSError as exc:
+        raise BackupBundleError(f"could not read backup bundle: {bundle_path}") from exc
+
+    actual_checksum = digest.hexdigest()
+    if not hmac.compare_digest(actual_checksum, expected_checksum.lower()):
+        raise BackupBundleError(
+            "bundle checksum mismatch: "
+            f"expected {expected_checksum.lower()}, got {actual_checksum}"
+        )
+    return actual_checksum
+
+
+def _import_authenticated_bundle(
     bundle_path: Path,
     *,
+    display_path: Path,
     backup_dir: Path | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Import a portable bundle into the backup store and verify it.
-
-    This is intentionally non-destructive: it does not run pg_restore or touch
-    the active database.
-    """
-    if not bundle_path.exists():
-        raise BackupBundleError(f"bundle not found: {bundle_path}")
+    """Stage a private bundle copy that already matched its trusted checksum."""
     root = _backup_dir(backup_dir)
     root.mkdir(parents=True, exist_ok=True)
 
@@ -311,7 +338,7 @@ def import_backup_bundle(
                     with (staging / name).open("wb") as destination:
                         copyfileobj(source, destination)
         except tarfile.TarError as exc:
-            raise BackupBundleError(f"invalid backup bundle: {bundle_path}") from exc
+            raise BackupBundleError(f"invalid backup bundle: {display_path}") from exc
 
         verified = verify_backup_manifest_files(staging, manifest_name)
         for name in verified["files"]:
@@ -320,9 +347,60 @@ def import_backup_bundle(
                 destination_path.unlink()
             move(str(staging / name), destination_path)
     return {
-        "bundle": str(bundle_path),
-        "bundle_checksum": _sha256_file(bundle_path),
         "backup_dir": str(root),
         "manifest_file": manifest_name,
         "files": verified["files"],
+    }
+
+
+def import_backup_bundle(
+    bundle_path: Path,
+    *,
+    expected_checksum: str,
+    backup_dir: Path | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Authenticate and import a portable bundle into the backup store.
+
+    This is intentionally non-destructive: it does not run pg_restore or touch
+    the active database.
+    """
+    if not bundle_path.exists():
+        raise BackupBundleError(f"bundle not found: {bundle_path}")
+
+    # Quarantine the private copy inside the backup store rather than the system
+    # TMPDIR: the store is already sized for (and used to stage) bundle contents,
+    # whereas a container's /tmp lives on the writable layer and may already hold
+    # the operator's `docker cp`'d bundle, doubling a potentially very large file.
+    root = _backup_dir(backup_dir)
+    created_root = not root.exists()
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".backup-bundle-auth-", dir=root
+        ) as auth_tmp:
+            authenticated_bundle = Path(auth_tmp) / "bundle.tar.gz"
+            bundle_checksum = _trusted_bundle_copy(
+                bundle_path,
+                authenticated_bundle,
+                expected_checksum,
+            )
+            imported = _import_authenticated_bundle(
+                authenticated_bundle,
+                display_path=bundle_path,
+                backup_dir=backup_dir,
+                overwrite=overwrite,
+            )
+    except BaseException:
+        # A rejected bundle must not leave a backup directory behind that this
+        # call created; only an empty directory is removed, never real backups.
+        if created_root:
+            with contextlib.suppress(OSError):
+                root.rmdir()
+        raise
+
+    return {
+        "bundle": str(bundle_path),
+        "bundle_checksum": bundle_checksum,
+        **imported,
     }

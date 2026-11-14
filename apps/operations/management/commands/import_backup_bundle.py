@@ -8,11 +8,16 @@ from django.core.management.base import BaseCommand, CommandError
 
 
 class Command(BaseCommand):
-    help = "Verify and stage a portable backup bundle into the backup directory."
+    help = "Authenticate, verify, and stage a portable backup bundle."
 
     def add_arguments(self, parser) -> None:
         parser.add_argument("bundle")
         parser.add_argument("--backup-dir", default=None)
+        parser.add_argument(
+            "--checksum",
+            required=True,
+            help="Expected bundle SHA-256 obtained from a separate trusted channel.",
+        )
         parser.add_argument("--overwrite", action="store_true")
 
     def handle(self, *args, **options) -> None:
@@ -22,6 +27,7 @@ class Command(BaseCommand):
         try:
             result = import_backup_bundle(
                 Path(options["bundle"]),
+                expected_checksum=options["checksum"],
                 backup_dir=backup_dir,
                 overwrite=bool(options["overwrite"]),
             )
