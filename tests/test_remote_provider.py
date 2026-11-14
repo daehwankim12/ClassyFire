@@ -519,6 +519,15 @@ def test_wishart_reuses_single_http_client():
     provider.close()
 
 
+def test_wishart_http_client_does_not_follow_redirects():
+    from apps.remote.wishart import WishartDirectProvider
+
+    provider = WishartDirectProvider(base_url="https://wishart.test")
+    client = provider._client()
+    assert client.follow_redirects is False
+    provider.close()
+
+
 def test_wishart_poll_rejects_oversized_content_length(settings):
     settings.WISHART_MAX_RESPONSE_BYTES = 32
 

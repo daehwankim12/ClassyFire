@@ -173,7 +173,7 @@ SHARED_ACCESS_LOGIN_GLOBAL_WINDOW_SECONDS: int = env_int(
 # ---------------------------------------------------------------------------
 
 WISHART_BASE_URL: str = env_str(
-    "WISHART_BASE_URL", "http://classyfire.wishartlab.com"
+    "WISHART_BASE_URL", "https://classyfire.wishartlab.com"
 )
 REMOTE_ENABLED: bool = env_bool("REMOTE_ENABLED", True)
 # Wishart rate-limits per IP, pinned to observed live-server 429 behaviour.

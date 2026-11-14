@@ -34,6 +34,7 @@ def _reload_prod_settings(monkeypatch: pytest.MonkeyPatch, env_overrides: dict[s
         "POSTGRES_DB": "classyfire",
         "POSTGRES_USER": "classyfire",
         "POSTGRES_PORT": "5432",
+        "WISHART_BASE_URL": "https://classyfire.wishartlab.com",
     }
     base_env.update(env_overrides)
 
@@ -149,15 +150,15 @@ class TestBaseSettingsContract:
 
     def test_wishart_base_url(self, settings: object) -> None:
         assert hasattr(settings, "WISHART_BASE_URL")
-        assert str(settings.WISHART_BASE_URL).startswith(("http://", "https://"))
+        assert str(settings.WISHART_BASE_URL).startswith("https://")
 
-    def test_wishart_default_matches_live_http_endpoint(self) -> None:
+    def test_wishart_default_matches_live_https_endpoint(self) -> None:
         root = Path(__file__).resolve().parents[1]
         base_settings = (root / "config/settings/base.py").read_text()
         env_example = (root / ".env.example").read_text()
 
-        assert '"WISHART_BASE_URL", "http://classyfire.wishartlab.com"' in base_settings
-        assert "WISHART_BASE_URL=http://classyfire.wishartlab.com" in env_example
+        assert '"WISHART_BASE_URL", "https://classyfire.wishartlab.com"' in base_settings
+        assert "WISHART_BASE_URL=https://classyfire.wishartlab.com" in env_example
 
     def test_remote_enabled(self, settings: object) -> None:
         assert hasattr(settings, "REMOTE_ENABLED")
@@ -297,6 +298,55 @@ class TestProdRequiredVars:
     ) -> None:
         with pytest.raises(ImproperlyConfigured):
             _reload_prod_settings(monkeypatch, {"SHARED_ACCESS_PASSWORD_HASH": ""})
+
+    def test_prod_accepts_approved_wishart_https_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        url = "https://classyfire.wishartlab.com/"
+        mod = _reload_prod_settings(monkeypatch, {"WISHART_BASE_URL": url})
+
+        assert mod.WISHART_BASE_URL == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://classyfire.wishartlab.com",
+            "https://attacker.example",
+            "https://classyfire.wishartlab.com.attacker.example",
+            "https://user@classyfire.wishartlab.com",
+            "https://attacker.example\\@classyfire.wishartlab.com",
+            "https://classyfire.wishartlab.com:not-a-port",
+            "https://classyfire.wishartlab.com?target=attacker.example",
+            "https://classyfire.wishartlab.com#attacker.example",
+        ],
+    )
+    def test_prod_rejects_untrusted_wishart_url(
+        self, monkeypatch: pytest.MonkeyPatch, url: str
+    ) -> None:
+        with pytest.raises(ImproperlyConfigured):
+            _reload_prod_settings(monkeypatch, {"WISHART_BASE_URL": url})
+
+    def test_prod_insecure_http_escape_hatch_is_explicit_and_host_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        url = "http://classyfire.wishartlab.com"
+        with pytest.warns(RuntimeWarning, match="plaintext HTTP"):
+            mod = _reload_prod_settings(
+                monkeypatch,
+                {"WISHART_BASE_URL": url, "WISHART_ALLOW_INSECURE_HTTP": "1"},
+            )
+        assert mod.WISHART_BASE_URL == url
+        assert mod.WISHART_ALLOW_INSECURE_HTTP is True
+
+        # The escape hatch relaxes only the scheme, never the approved host.
+        with pytest.raises(ImproperlyConfigured):
+            _reload_prod_settings(
+                monkeypatch,
+                {
+                    "WISHART_BASE_URL": "http://attacker.example",
+                    "WISHART_ALLOW_INSECURE_HTTP": "1",
+                },
+            )
 
     def test_prod_has_security_settings(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mod = _reload_prod_settings(monkeypatch, {})

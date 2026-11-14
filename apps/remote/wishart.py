@@ -171,7 +171,14 @@ class WishartDirectProvider:
     def _client(self) -> httpx.Client:
         """Return the shared, lazily-created httpx.Client (connection pooling)."""
         if self._http_client is None:
-            self._http_client = httpx.Client(timeout=self.timeout)
+            # Pin certificate verification. Provider redirects are not part of
+            # the contract; keeping them disabled prevents a trusted endpoint
+            # from forwarding structures or requests to another authority.
+            self._http_client = httpx.Client(
+                timeout=self.timeout,
+                verify=True,
+                follow_redirects=False,
+            )
         return self._http_client
 
     @property

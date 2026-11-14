@@ -13,7 +13,7 @@ optionally forwards unresolved compounds to the Wishart ClassyFire service.
 
 **Important — data storage notice (FR-009.4):**
 Structures submitted via this service may be sent to the Wishart Lab ClassyFire
-web service (http://classyfire.wishartlab.com) for classification.  Successful
+web service (https://classyfire.wishartlab.com) for classification.  Successful
 classification results and identifiers (InChIKeys) are stored locally in the
 service's database for caching.  Do not submit confidential structures if this
 is a concern.
