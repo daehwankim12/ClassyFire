@@ -32,7 +32,6 @@ Politeness / rate limits (the design point):
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 
@@ -41,6 +40,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from apps.compounds.inchikey import is_standard_inchikey, same_inchikey_modulo_flag
+from apps.remote.json_decode import loads_bounded_depth
 from apps.remote.rate_limit import DbTokenBucket
 
 logger = logging.getLogger(__name__)
@@ -106,9 +106,9 @@ def _pubchem_fetch(inchikey: str) -> str | None:
     if status != 200:
         return None
     try:
-        props = json.loads(body)["PropertyTable"]["Properties"]
+        props = loads_bounded_depth(body)["PropertyTable"]["Properties"]
         inchi = props[0].get("InChI") if props else None
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+    except (ValueError, KeyError, IndexError, TypeError):
         return None
     return inchi or None
 

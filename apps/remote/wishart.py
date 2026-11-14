@@ -43,6 +43,7 @@ from apps.remote.contract import (
     validate_query_poll_payload,
     validate_query_submit_payload,
 )
+from apps.remote.json_decode import loads_bounded_depth
 from apps.remote.mock import parse_wishart_payload, parse_wishart_results
 from apps.remote.provider import (
     AmbiguousSubmissionError,
@@ -77,7 +78,7 @@ class _BufferedResponse:
     raw_text: str
 
     def json(self) -> Any:
-        return json.loads(self.raw_text)
+        return loads_bounded_depth(self.raw_text)
 
 
 def _safe_headers(response: httpx.Response | _BufferedResponse) -> dict[str, str]:

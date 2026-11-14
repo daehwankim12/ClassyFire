@@ -1347,16 +1347,25 @@ def test_crash_after_post_before_commit_does_not_double_submit(monkeypatch):
 
     monkeypatch.setattr(worker_mod.RemoteQuery.objects, "create", boom)
 
-    with pytest.raises(RuntimeError):
-        worker.tick()
+    assert worker.tick() is True
 
-    # The POST happened exactly once; a PENDING intent survived the crash.
+    # The POST happened exactly once; a PENDING intent survived the contained
+    # failure, and the task was parked for operator review instead of killing the
+    # worker command.
     assert len(provider.submit_calls) == 1
     submission = RemoteSubmission.objects.get()
     assert submission.state == "PENDING"
+    task = RemoteTask.objects.get(inchikey=IK_A)
+    assert task.state == TaskState.DEFERRED
+    assert task.next_run_at is None
+    assert RemoteAttempt.objects.filter(
+        task=task,
+        operation=RemoteAttempt.OPERATION_SUBMIT,
+        classification="WORKER_ERROR",
+    ).exists()
 
-    # Restore create; the task is reclaimable. Reset it to READY (the crash left
-    # it RUNNING) to mimic stale-lock recovery re-queuing it.
+    # Restore create; an operator can re-arm the safely parked task after reviewing
+    # the retained PENDING intent.
     monkeypatch.setattr(worker_mod.RemoteQuery.objects, "create", real_create)
     RemoteTask.objects.filter(inchikey=IK_A).update(
         state=TaskState.READY,

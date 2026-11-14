@@ -248,6 +248,7 @@ class RemoteWorker:
         # mistake Wishart's key-specific 500s for a provider outage.
         self.rate_limiter = rate_limiter or DbRateLimiter.from_settings()
         self.lease_seconds = lease_seconds
+        self._active_operation: str | None = None
 
     # -- top-level steps ---------------------------------------------------
 
@@ -271,6 +272,7 @@ class RemoteWorker:
         if task is None:
             return False
         claim = queue.claim_from_task(task)
+        self._active_operation = RemoteAttempt.OPERATION_ENTITY
         try:
             self.process(task, claim=claim)
         except LeaseLost:
@@ -282,7 +284,71 @@ class RemoteWorker:
                 task.pk,
                 task.inchikey,
             )
+        except Exception as exc:  # final task-scoped worker containment boundary
+            self._park_unexpected_task_failure(task, claim, exc)
+        finally:
+            self._active_operation = None
         return True
+
+    def _park_unexpected_task_failure(
+        self, task: RemoteTask, claim: queue.TaskClaim, exc: Exception
+    ) -> None:
+        """Audit an unexpected failure and contain it without killing the loop.
+
+        Entity/poll failures are retried on the normal backoff schedule so a
+        transient fault (a DB blip, an unmapped provider exception) self-heals
+        and a poison pill still ends via MAX_ATTEMPTS and the stale-task reaper.
+        A failure during SUBMIT is parked for an operator instead: the POST may
+        already have reached the provider, so an automatic retry could duplicate
+        upstream work.
+        """
+        operation = self._active_operation or RemoteAttempt.OPERATION_ENTITY
+        detail = f"{exc.__class__.__name__}: {exc}"[:2000]
+        logger.exception(
+            "unexpected remote %s failure for task %s (inchikey=%s); containing task",
+            operation.lower(),
+            task.pk,
+            task.inchikey,
+        )
+        try:
+            with transaction.atomic():
+                locked = queue.lock_owned_claim(claim)
+                self._record_attempt(
+                    operation,
+                    classification="WORKER_ERROR",
+                    raw_payload=None,
+                    detail=detail,
+                    task=locked,
+                    request_inchikey=locked.inchikey,
+                )
+                if operation == RemoteAttempt.OPERATION_SUBMIT:
+                    queue.park_for_operator(locked)
+                else:
+                    queue.schedule_retry(locked)
+        except LeaseLost:
+            logger.warning(
+                "lease lost while parking failed task %s (inchikey=%s); aborting write",
+                task.pk,
+                task.inchikey,
+            )
+            return
+        except Exception:
+            # A broken audit/parking write must not defeat the command-level
+            # containment boundary; stale-lock recovery remains the fallback.
+            logger.exception(
+                "could not persist unexpected failure for task %s (inchikey=%s)",
+                task.pk,
+                task.inchikey,
+            )
+            return
+        try:
+            fanout.mark_items_delayed(task.inchikey)
+        except Exception:
+            logger.exception(
+                "could not fan out unexpected failure for task %s (inchikey=%s)",
+                task.pk,
+                task.inchikey,
+            )
 
     def process(
         self, task: RemoteTask, *, claim: queue.TaskClaim | None = None
@@ -360,6 +426,7 @@ class RemoteWorker:
             return False
 
     def _entity_first(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
+        self._active_operation = RemoteAttempt.OPERATION_ENTITY
         if not self.rate_limiter.entity.allow():
             queue.defer_task(
                 task,
@@ -749,6 +816,7 @@ class RemoteWorker:
         return free_members, free_structures
 
     def _submit_batch(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
+        self._active_operation = RemoteAttempt.OPERATION_SUBMIT
         # R-02: never INITIATE a submit under a lost lease. A stale entity worker
         # whose lease was stolen during lookup_entity must POST nothing. Re-assert
         # ownership of the representative task before claiming extras or persisting
@@ -1450,6 +1518,7 @@ class RemoteWorker:
     # -- poll flow ---------------------------------------------------------
 
     def _poll_task(self, task: RemoteTask, claim: queue.TaskClaim) -> None:
+        self._active_operation = RemoteAttempt.OPERATION_POLL
         item = (
             task.query_items.filter(
                 query__state__in=[QueryState.SUBMITTED, QueryState.POLLING]

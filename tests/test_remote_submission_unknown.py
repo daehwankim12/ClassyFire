@@ -94,12 +94,14 @@ def test_in_doubt_submission_never_auto_reposts(settings):
     worker = _worker(provider)
 
     # Tick 1: entity MISS -> PENDING intent committed -> submit POSTs and the
-    # socket drops (ConnectionError is NOT caught; it propagates like any crash
-    # between the POST and the local commit, leaving the PENDING intent durable).
-    with pytest.raises(ConnectionError):
-        worker.tick()
+    # socket drops. The task-scoped worker boundary contains the provider bug and
+    # parks the task, while the PENDING intent remains durable.
+    assert worker.tick() is True
     assert provider.submit_count == 1
     assert RemoteSubmission.objects.get().state == SubmissionState.PENDING
+    task.refresh_from_db()
+    assert task.state == TaskState.DEFERRED
+    assert task.next_run_at is None
 
     # Subsequent ticks find the live PENDING intent for the SAME payload and
     # reconcile it WITHOUT a second POST. With cap/TTL at 0 the first reconcile
@@ -129,8 +131,7 @@ def test_unknown_holds_idempotency_key(settings):
     provider = AcceptThenDropProvider()
     worker = _worker(provider)
 
-    with pytest.raises(ConnectionError):
-        worker.tick()
+    assert worker.tick() is True
     _ready()
     worker.tick()
     assert RemoteSubmission.objects.get().state == SubmissionState.UNKNOWN
