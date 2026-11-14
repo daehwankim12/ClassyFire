@@ -46,10 +46,19 @@ from apps.core.security import (
 )
 
 
-def test_secret_redaction_filter_redacts_claim_and_legacy_paths():
-    """Claim-path and legacy job-path secrets are redacted, not just query secrets."""
+def test_secret_redaction_filter_redacts_all_routed_capability_paths():
+    """Every secret-bearing path in config/urls.py is redacted."""
     secret = "sentinel-invalid-claim-secret"
     job_id = "00000000-0000-0000-0000-000000000000"
+    compact_job_id = job_id.replace("-", "")
+    secret_paths = [
+        f"/jobs/{job_id}/claim/{secret}/",
+        f"/jobs/{job_id}/{secret}/",
+        f"/jobs/{job_id}/{secret}/items",
+        f"/jobs/{job_id}/{secret}/progress",
+        f"/items/42/{secret}/structure",
+        f"/jobs/{compact_job_id}/{secret}/",
+    ]
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -59,18 +68,96 @@ def test_secret_redaction_filter_redacts_claim_and_legacy_paths():
     logger.setLevel(logging.WARNING)
     logger.propagate = False
     try:
-        logger.warning("Forbidden: /jobs/%s/claim/%s/", job_id, secret)
-        logger.warning("Forbidden: /api/jobs/%s?secret=%s", job_id, secret)
-        logger.warning("Forbidden: /jobs/%s/items/%s/", job_id, secret)
-        logger.warning("Forbidden: /jobs/%s/structure/%s/", job_id, secret)
-        logger.warning("Forbidden: /jobs/%s/%s/progress", job_id, secret)
+        for path in secret_paths:
+            logger.warning("Forbidden: %s", path)
     finally:
         logger.removeHandler(handler)
 
     output = stream.getvalue()
     assert secret not in output
     assert quote(secret) not in output
-    assert "[REDACTED]" in output
+    for path in secret_paths:
+        assert path.replace(secret, "[REDACTED]") in output
+
+
+def test_secret_redaction_filter_preserves_secretless_route_names():
+    """Redaction does not obscure the ordinary secretless route variants."""
+    paths = [
+        "/jobs/00000000-0000-0000-0000-000000000000/",
+        "/jobs/00000000-0000-0000-0000-000000000000/items",
+        "/jobs/00000000-0000-0000-0000-000000000000/progress",
+        "/items/42/structure",
+    ]
+    message = " ".join(paths)
+    record = logging.LogRecord(
+        name="django.request",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg=message,
+        args=(),
+        exc_info=None,
+    )
+
+    SecretRedactionFilter().filter(record)
+
+    assert record.getMessage() == message
+
+
+def _redact(message: str) -> str:
+    record = logging.LogRecord(
+        name="django.request",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg=message,
+        args=(),
+        exc_info=None,
+    )
+    SecretRedactionFilter().filter(record)
+    return record.getMessage()
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "Not Found: '{path}'",
+        'Forbidden: "{path}"',
+        "paths=({path}, other)",
+        "<{path}>",
+        "[{path}]",
+        "{path}#frag",
+    ],
+)
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/jobs/job-1/SECRETVALUE/",
+        "/jobs/job-1/SECRETVALUE/items",
+        "/jobs/job-1/SECRETVALUE/progress",
+        "/items/7/SECRETVALUE/structure",
+    ],
+)
+def test_secret_redaction_filter_redacts_quoted_or_wrapped_paths(template, path):
+    """Paths wrapped in quotes/brackets/commas inside a message are still redacted."""
+    redacted = _redact(template.format(path=path))
+
+    assert "SECRETVALUE" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/jobs/00000000-0000-0000-0000-000000000000/exports",
+        "/api/jobs/00000000-0000-0000-0000-000000000000/items",
+        "/api/items/42/structure",
+    ],
+)
+def test_secret_redaction_filter_leaves_api_routes_intact(path):
+    """JSON API routes carry no path secret and must stay readable in logs."""
+    assert _redact(f"Bad Request: {path}") == f"Bad Request: {path}"
+
 
 ASPIRIN_SMILES = "CC(=O)Oc1ccccc1C(=O)O"
 GHOST_INCHIKEY = "QIVBCDIJIAJPQS-VIFPVBQESA-N"
@@ -825,6 +912,24 @@ class TestProdSettings:
     def test_prod_x_frame_options_deny(self, monkeypatch: pytest.MonkeyPatch) -> None:
         mod = _reload_prod_settings(monkeypatch, {})
         assert getattr(mod, "X_FRAME_OPTIONS", "") == "DENY"
+
+    def test_prod_django_loggers_use_redaction_filter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mod = _reload_prod_settings(monkeypatch, {})
+        logging_config = mod.LOGGING
+        assert logging_config["handlers"]["console"]["filters"] == [
+            "redact_secrets"
+        ]
+        for logger_name in (
+            "django",
+            "django.request",
+            "django.security",
+            "django.server",
+        ):
+            logger_config = logging_config["loggers"][logger_name]
+            assert logger_config["handlers"] == ["console"]
+            assert logger_config["propagate"] is False
 
 
 # ===========================================================================

@@ -959,10 +959,10 @@ class SecretRedactionFilter(logging.Filter):
     - ``?secret=<value>`` / ``&secret=<value>`` query parameters with
       ``?secret=[REDACTED]`` / ``&secret=[REDACTED]``.
     - ``/api/exports/<token>`` path segments with ``/api/exports/[REDACTED]``.
-    - ``/jobs/<uuid>/claim/<secret>`` capability secrets carried IN the PATH
+    - ``/jobs/<job_id>/claim/<secret>`` capability secrets carried IN the PATH
       (Django's "Forbidden: <path>" request-log lines expose these on a 403).
-    - legacy ``/jobs/<uuid>/(items|structure|result[s])/<secret>`` path secrets.
-    - legacy ``/jobs/<uuid>/<secret>/progress`` path secrets.
+    - legacy ``/jobs/<job_id>/<secret>[/items|/progress]`` path secrets.
+    - legacy ``/items/<item_id>/<secret>/structure`` path secrets.
     - ``/api/jobs/<uuid>/...?secret=<value>`` (covered by the query rule too, but
       matched explicitly for defence in depth).
 
@@ -972,12 +972,21 @@ class SecretRedactionFilter(logging.Filter):
 
     QUERY_SECRET_RE = re.compile(r"([?&]secret=)[^&\s]+")
     EXPORT_PATH_RE = re.compile(r"(/api/exports/)[^/?\s]+")
-    CLAIM_PATH_RE = re.compile(r"(/jobs/[0-9a-fA-F-]{36}/claim/)[^/?\s]+")
+    CLAIM_PATH_RE = re.compile(r"(/jobs/[^/?\s]+/claim/)[^/?\s]+")
+    # A path ends at a query/fragment, whitespace, end of string, or the
+    # punctuation that typically wraps a path inside a logged message
+    # (quotes, commas, brackets), so repr'd/quoted paths are redacted too.
+    _PATH_END = r"(?:[?#\s'\",)>\]]|$)"
+    # (?<!/api) keeps the JSON API routes (/api/jobs/<id>/exports, ...), which
+    # carry no path secret, out of the legacy capability rules.
     LEGACY_JOB_PATH_RE = re.compile(
-        r"(/jobs/[0-9a-fA-F-]{36}/(?:items|structure|results?)/)[^/?\s]+"
+        r"(?<!/api)(/jobs/[^/?#\s]+/)"
+        r"(?!(?:items|progress)/?" + _PATH_END + r")"
+        r"[^/?#\s'\",)>\]]+"
+        r"(?=(?:/(?:items|progress))?/?" + _PATH_END + r")"
     )
-    LEGACY_PROGRESS_PATH_RE = re.compile(
-        r"(/jobs/[0-9a-fA-F-]{36}/)[^/?\s]+(/progress/?)(?=[?\s]|$)"
+    LEGACY_ITEM_PATH_RE = re.compile(
+        r"(?<!/api)(/items/[0-9]+/)[^/?#\s'\",)>\]]+(?=/structure/?" + _PATH_END + r")"
     )
     API_JOB_SECRET_RE = re.compile(
         r"(/api/jobs/[0-9a-fA-F-]{36}/[^?\s]*[?&]secret=)[^&\s]+"
@@ -989,7 +998,7 @@ class SecretRedactionFilter(logging.Filter):
         message = self.EXPORT_PATH_RE.sub(r"\1[REDACTED]", message)
         message = self.CLAIM_PATH_RE.sub(r"\1[REDACTED]", message)
         message = self.LEGACY_JOB_PATH_RE.sub(r"\1[REDACTED]", message)
-        message = self.LEGACY_PROGRESS_PATH_RE.sub(r"\1[REDACTED]\2", message)
+        message = self.LEGACY_ITEM_PATH_RE.sub(r"\1[REDACTED]", message)
         message = self.API_JOB_SECRET_RE.sub(r"\1[REDACTED]", message)
         record.msg = message
         record.args = ()

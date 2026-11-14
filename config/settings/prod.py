@@ -113,6 +113,8 @@ UPLOAD_ARTIFACT_DIR = _env_str("UPLOAD_ARTIFACT_DIR", "/app/uploads")
 # Logging (minimal — full observability is Task 11)
 # ---------------------------------------------------------------------------
 
+_DJANGO_LOG_LEVEL = env_str("DJANGO_LOG_LEVEL", "WARNING")
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -129,7 +131,29 @@ LOGGING = {
     },
     "root": {
         "handlers": ["console"],
-        "level": env_str("DJANGO_LOG_LEVEL", "WARNING"),
+        "level": _DJANGO_LOG_LEVEL,
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": _DJANGO_LOG_LEVEL,
+            "propagate": False,
+        },
+        "django.request": {
+            "handlers": ["console"],
+            "level": _DJANGO_LOG_LEVEL,
+            "propagate": False,
+        },
+        "django.security": {
+            "handlers": ["console"],
+            "level": _DJANGO_LOG_LEVEL,
+            "propagate": False,
+        },
+        "django.server": {
+            "handlers": ["console"],
+            "level": _DJANGO_LOG_LEVEL,
+            "propagate": False,
+        },
     },
 }
 
