@@ -10,7 +10,7 @@ create_export_for_authorized_job(job, fmt) -> (token, expires_at)
     Create (or reuse) an export after the caller has already authorized job access.
 
 get_export_metadata(token) -> dict | None
-    Return export metadata for auth decisions, or None.
+    Return authoritative export metadata for auth decisions, or None.
 
 get_export_path(token) -> Path | None
     Return the file path for a valid, non-expired export token, or None.
@@ -41,7 +41,8 @@ Implementation notes (Gate-2 WS-E / F-12)
   means at most ONE full BatchItem scan per create (no double scan).
 - ExportArtifact (DB model) is the source of truth for metadata/dedup/expiry.
   A JSON sidecar (.meta.json) is also written for backward compatibility with
-  existing tests that call _meta_path/_load_meta directly.
+  existing tests that call _meta_path/_load_meta directly, but sidecars are
+  never accepted as download authorization.
 """
 from __future__ import annotations
 
@@ -523,21 +524,30 @@ def _meta_path(token: str) -> Path:
     return _artifact_storage().meta_path(token)
 
 
+def _artifact_metadata(artifact: ExportArtifact) -> dict[str, str]:
+    """Serialize authoritative metadata from an ExportArtifact row."""
+    return {
+        "token": artifact.token,
+        "job_id": str(artifact.job_id),
+        "fmt": artifact.fmt,
+        "expires_at": artifact.expires_at.isoformat(),
+        "rows_signature": artifact.rows_signature,
+        "checksum": artifact.checksum,
+        "byte_size": str(artifact.byte_size),
+        "row_count": str(artifact.row_count),
+        "job_state_signature": artifact.job_state_signature,
+    }
+
+
 def _load_meta(token: str) -> dict[str, str] | None:
-    """Load metadata — first from DB (ExportArtifact), then sidecar fallback."""
+    """Load DB metadata or a legacy sidecar for compatibility inspection.
+
+    Callers must not use this helper to authorize a download because a sidecar
+    can outlive deletion of its authoritative ExportArtifact row.
+    """
     artifact = ExportArtifact.objects.filter(token=token).first()
     if artifact is not None:
-        return {
-            "token": artifact.token,
-            "job_id": str(artifact.job_id),
-            "fmt": artifact.fmt,
-            "expires_at": artifact.expires_at.isoformat(),
-            "rows_signature": artifact.rows_signature,
-            "checksum": artifact.checksum,
-            "byte_size": str(artifact.byte_size),
-            "row_count": str(artifact.row_count),
-            "job_state_signature": artifact.job_state_signature,
-        }
+        return _artifact_metadata(artifact)
 
     # Fallback: legacy JSON sidecar (for tests that write it directly)
     storage = _artifact_storage()
@@ -671,52 +681,41 @@ def create_export_for_authorized_job(job: BatchJob, fmt: str) -> tuple[str, str]
 
 
 def get_export_metadata(token: str) -> dict[str, str] | None:
-    """Return parsed export metadata for auth checks, or None."""
-    return _load_meta(token)
+    """Return authoritative export metadata for auth checks, or None."""
+    artifact = ExportArtifact.objects.filter(token=token).first()
+    return _artifact_metadata(artifact) if artifact is not None else None
 
 
 def get_export_path(token: str) -> Path | None:
     """Return the file path for a valid export token, or None if not found/expired."""
     storage = _artifact_storage()
 
-    # Primary path: look up ExportArtifact in DB
+    # The ExportArtifact row is the authorization record. Sidecars are retained
+    # only for compatibility cleanup and must never revive a revoked token.
     artifact = ExportArtifact.objects.filter(token=token).first()
-    if artifact is not None:
-        now = timezone.now()
-        if artifact.expires_at <= now:
-            return None
-        path = Path(artifact.path)
-        if not storage.exists(path):
-            return None
-        if not _artifact_matches_current_job_state(artifact):
-            return None
-        if not _artifact_file_checksum_matches(path, artifact):
-            SystemEvent.objects.create(
-                category="SECURITY",
-                event_type="export_checksum_mismatch",
-                payload={
-                    "artifact_id": artifact.pk,
-                    "token_prefix": artifact.token[:8],
-                    "path": str(path),
-                },
-            )
-            return None
-        return path
+    if artifact is None:
+        return None
 
-    # Fallback: legacy sidecar path (for tests that write .meta.json directly)
-    meta = _load_meta(token)
-    if meta is None or not _is_valid_meta(meta):
+    now = timezone.now()
+    if artifact.expires_at <= now:
         return None
-    # Legacy sidecar-only artifacts do not carry a trusted DB job-state snapshot;
-    # fail closed instead of recomputing the full row signature on download. Both
-    # the job-state snapshot AND the rows_signature must be present — without the
-    # rows_signature the artifact's integrity cannot be vouched for, so a sidecar
-    # missing either field is not served.
-    if "job_state_signature" not in meta or "rows_signature" not in meta:
+    path = Path(artifact.path)
+    if not storage.exists(path):
         return None
-    fmt = meta.get("fmt", "")
-    path = storage.local_path(token, fmt)
-    return path if storage.exists(path) else None
+    if not _artifact_matches_current_job_state(artifact):
+        return None
+    if not _artifact_file_checksum_matches(path, artifact):
+        SystemEvent.objects.create(
+            category="SECURITY",
+            event_type="export_checksum_mismatch",
+            payload={
+                "artifact_id": artifact.pk,
+                "token_prefix": artifact.token[:8],
+                "path": str(path),
+            },
+        )
+        return None
+    return path
 
 
 # ---------------------------------------------------------------------------

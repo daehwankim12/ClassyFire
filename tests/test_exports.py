@@ -627,32 +627,49 @@ def test_export_reuse_invalidates_after_job_items_resolve():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_legacy_export_metadata_without_rows_signature_is_not_served():
-    """An artifact whose rows_signature no longer matches current job state is not served.
+def test_admin_delete_revokes_export_when_unlink_fails(
+    settings, tmp_path, monkeypatch
+):
+    """Deleting the DB authority revokes a token even when sidecar unlink fails."""
+    from pathlib import Path
 
-    The DB model (ExportArtifact) is now the source of truth.  We simulate a
-    stale artifact by deleting the DB row so neither the DB record nor the
-    sidecar (which also has rows_signature removed) can validate the token.
-    """
     from apps.batches import exports
+    from apps.batches.admin_ops import delete_jobs_with_artifacts
     from apps.batches.models import ExportArtifact
+
+    export_dir = tmp_path / "exports"
+    export_dir.mkdir()
+    settings.EXPORT_DIR = export_dir
+    monkeypatch.setattr(exports, "EXPORT_DIR", export_dir)
 
     job, secret = _create_simple_job()
     client = Client()
     token = _create_export_token(client, str(job.pk), secret, "csv")
+    artifact = ExportArtifact.objects.get(token=token)
+    payload_path = Path(artifact.path)
+    sidecar_path = exports._meta_path(token)
+    assert payload_path.exists()
+    assert sidecar_path.exists()
 
-    # Remove the DB artifact — primary source of truth gone
-    ExportArtifact.objects.filter(token=token).delete()
+    original_unlink = Path.unlink
 
-    # Also corrupt the sidecar (legacy fallback) to remove rows_signature
-    meta_path = exports._meta_path(token)
-    if meta_path.exists():
-        meta = json.loads(meta_path.read_text())
-        meta.pop("rows_signature", None)
-        meta_path.write_text(json.dumps(meta))
+    def fail_export_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path in {payload_path, sidecar_path}:
+            raise OSError("simulated export cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_export_unlink)
+
+    result = delete_jobs_with_artifacts([job.pk], actor="test")
 
     response = client.get(f"/api/exports/{token}")
 
+    assert result.jobs_deleted == 1
+    assert not ExportArtifact.objects.filter(token=token).exists()
+    assert payload_path.exists()
+    assert sidecar_path.exists()
+    assert exports._load_meta(token) is not None
+    assert exports.get_export_metadata(token) is None
     assert response.status_code == 404
 
 
