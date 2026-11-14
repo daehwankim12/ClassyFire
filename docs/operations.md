@@ -187,6 +187,19 @@ the manifest's payload checksums and stages files in the backup directory, but
 it does not restore the live database. Run the explicit restore procedure only
 after stopping writers and confirming the imported manifest.
 
+Import also refuses bundles that exceed these resource limits (Django settings;
+defaults shown). Only raise them for a bundle you already trust:
+
+| Setting | Default | Limits |
+|---|---|---|
+| `BACKUP_BUNDLE_MAX_COMPRESSED_SIZE` | 26 GiB | size of the `.tar.gz` file, checked before it is copied |
+| `BACKUP_BUNDLE_MAX_TOTAL_SIZE` | 25 GiB | combined uncompressed size of the payload files |
+| `BACKUP_BUNDLE_MAX_MEMBER_SIZE` | 10 GiB | uncompressed size of any single payload file |
+| `BACKUP_BUNDLE_MAX_MEMBERS` | 64 | tar headers, including PAX/GNU metadata headers (a normal bundle uses about 13) |
+
+The bundle index must be the first member and the backup manifest the second,
+which is the order `export_backup_bundle` writes; re-tarred bundles are rejected.
+
 ### Restore smoke test
 
 To verify the most recent backup is readable:
