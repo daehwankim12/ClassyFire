@@ -105,15 +105,30 @@ def test_dockerfile_creates_runtime_writable_directories():
 def test_ngrok_agent_config_uses_v3_https_endpoint_to_proxy_http():
     compose = load_compose()
     ngrok_agent = compose["services"]["ngrok-agent"]
+    proxy = compose["services"]["proxy"]
 
     assert ngrok_agent["environment"]["NGROK_AUTHTOKEN"] == "${NGROK_AUTHTOKEN}"
+    assert ngrok_agent["network_mode"] == "service:proxy"
+    assert "networks" not in ngrok_agent
+    assert set(proxy["networks"]) == {"internal", "external"}
     assert ngrok_agent["command"] == [
         "http",
-        "proxy:80",
+        "127.0.0.1:80",
         "--url=https://${NGROK_DOMAIN}",
         "--log=stdout",
         "--log-format=json",
     ]
+
+
+def test_caddy_sanitizes_client_ip_from_only_the_ngrok_loopback_hop():
+    caddyfile = read_file("deploy/caddy/Caddyfile")
+
+    assert "trusted_proxies static 127.0.0.1/32" in caddyfile
+    assert "trusted_proxies_strict" in caddyfile
+    assert "client_ip_headers X-Forwarded-For" in caddyfile
+    assert "header_up X-Forwarded-For {http.request.client_ip}" in caddyfile
+    assert "header_up X-Real-IP {http.request.client_ip}" in caddyfile
+    assert "header_up X-Forwarded-For {remote_host}" not in caddyfile
 
 
 def test_db_no_external_network():

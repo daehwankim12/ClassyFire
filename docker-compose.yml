@@ -7,12 +7,13 @@
 #   external  : proxy, ngrok-agent      (outbound/ngrok-facing only)
 #   web and worker are on BOTH networks so they can reach db (internal)
 #   and also make outbound internet requests (external).
-#   proxy and ngrok-agent are also on `internal` so they can reach `web`.
+#   ngrok-agent shares proxy's network namespace, using loopback for its only
+#   trusted inbound hop; proxy remains on both networks so it can reach `web`.
 #
 # Port policy
 # ───────────
 #   db, web, worker, backup → NO host-published ports
-#   proxy                   → NO host-published ports; ngrok reaches proxy internally
+#   proxy                   → NO host-published ports; ngrok reaches Caddy on loopback
 #   ngrok-agent             → connects outbound to ngrok cloud (no inbound port)
 #
 # Usage
@@ -320,7 +321,7 @@ services:
       - external
     depends_on:
       - web
-    # NO ports: ngrok reaches Caddy over the internal Docker network (proxy:80).
+    # NO ports: ngrok reaches Caddy through their shared network namespace.
     # Publishing this HTTP listener to the host would let direct cleartext
     # requests bypass Django's SECURE_SSL_REDIRECT because Caddy must mark
     # ngrok-forwarded requests as HTTPS.
@@ -337,15 +338,15 @@ services:
     # mounted ngrok.yml.template passed the literal "${NGROK_AUTHTOKEN}" and
     # failed with ERR_NGROK_105. Forward the reserved domain straight to the Caddy
     # proxy; docker compose substitutes ${NGROK_DOMAIN} from .env at parse time.
+    # Sharing proxy's namespace makes 127.0.0.1 the exact trusted proxy hop;
+    # other containers cannot choose the client-IP headers Caddy forwards.
     command:
       - "http"
-      - "proxy:80"
+      - "127.0.0.1:80"
       - "--url=https://${NGROK_DOMAIN}"
       - "--log=stdout"
       - "--log-format=json"
-    networks:
-      - internal
-      - external
+    network_mode: "service:proxy"
     depends_on:
       - proxy
     # NO ports: ngrok connects outbound to ngrok cloud — no inbound host ports

@@ -11,6 +11,18 @@
 #   MAX_UPLOAD_MB — maximum body size for file uploads; defaults to 100
 # =============================================================================
 
+{
+    servers {
+        # The ngrok agent shares this container's network namespace and reaches
+        # Caddy over IPv4 loopback. Trust no other Compose peer's forwarding
+        # headers, and parse right-to-left so a client-supplied leftmost value
+        # cannot replace the address appended by ngrok.
+        trusted_proxies static 127.0.0.1/32
+        trusted_proxies_strict
+        client_ip_headers X-Forwarded-For
+    }
+}
+
 http://{$NGROK_DOMAIN} {
 
     # ── Upload size limit ────────────────────────────────────────────────────
@@ -43,10 +55,11 @@ http://{$NGROK_DOMAIN} {
 
     # ── Reverse proxy to Gunicorn ────────────────────────────────────────────
     reverse_proxy web:8000 {
-        # Forward the real client IP and protocol
-        header_up X-Forwarded-For {remote_host}
+        # Forward only Caddy's sanitized client identity, not the untrusted
+        # inbound forwarding chain. Django uses this value for IP throttles.
+        header_up X-Forwarded-For {http.request.client_ip}
         header_up X-Forwarded-Proto https
-        header_up X-Real-IP {remote_host}
+        header_up X-Real-IP {http.request.client_ip}
         header_up Host {host}
 
         # Health-check: mark upstream as unhealthy after 3 consecutive failures
