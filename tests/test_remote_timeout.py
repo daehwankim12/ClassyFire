@@ -9,6 +9,7 @@ its items out to REMOTE_TIMED_OUT so the job can complete.
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 import pytest
 from django.utils import timezone
@@ -22,7 +23,9 @@ from apps.core.enums import (
     TaskState,
 )
 from apps.remote import queue
+from apps.remote.mock import MockProvider
 from apps.remote.models import RemoteTask
+from apps.remote.worker import RemoteWorker
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -180,3 +183,86 @@ def test_timeout_terminalizes_live_query_submission_state():
     assert "timed out" in (submission.detail or "").lower()
     assert member.active is False
     assert member.release_reason == "task_timed_out"
+
+
+def test_timeout_revokes_lease_and_fans_out_before_freeing_slot(monkeypatch):
+    """A stale submit lease cannot cross timeout into a fresh key generation."""
+    from apps.remote import fanout
+
+    job = _job()
+    _delayed_item(job, IK_A)
+    task = _stuck_task(IK_A, age_hours=30)
+    token = uuid.uuid4()
+    RemoteTask.objects.filter(pk=task.pk).update(
+        state=TaskState.RUNNING,
+        lock_owner="slow-submit",
+        locked_at=timezone.now() - dt.timedelta(hours=1),
+        lease_token=token,
+        lease_version=7,
+    )
+    task.refresh_from_db()
+    stale_submit_task = RemoteTask.objects.get(pk=task.pk)
+    stale_submit_claim = queue.claim_from_task(stale_submit_task)
+
+    real_fan_out = fanout.fan_out_result
+
+    def inspect_terminal_fan_out(inchikey, status):
+        locked = RemoteTask.objects.get(pk=task.pk)
+        assert locked.state == TaskState.RUNNING
+        assert locked.lock_owner is None
+        assert locked.lease_token is None
+        assert locked.lease_version == 8
+        # The active-key slot is still this generation's until fan-out finishes.
+        assert queue.enqueue_task(inchikey).pk == task.pk
+        return real_fan_out(inchikey, status)
+
+    monkeypatch.setattr(fanout, "fan_out_result", inspect_terminal_fan_out)
+
+    assert queue.timeout_stale_tasks(timeout_hours=24) == 1
+
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+    assert task.lock_owner is None
+    assert task.lease_token is None
+    assert task.lease_version == 8
+    assert RemoteTask.objects.filter(inchikey=IK_A).count() == 1
+    assert BatchItem.objects.get(job=job).status == BatchItemStatus.REMOTE_TIMED_OUT
+
+    # A response holding the pre-timeout snapshot cannot resurrect the DONE row.
+    with pytest.raises(queue.LeaseLost):
+        queue.transition(
+            stale_submit_task,
+            TaskState.POLL_WAIT,
+            next_run_at=timezone.now(),
+            lock_owner=None,
+            locked_at=None,
+        )
+    task.refresh_from_db()
+    assert task.state == TaskState.DONE
+
+    fresh = queue.enqueue_task(IK_A)
+    assert fresh is not None
+    assert fresh.pk != task.pk
+    assert fresh.state == TaskState.READY
+
+    fresh_job = _job()
+    fresh_item = BatchItem.objects.create(
+        job=fresh_job,
+        row_order=0,
+        original_input=IK_A,
+        inchikey=IK_A,
+        status=BatchItemStatus.PENDING_CLASSIFICATION,
+    )
+    worker = RemoteWorker(MockProvider(), worker_id="slow-submit")
+    assert (
+        worker._terminalize_submitted_member(
+            stale_submit_task,
+            stale_submit_claim,
+            BatchItemStatus.INVALID_INPUT,
+        )
+        is False
+    )
+    fresh_item.refresh_from_db()
+    assert fresh_item.status == BatchItemStatus.PENDING_CLASSIFICATION
+    fresh.refresh_from_db()
+    assert fresh.state == TaskState.READY

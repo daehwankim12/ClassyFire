@@ -67,7 +67,7 @@ class LeaseLost(Exception):  # noqa: N818 - domain name fixed by the F-07 contra
 
     def __init__(self, task_pk: int) -> None:
         super().__init__(
-            f"lease lost for remote_task pk={task_pk}: version/token no longer match"
+            f"lease lost for remote_task pk={task_pk}: lease/state no longer match"
         )
         self.task_pk = task_pk
 
@@ -373,22 +373,27 @@ def transition(task: RemoteTask, state: TaskState, **fields: object) -> None:
     """Persist a lease-fenced state transition plus any extra column updates.
 
     EVERY transition is conditional on the task's current
-    ``(pk, lease_version, lease_token)`` (F-07): the UPDATE only writes the row
-    if the lease still matches. If 0 rows are updated the lease was stolen /
+    ``(pk, state, lock_owner, lease_version, lease_token)`` (F-07): the UPDATE
+    only writes the row if the state and complete lease snapshot still match. If
+    0 rows are updated the task was terminalized or the lease was stolen /
     reclaimed by another worker — we raise :class:`LeaseLost` and do NOT
-    overwrite the new owner's state. The in-memory ``task`` is mutated to reflect
-    the intended new values only after the conditional UPDATE succeeds.
+    overwrite the newer state. The in-memory ``task`` is mutated to reflect the
+    intended new values only after the conditional UPDATE succeeds.
 
-    Tasks that have never been claimed (``lease_token is None``) are transitioned
-    on the ``pk + lease_version`` pair alone — there is no competing owner to
-    fence against until a claim issues a token.
+    Tasks that have never been claimed carry null token and owner snapshots; those
+    nulls are matched explicitly so they cannot overwrite a concurrently claimed
+    task.
     """
     update_values: dict[str, object] = {"state": state, "updated_at": timezone.now()}
     update_values.update(fields)
 
-    guard = RemoteTask.objects.filter(pk=task.pk, lease_version=task.lease_version)
-    if task.lease_token is not None:
-        guard = guard.filter(lease_token=task.lease_token)
+    guard = RemoteTask.objects.filter(
+        pk=task.pk,
+        state=task.state,
+        lock_owner=task.lock_owner,
+        lease_version=task.lease_version,
+        lease_token=task.lease_token,
+    )
     updated = guard.update(**update_values)
     if updated == 0:
         raise LeaseLost(task.pk)
@@ -643,8 +648,10 @@ def timeout_stale_tasks(
 
     Idempotent and concurrency-safe: each candidate is re-locked + re-checked
     under ``SELECT ... FOR UPDATE`` so two worker processes never double-finish
-    the same task. ``timeout_hours <= 0`` disables the reaper. Returns the number
-    of tasks timed out.
+    the same task. Its lease is revoked before any terminal side effect, and the
+    active dedup slot remains held until fan-out completes, so a later generation
+    for the same key cannot be consumed by this timeout. ``timeout_hours <= 0``
+    disables the reaper. Returns the number of tasks timed out.
     """
     from apps.core.enums import BatchItemStatus
     from apps.remote import fanout
@@ -678,19 +685,39 @@ def timeout_stale_tasks(
                 continue
             inchikey = task.inchikey
             _fail_live_remote_query_state_for_timed_out_task(task, message)
-            # We hold the row lock, so a plain (unfenced) transition is correct.
+
+            # Revoke the captured lease while the row is still active. A provider
+            # response that returns after this timeout can no longer park or
+            # resurrect the task using its old owner/token/version snapshot.
+            task.lease_token = None
+            task.lease_version += 1
+            task.lock_owner = None
+            task.locked_at = None
+            RemoteTask.objects.filter(pk=task.pk).update(
+                lease_token=None,
+                lease_version=task.lease_version,
+                lock_owner=None,
+                locked_at=None,
+                updated_at=timezone.now(),
+            )
+
+            # Fan out before DONE frees the partial-unique active-key slot. The
+            # nested atomic block is part of this transaction, so item updates,
+            # counter recomputation, and terminalization commit together.
+            fanout.fan_out_result(inchikey, BatchItemStatus.REMOTE_TIMED_OUT)
+
+            # Stamp a human-readable reason on this generation's timed-out items
+            # (fan-out only sets status).
+            from apps.batches.models import BatchItem
+
+            BatchItem.objects.filter(
+                inchikey=inchikey, status=BatchItemStatus.REMOTE_TIMED_OUT
+            ).exclude(message=message).update(message=message)
+
+            # We still hold the row lock, so a plain transition is correct. Keep
+            # this last: DONE is what permits a fresh same-key generation.
             transition_locked(
                 task, TaskState.DONE, lock_owner=None, locked_at=None
             )
-        # Fan out OUTSIDE the task-row lock: fan_out_result opens its own
-        # transaction and locks the affected BatchJob rows.
-        fanout.fan_out_result(inchikey, BatchItemStatus.REMOTE_TIMED_OUT)
-        # Stamp a human-readable reason on the just-timed-out items (fan-out only
-        # sets status). Scoped to this key so the item table explains the state.
-        from apps.batches.models import BatchItem
-
-        BatchItem.objects.filter(
-            inchikey=inchikey, status=BatchItemStatus.REMOTE_TIMED_OUT
-        ).exclude(message=message).update(message=message)
         timed_out += 1
     return timed_out

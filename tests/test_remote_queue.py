@@ -1541,18 +1541,18 @@ def test_mid_batch_lease_lost_preserves_query_id_and_reclaims_member(
 
     import apps.remote.worker as worker_mod
 
-    real_transition = worker_mod.queue.transition
+    task_b_before_submit = RemoteTask.objects.get(inchikey=IK_B)
+    real_lock_owned_claim = worker_mod.queue.lock_owned_claim
 
-    def steal_b_lease(member, state, **fields):
-        # Simulate a concurrent reclaim of IK_B between the POST and its park:
-        # bump its lease_version so the fenced transition matches 0 rows.
-        if member.inchikey == IK_B:
-            RemoteTask.objects.filter(pk=member.pk).update(
-                lease_version=member.lease_version + 5
+    def steal_b_lease(member_claim):
+        # Simulate a concurrent reclaim of IK_B between the POST and its park.
+        if member_claim.task_id == task_b_before_submit.pk:
+            RemoteTask.objects.filter(pk=member_claim.task_id).update(
+                lease_version=member_claim.lease_version + 5
             )
-        return real_transition(member, state, **fields)
+        return real_lock_owned_claim(member_claim)
 
-    monkeypatch.setattr(worker_mod.queue, "transition", steal_b_lease)
+    monkeypatch.setattr(worker_mod.queue, "lock_owned_claim", steal_b_lease)
 
     worker.tick()  # entity MISS for IK_A + batch submit (A primary, B extra)
 

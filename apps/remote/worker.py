@@ -809,6 +809,15 @@ class RemoteWorker:
         members, structures = self._filter_reserved_members(members, structures)
         if not members:
             return
+        # Capture every accepted member's lease before the provider call. The
+        # response path must validate these immutable snapshots rather than trust
+        # mutable model instances that may outlive a timeout or reclaim.
+        member_claims = [
+            (member, queue.claim_from_task(member)) for member in members
+        ]
+        member_claims_by_id = {
+            claim.task_id: claim for _member, claim in member_claims
+        }
         payload = self._canonical_payload(structures)
         payload_hash = self._payload_hash(payload)
         member_specs = self._member_specs(structures)
@@ -964,10 +973,11 @@ class RemoteWorker:
                     detail=str(exc),
                 )
                 if negative.state == negative.State.HARD_FAILED:
-                    fanout.fan_out_result(
-                        member.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                    self._terminalize_submitted_member(
+                        member,
+                        member_claims_by_id[member.pk],
+                        BatchItemStatus.REMOTE_TIMED_OUT,
                     )
-                    queue.finish_task(member)
                 elif honor_retry_after:
                     assert retry_after is not None
                     queue.retry_after_override(member, retry_after)
@@ -1025,10 +1035,11 @@ class RemoteWorker:
                     detail=str(exc),
                 )
                 if negative.state == negative.State.HARD_FAILED:
-                    fanout.fan_out_result(
-                        member.inchikey, BatchItemStatus.REMOTE_TIMED_OUT
+                    self._terminalize_submitted_member(
+                        member,
+                        member_claims_by_id[member.pk],
+                        BatchItemStatus.REMOTE_TIMED_OUT,
                     )
-                    queue.finish_task(member)
                 else:
                     queue.schedule_retry(member)
                     fanout.mark_items_delayed(member.inchikey)
@@ -1050,8 +1061,11 @@ class RemoteWorker:
             )
             self._fail_submission(submission, detail=f"permanent: {exc}")
             for member in members:
-                fanout.fan_out_result(member.inchikey, BatchItemStatus.INVALID_INPUT)
-                queue.finish_task(member)
+                self._terminalize_submitted_member(
+                    member,
+                    member_claims_by_id[member.pk],
+                    BatchItemStatus.INVALID_INPUT,
+                )
             return
 
         # --- success: DURABLE-FIRST ordering (IMPORTANT-2) -------------------
@@ -1140,21 +1154,49 @@ class RemoteWorker:
         # for its new owner / reclaim) rather than aborting the whole batch — the
         # durable query link above means its result is NOT lost: whoever owns the
         # task next finds the RemoteQueryItem and polls the submitted query.
-        self._park_members_poll_wait(members, poll_at)
+        self._park_members_poll_wait(member_claims, poll_at)
+
+    def _terminalize_submitted_member(
+        self,
+        member: RemoteTask,
+        claim: queue.TaskClaim,
+        status: BatchItemStatus,
+    ) -> bool:
+        """Fan out a terminal submit outcome only under its captured lease."""
+        try:
+            with transaction.atomic():
+                locked = queue.lock_owned_claim(claim)
+                fanout.fan_out_result(locked.inchikey, status)
+                queue.transition_locked(
+                    locked, TaskState.DONE, lock_owner=None, locked_at=None
+                )
+            return True
+        except LeaseLost:
+            logger.warning(
+                "member %s (inchikey=%s) lease lost before terminal submit "
+                "fan-out; skipping",
+                member.pk,
+                member.inchikey,
+            )
+            return False
 
     def _park_members_poll_wait(
-        self, members: list[RemoteTask], poll_at: datetime
+        self,
+        member_claims: list[tuple[RemoteTask, queue.TaskClaim]],
+        poll_at: datetime,
     ) -> None:
-        """POLL_WAIT-park members, skipping any whose lease was lost (F-07)."""
-        for member in members:
+        """POLL_WAIT-park members whose immutable lease claims remain owned."""
+        for member, claim in member_claims:
             try:
-                queue.transition(
-                    member,
-                    TaskState.POLL_WAIT,
-                    next_run_at=poll_at,
-                    lock_owner=None,
-                    locked_at=None,
-                )
+                with transaction.atomic():
+                    locked = queue.lock_owned_claim(claim)
+                    queue.transition_locked(
+                        locked,
+                        TaskState.POLL_WAIT,
+                        next_run_at=poll_at,
+                        lock_owner=None,
+                        locked_at=None,
+                    )
             except LeaseLost:
                 logger.warning(
                     "member %s (inchikey=%s) lease lost during POLL_WAIT park; "
@@ -1185,6 +1227,9 @@ class RemoteWorker:
         poll_at = timezone.now() + timedelta(seconds=settings.REMOTE_POLL_MIN_SECONDS)
         if submission.state == SubmissionState.SUBMITTED and submission.query_id:
             query = submission.query
+            member_claims = [
+                (member, queue.claim_from_task(member)) for member in members
+            ]
             with transaction.atomic():
                 for member in members:
                     RemoteQueryItem.objects.get_or_create(
@@ -1195,7 +1240,7 @@ class RemoteWorker:
                             "inchikey": member.inchikey,
                         },
                     )
-            self._park_members_poll_wait(members, poll_at)
+            self._park_members_poll_wait(member_claims, poll_at)
             return
 
         if submission.state == SubmissionState.UNKNOWN:
