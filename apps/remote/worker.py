@@ -64,6 +64,7 @@ from apps.remote.models import (
     RemoteTask,
 )
 from apps.remote.negative_cache import (
+    MISSING_FROM_COMPLETE_DETAIL,
     mark_negative_resolved_from_wishart,
     record_negative_failure,
 )
@@ -2188,11 +2189,18 @@ class RemoteWorker:
             try:
                 with transaction.atomic():
                     locked = queue.lock_owned_claim(claim)
+                    # Only a member absent from an otherwise-COMPLETE response is
+                    # a definitive miss; a whole-response rejection is transient.
                     negative = record_negative_failure(
                         locked.inchikey,
                         operation=RemoteAttempt.OPERATION_POLL,
                         http_status=None,
-                        detail="missing from completed provider response",
+                        detail=(
+                            MISSING_FROM_COMPLETE_DETAIL
+                            if mark_missing_terminal
+                            else "malformed provider response"
+                        ),
+                        definitive=mark_missing_terminal,
                     )
                     if negative.state == negative.State.HARD_FAILED:
                         fanout.fan_out_result(locked, BatchItemStatus.REMOTE_TIMED_OUT)
