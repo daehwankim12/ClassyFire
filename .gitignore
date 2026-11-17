@@ -63,15 +63,39 @@ db.sqlite3-journal
 /exports/
 local_settings.py
 
-# Environment variables
+# Environment variables (any .env variant, e.g. .env.prod / .env.bak, holds
+# real secrets; only the documented template is committed)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# Keys, certificates and git bundles must never be committed
+*.pem
+*.key
+*.p12
+*.pfx
+*.bundle
 
 # Project-specific
 .superpowers/
 .serena/
 .worktrees/
+
+# Local Claude Code state (settings, worktrees). Nothing here is shared; to
+# commit a shared file later, add a "!.claude/<file>" exception below.
+.claude/
+
+# Local-only working notes (not part of the published docs). Already-tracked
+# files under docs/superpowers/ are unaffected.
+docs/superpowers/HANDOFF*.md
+docs/superpowers/plans/2026-06-23-classyfire-batch-cache-web.md
+docs/superpowers/plans/2026-06-24-beta-readiness-hotfixes.md
+docs/superpowers/plans/2026-06-25-gate4-ingest-input-hardening.md
+docs/superpowers/plans/2026-06-25-gate5-remote-exactly-once-provenance.md
+docs/superpowers/plans/2026-06-25-gate6-release-security-recovery.md
+docs/superpowers/plans/2026-06-25-gate7-export-access-lifecycle.md
+docs/superpowers/plans/2026-06-25-safe-production-remediation.md
+docs/superpowers/plans/2026-06-26-strict-rereview-remediation.md
 
 # Database dumps
 *.sql
