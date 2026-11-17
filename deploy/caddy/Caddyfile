@@ -57,9 +57,9 @@ http://{$NGROK_DOMAIN} {
     reverse_proxy web:8000 {
         # Forward only Caddy's sanitized client identity, not the untrusted
         # inbound forwarding chain. Django uses this value for IP throttles.
-        header_up X-Forwarded-For {http.request.client_ip}
+        header_up X-Forwarded-For {client_ip}
         header_up X-Forwarded-Proto https
-        header_up X-Real-IP {http.request.client_ip}
+        header_up X-Real-IP {client_ip}
         header_up Host {host}
 
         # Health-check: mark upstream as unhealthy after 3 consecutive failures

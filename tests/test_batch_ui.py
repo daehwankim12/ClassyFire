@@ -74,6 +74,41 @@ def test_submit_post_redirects_to_job():
     assert parts[2] == "claim"
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize(
+    "forwarded_for",
+    ["{http.request.client_ip}", "not-an-ip", "", "203.0.113.7, 10.0.0.1"],
+)
+def test_submit_post_survives_malformed_forwarded_for(forwarded_for):
+    """A non-IP X-Forwarded-For (e.g. an unexpanded proxy placeholder) must not
+    reach IP-typed queries: it used to turn every submit into HTTP 500."""
+    client = Client(HTTP_X_FORWARDED_FOR=forwarded_for)
+    response = client.post(
+        "/",
+        {"text_input": ASPIRIN_SMILES, "remote_enabled": "on"},
+        follow=False,
+    )
+    assert response.status_code == 302
+
+
+def test_client_ip_falls_back_when_forwarded_value_is_not_an_ip():
+    from django.test import RequestFactory
+
+    from apps.core.security import _client_ip
+
+    factory = RequestFactory()
+    placeholder = factory.get(
+        "/", HTTP_X_FORWARDED_FOR="{http.request.client_ip}", REMOTE_ADDR="172.18.0.5"
+    )
+    assert _client_ip(placeholder) == "172.18.0.5"
+    forwarded = factory.get(
+        "/", HTTP_X_FORWARDED_FOR=" 203.0.113.7 , 10.0.0.1", REMOTE_ADDR="172.18.0.5"
+    )
+    assert _client_ip(forwarded) == "203.0.113.7"
+    garbage = factory.get("/", HTTP_X_FORWARDED_FOR="x", REMOTE_ADDR="also-bad")
+    assert _client_ip(garbage) == "0.0.0.0"
+
+
 # ---------------------------------------------------------------------------
 # 3. Job detail: wrong secret → 403
 # ---------------------------------------------------------------------------

@@ -31,6 +31,7 @@ import functools
 import hashlib
 import hmac
 import io
+import ipaddress
 import logging
 import re
 import secrets
@@ -572,11 +573,27 @@ def request_has_job_access_cookie(request: HttpRequest, job_id: object) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _valid_ip(value: str) -> str | None:
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
 def _client_ip(request: HttpRequest) -> str:
+    """Return the client IP from the proxy-set header, falling back safely.
+
+    The value feeds GenericIPAddressField queries (rate limits, quota events),
+    so anything that is not a literal IP address — a misconfigured proxy
+    placeholder, a hostname, garbage — must never reach the database, where it
+    raises and turns every request into an HTTP 500.
+    """
     forwarded_for = str(request.META.get("HTTP_X_FORWARDED_FOR", ""))
     if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
-    return str(request.META.get("REMOTE_ADDR", "") or "0.0.0.0")
+        forwarded_ip = _valid_ip(forwarded_for.split(",", 1)[0])
+        if forwarded_ip is not None:
+            return forwarded_ip
+    return _valid_ip(str(request.META.get("REMOTE_ADDR", "") or "")) or "0.0.0.0"
 
 
 def _principal(request: HttpRequest) -> str:

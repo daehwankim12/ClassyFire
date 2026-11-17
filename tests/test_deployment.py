@@ -126,9 +126,13 @@ def test_caddy_sanitizes_client_ip_from_only_the_ngrok_loopback_hop():
     assert "trusted_proxies static 127.0.0.1/32" in caddyfile
     assert "trusted_proxies_strict" in caddyfile
     assert "client_ip_headers X-Forwarded-For" in caddyfile
-    assert "header_up X-Forwarded-For {http.request.client_ip}" in caddyfile
-    assert "header_up X-Real-IP {http.request.client_ip}" in caddyfile
+    assert "header_up X-Forwarded-For {client_ip}" in caddyfile
+    assert "header_up X-Real-IP {client_ip}" in caddyfile
     assert "header_up X-Forwarded-For {remote_host}" not in caddyfile
+    # {http.request.client_ip} is not a Caddy placeholder: header ops leave
+    # unknown placeholders as literal text, which reached Django as the
+    # "client IP" and broke every IP-typed query (HTTP 500).
+    assert "{http.request.client_ip}" not in caddyfile
 
 
 def test_db_no_external_network():
